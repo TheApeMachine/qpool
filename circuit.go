@@ -6,18 +6,7 @@ import (
 	"time"
 )
 
-// CircuitBreaker prevents cascading failures
-type CircuitBreaker struct {
-	mu           sync.RWMutex
-	failures     int
-	lastFailure  time.Time
-	state        CircuitState
-	maxFailures  int
-	resetTimeout time.Duration
-	halfOpenMax  int
-	halfOpenPass int
-}
-
+// CircuitState represents the state of the circuit breaker
 type CircuitState int
 
 const (
@@ -26,51 +15,77 @@ const (
 	CircuitHalfOpen
 )
 
-func (cb *CircuitBreaker) Allow() bool {
+// CircuitBreaker implements the circuit breaker pattern
+type CircuitBreaker struct {
+	mu               sync.RWMutex
+	maxFailures      int
+	resetTimeout     time.Duration
+	halfOpenMax      int
+	failureCount     int
+	state            CircuitState
+	openTime         time.Time
+	halfOpenAttempts int
+}
+
+// RecordFailure records a failure and updates the circuit state
+func (cb *CircuitBreaker) RecordFailure() {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
-	switch cb.state {
-	case CircuitClosed:
-		return true
-	case CircuitOpen:
-		if time.Since(cb.lastFailure) > cb.resetTimeout {
-			cb.state = CircuitHalfOpen
-			cb.halfOpenPass = 0
-			log.Printf("Circuit breaker state changed to HALF-OPEN")
-			return true
+	cb.failureCount++
+	if cb.failureCount >= cb.maxFailures {
+		if cb.state == CircuitHalfOpen {
+			// If we fail in half-open state, go back to open
+			cb.state = CircuitOpen
+			cb.openTime = time.Now()
+			log.Printf("Circuit breaker reopened from half-open state")
+		} else if cb.state == CircuitClosed {
+			// Only open the circuit if we were closed
+			cb.state = CircuitOpen
+			cb.openTime = time.Now()
+			log.Printf("Circuit breaker opened")
 		}
-		return false
-	case CircuitHalfOpen:
-		return cb.halfOpenPass < cb.halfOpenMax
-	default:
-		return false
 	}
 }
 
+// RecordSuccess records a successful attempt and updates the circuit state
 func (cb *CircuitBreaker) RecordSuccess() {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
 	if cb.state == CircuitHalfOpen {
-		cb.halfOpenPass++
-		if cb.halfOpenPass >= cb.halfOpenMax {
+		cb.halfOpenAttempts++
+		if cb.halfOpenAttempts >= cb.halfOpenMax {
 			cb.state = CircuitClosed
-			cb.failures = 0
-			log.Printf("Circuit breaker state changed to CLOSED")
+			cb.failureCount = 0
+			cb.halfOpenAttempts = 0
+			log.Printf("Circuit breaker closed from half-open")
 		}
 	}
 }
 
-func (cb *CircuitBreaker) RecordFailure() {
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
+// Allow determines if a request is allowed based on the circuit state
+func (cb *CircuitBreaker) Allow() bool {
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
 
-	cb.failures++
-	cb.lastFailure = time.Now()
-
-	if cb.failures >= cb.maxFailures && cb.state != CircuitOpen {
-		cb.state = CircuitOpen
-		log.Printf("Circuit breaker state changed to OPEN")
+	switch cb.state {
+	case CircuitClosed:
+		return true
+	case CircuitOpen:
+		if time.Since(cb.openTime) > cb.resetTimeout {
+			cb.mu.RUnlock()
+			cb.mu.Lock()
+			cb.state = CircuitHalfOpen
+			cb.halfOpenAttempts = 0
+			cb.mu.Unlock()
+			cb.mu.RLock()
+			return true
+		}
+		return false
+	case CircuitHalfOpen:
+		return cb.halfOpenAttempts < cb.halfOpenMax
+	default:
+		return false
 	}
 }

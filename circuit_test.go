@@ -9,37 +9,61 @@ import (
 
 func TestCircuitBreaker(t *testing.T) {
 	Convey("Given a circuit breaker", t, func() {
-		cb := &CircuitBreaker{
-			maxFailures:  3,
-			resetTimeout: time.Second * 2, // Increased from 1 second
-			halfOpenMax:  2,
+		breaker := &CircuitBreaker{
+			maxFailures:  2,
+			resetTimeout: 100 * time.Millisecond,
+			halfOpenMax:  1,
+			state:        CircuitClosed,
 		}
 
-		// Test initial state
-		So(cb.state, ShouldEqual, CircuitClosed)
+		Convey("It should start in closed state", func() {
+			So(breaker.Allow(), ShouldBeTrue)
+			So(breaker.state, ShouldEqual, CircuitClosed)
+		})
 
-		// Add failures until circuit opens
-		for i := 0; i < cb.maxFailures; i++ {
-			cb.RecordFailure()
-		}
+		Convey("It should open after max failures", func() {
+			breaker.RecordFailure()
+			breaker.RecordFailure()
 
-		// Wait for state transition
-		time.Sleep(10 * time.Millisecond)
-		So(cb.state, ShouldEqual, CircuitOpen)
+			So(breaker.Allow(), ShouldBeFalse)
+			So(breaker.state, ShouldEqual, CircuitOpen)
 
-		Convey("After reset timeout", func() {
-			time.Sleep(time.Millisecond * 300)
+			// Wait for reset timeout
+			time.Sleep(150 * time.Millisecond)
 
-			Convey("Circuit should be half-open", func() {
-				So(cb.Allow(), ShouldBeTrue)
-				So(cb.state, ShouldEqual, CircuitHalfOpen)
-			})
+			So(breaker.Allow(), ShouldBeTrue)
+			So(breaker.state, ShouldEqual, CircuitHalfOpen)
+		})
 
-			Convey("Successful requests in half-open state should close circuit", func() {
-				cb.RecordSuccess()
-				cb.RecordSuccess()
-				So(cb.state, ShouldEqual, CircuitClosed)
-			})
+		Convey("It should close after successful attempt in half-open state", func() {
+			breaker.RecordFailure()
+			breaker.RecordFailure()
+
+			time.Sleep(150 * time.Millisecond)
+
+			So(breaker.Allow(), ShouldBeTrue)
+			So(breaker.state, ShouldEqual, CircuitHalfOpen)
+
+			// Simulate a successful attempt
+			So(breaker.Allow(), ShouldBeTrue)
+			breaker.RecordSuccess()
+
+			So(breaker.state, ShouldEqual, CircuitClosed)
+		})
+
+		Convey("It should open again after failure in half-open state", func() {
+			breaker.RecordFailure()
+			breaker.RecordFailure()
+
+			time.Sleep(150 * time.Millisecond)
+
+			So(breaker.Allow(), ShouldBeTrue)
+			So(breaker.state, ShouldEqual, CircuitHalfOpen)
+
+			// Simulate a failed attempt
+			breaker.RecordFailure()
+
+			So(breaker.state, ShouldEqual, CircuitOpen)
 		})
 	})
 }

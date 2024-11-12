@@ -14,23 +14,23 @@ type tDigestCentroid struct {
 }
 
 type Metrics struct {
-	mu            sync.RWMutex
-	WorkerCount   int
-	JobQueueSize  int
-	ActiveWorkers int
-	LastScale     time.Time
-	ErrorRates    map[string]float64
-	TotalJobTime  time.Duration
-	JobCount      int64
+	mu                   sync.RWMutex
+	WorkerCount          int
+	JobQueueSize         int
+	ActiveWorkers        int
+	LastScale            time.Time
+	ErrorRates           map[string]float64
+	TotalJobTime         time.Duration
+	JobCount             int64
+	CircuitBreakerStates map[string]CircuitState
 
 	// Additional suggested metrics
-	AverageJobLatency    time.Duration
-	P95JobLatency        time.Duration
-	P99JobLatency        time.Duration
-	JobSuccessRate       float64
-	CircuitBreakerStates map[string]CircuitState
-	QueueWaitTime        time.Duration
-	ResourceUtilization  float64
+	AverageJobLatency   time.Duration
+	P95JobLatency       time.Duration
+	P99JobLatency       time.Duration
+	JobSuccessRate      float64
+	QueueWaitTime       time.Duration
+	ResourceUtilization float64
 
 	// Rate limiting metrics
 	RateLimitHits int64
@@ -44,6 +44,9 @@ type Metrics struct {
 
 	// SchedulingFailures field to track scheduling timeouts
 	SchedulingFailures int64
+
+	// Additional metrics
+	FailureCount int64
 }
 
 func newMetrics() *Metrics {
@@ -51,31 +54,31 @@ func newMetrics() *Metrics {
 		ErrorRates:           make(map[string]float64),
 		CircuitBreakerStates: make(map[string]CircuitState),
 		SchedulingFailures:   0,
-		compression:          100, // Controls accuracy vs performance trade-off
-		maxCentroids:         100, // Maximum number of centroids to maintain
+		compression:          100,
+		maxCentroids:         100,
 		centroids:            make([]tDigestCentroid, 0, 100),
 		totalWeight:          0,
-		JobSuccessRate:       1.0, // Start at 100% success rate
+		JobSuccessRate:       1.0,
 	}
 }
 
 // Add prometheus-style metrics collection
 func (m *Metrics) recordJobExecution(startTime time.Time, success bool) {
+	m.mu.RLock()
+	oldTime := m.TotalJobTime
+	m.mu.RUnlock()
+
 	duration := time.Since(startTime)
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	m.TotalJobTime += duration
+	m.TotalJobTime = oldTime + duration
 	m.JobCount++
-
-	// Update success rate
 	if success {
-		m.JobSuccessRate = float64(m.JobCount-int64(len(m.ErrorRates))) / float64(m.JobCount)
+		m.JobSuccessRate = float64(m.JobCount-m.FailureCount) / float64(m.JobCount)
 	}
+	m.mu.Unlock()
 
-	// Update latency percentiles (simplified implementation)
-	// In production, consider using a proper percentile calculation library
+	// Update latency percentiles in a separate lock to reduce contention
 	m.updateLatencyPercentiles(duration)
 }
 
@@ -217,5 +220,34 @@ func (m *Metrics) ExportMetrics() map[string]interface{} {
 		"p95_latency":          m.P95JobLatency.Milliseconds(),
 		"p99_latency":          m.P99JobLatency.Milliseconds(),
 		"resource_utilization": m.ResourceUtilization,
+	}
+}
+
+func (m *Metrics) RecordJobSuccess(latency time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.JobCount++
+	m.TotalJobTime += latency
+	m.AverageJobLatency = time.Duration(int64(m.TotalJobTime) / m.JobCount)
+	// Update t-digest for percentiles
+	m.updateLatencyMetrics(latency)
+	m.JobSuccessRate = float64(m.JobCount-m.FailureCount) / float64(m.JobCount)
+}
+
+// RecordJobFailure records the failure of a job and updates metrics
+func (m *Metrics) RecordJobFailure() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.FailureCount++
+	m.JobSuccessRate = float64(m.JobCount-m.FailureCount) / float64(m.JobCount)
+}
+
+// updateLatencyMetrics updates latency percentiles
+func (m *Metrics) updateLatencyMetrics(latency time.Duration) {
+	// Simple implementation: update P95 and P99 if current latency exceeds them
+	if latency > m.P99JobLatency {
+		m.P99JobLatency = latency
+	} else if latency > m.P95JobLatency {
+		m.P95JobLatency = latency
 	}
 }

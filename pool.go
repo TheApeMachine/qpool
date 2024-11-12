@@ -22,6 +22,8 @@ type Q struct {
 	workerList []*Worker
 	breakersMu sync.RWMutex
 	config     *Config
+	cancel     context.CancelFunc
+	wg         sync.WaitGroup
 }
 
 // Config struct
@@ -31,34 +33,18 @@ type Config struct {
 
 // NewQ creates a new quantum pool
 func NewQ(ctx context.Context, minWorkers, maxWorkers int, config *Config) *Q {
-	if config == nil {
-		config = &Config{
-			SchedulingTimeout: 5 * time.Second,
-		}
-	}
-
+	ctx, cancel := context.WithCancel(ctx)
 	q := &Q{
 		ctx:        ctx,
-		workers:    make(chan chan Job, maxWorkers),
+		cancel:     cancel,
+		breakers:   make(map[string]*CircuitBreaker),
+		workerList: make([]*Worker, 0),
+		quit:       make(chan struct{}),
 		jobs:       make(chan Job, maxWorkers*10),
+		workers:    make(chan chan Job, maxWorkers),
 		space:      newQuantumSpace(),
 		metrics:    newMetrics(),
-		breakers:   make(map[string]*CircuitBreaker),
-		quit:       make(chan struct{}),
-		workerList: []*Worker{},
-		breakersMu: sync.RWMutex{},
 		config:     config,
-	}
-
-	// Initialize scaler
-	q.scaler = &Scaler{
-		pool:               q,
-		minWorkers:         minWorkers,
-		maxWorkers:         maxWorkers,
-		targetLoad:         0.7,
-		scaleUpThreshold:   0.8,
-		scaleDownThreshold: 0.3,
-		cooldown:           5 * time.Second,
 	}
 
 	// Start initial workers
@@ -66,33 +52,56 @@ func NewQ(ctx context.Context, minWorkers, maxWorkers int, config *Config) *Q {
 		q.startWorker()
 	}
 
-	// Start pool management
-	go q.manage()
-	go q.collectMetrics()
+	// Start the manager goroutine
+	q.wg.Add(1)
+	go func() {
+		defer q.wg.Done()
+		q.manage()
+	}()
+
+	// Start metrics collection
+	q.wg.Add(1)
+	go func() {
+		defer q.wg.Done()
+		q.collectMetrics()
+	}()
+
+	// Start scaler with appropriate configuration
+	scalerConfig := &ScalerConfig{
+		TargetLoad:         2.0,                    // Reasonable target load
+		ScaleUpThreshold:   4.0,                    // Scale up when load is high
+		ScaleDownThreshold: 1.0,                    // Scale down when load is low
+		Cooldown:           time.Millisecond * 500, // Reasonable cooldown
+	}
+	q.scaler = NewScaler(q, minWorkers, maxWorkers, scalerConfig)
 
 	return q
 }
 
 // Pool management
 func (q *Q) manage() {
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-
 	for {
 		select {
 		case <-q.ctx.Done():
-			q.workerMu.Lock()
-			// First close the jobs channel to prevent new jobs
-			close(q.jobs)
-			// Then cancel all workers
-			for _, w := range q.workerList {
-				w.cancel()
-			}
-			q.workerMu.Unlock()
-			close(q.quit)
 			return
-		case <-ticker.C:
-			q.scaler.evaluate()
+		case job := <-q.jobs:
+			// Wait for a worker with timeout
+			select {
+			case <-q.ctx.Done():
+				return
+			case workerChan := <-q.workers:
+				// Send job to worker
+				select {
+				case workerChan <- job:
+					// Job successfully sent to worker
+				case <-q.ctx.Done():
+					return
+				}
+			case <-time.After(q.getSchedulingTimeout()):
+				log.Printf("No available workers for job: %s, timeout occurred", job.ID)
+				// Store error result since we couldn't process the job
+				q.space.Store(job.ID, nil, fmt.Errorf("no available workers"), job.TTL)
+			}
 		}
 	}
 }
@@ -137,6 +146,20 @@ func (q *Q) Schedule(id string, fn func() (any, error), opts ...JobOption) chan 
 		opt(&job)
 	}
 
+	// Check circuit breaker if configured
+	if job.CircuitID != "" {
+		breaker := q.getCircuitBreaker(job)
+		if breaker != nil && !breaker.Allow() {
+			ch := make(chan QuantumValue, 1)
+			ch <- QuantumValue{
+				Error:     fmt.Errorf("circuit breaker %s is open", job.CircuitID),
+				CreatedAt: time.Now(),
+			}
+			close(ch)
+			return ch
+		}
+	}
+
 	// Try to schedule job with context timeout
 	select {
 	case q.jobs <- job:
@@ -168,20 +191,24 @@ func (q *Q) Subscribe(groupID string) chan QuantumValue {
 
 // Helper functions
 func (q *Q) startWorker() {
-	workerCtx, cancel := context.WithCancel(q.ctx)
-	w := &Worker{
+	worker := &Worker{
 		pool:   q,
 		jobs:   make(chan Job),
-		cancel: cancel,
+		cancel: nil,
 	}
 	q.workerMu.Lock()
-	q.workerList = append(q.workerList, w)
+	q.workerList = append(q.workerList, worker)
 	q.workerMu.Unlock()
 
 	q.metrics.mu.Lock()
 	q.metrics.WorkerCount++
 	q.metrics.mu.Unlock()
-	go w.start(workerCtx)
+
+	q.wg.Add(1)
+	go func() {
+		defer q.wg.Done()
+		worker.run()
+	}()
 	log.Printf("Started worker, total workers: %d", q.metrics.WorkerCount)
 }
 
@@ -255,21 +282,6 @@ func Example() {
 }
 
 // Helper functions
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-// Add method to get or create circuit breaker
 func (q *Q) getCircuitBreaker(job Job) *CircuitBreaker {
 	if job.CircuitID == "" || job.CircuitConfig == nil {
 		return nil
@@ -287,11 +299,6 @@ func (q *Q) getCircuitBreaker(job Job) *CircuitBreaker {
 			state:        CircuitClosed,
 		}
 		q.breakers[job.CircuitID] = breaker
-
-		// Update metrics
-		q.metrics.mu.Lock()
-		q.metrics.CircuitBreakerStates[job.CircuitID] = CircuitClosed
-		q.metrics.mu.Unlock()
 	}
 
 	return breaker
@@ -303,4 +310,36 @@ func (q *Q) getSchedulingTimeout() time.Duration {
 		return q.config.SchedulingTimeout
 	}
 	return 5 * time.Second // Default timeout
+}
+
+// Update Close method to handle channel closing safely
+func (q *Q) Close() {
+	if q == nil {
+		return
+	}
+
+	log.Println("Closing Quantum Pool")
+
+	// Cancel context first to stop all operations
+	if q.cancel != nil {
+		log.Println("Cancelling context")
+		q.cancel()
+	}
+
+	// Wait for all goroutines to finish before closing channels
+	q.wg.Wait()
+
+	// Now it's safe to close channels as no goroutines are using them
+	q.workerMu.Lock()
+	for _, worker := range q.workerList {
+		close(worker.jobs)
+	}
+	q.workerList = nil
+	q.workerMu.Unlock()
+
+	close(q.quit)
+	close(q.jobs)
+	close(q.workers)
+
+	log.Println("Quantum Pool closed")
 }

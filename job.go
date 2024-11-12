@@ -20,9 +20,19 @@ type Job struct {
 // JobOption is a function type for configuring jobs
 type JobOption func(*Job)
 
-// CircuitBreakerConfig struct
+// CircuitBreakerConfig defines configuration for a circuit breaker
 type CircuitBreakerConfig struct {
 	MaxFailures  int
 	ResetTimeout time.Duration
 	HalfOpenMax  int
+}
+
+// WithDependencyRetry configures retry behavior for dependencies
+func WithDependencyRetry(attempts int, strategy RetryStrategy) JobOption {
+	return func(j *Job) {
+		j.DependencyRetryPolicy = &RetryPolicy{
+			MaxAttempts: attempts,
+			Strategy:    strategy,
+		}
+	}
 }

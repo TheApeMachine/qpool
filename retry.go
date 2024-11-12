@@ -31,6 +31,11 @@ func (eb *ExponentialBackoff) NextDelay(attempt int) time.Duration {
 func WithCircuitBreaker(id string, maxFailures int, resetTimeout time.Duration) JobOption {
 	return func(j *Job) {
 		j.CircuitID = id
+		j.CircuitConfig = &CircuitBreakerConfig{
+			MaxFailures:  maxFailures,
+			ResetTimeout: resetTimeout,
+			HalfOpenMax:  2, // Default value, could be made configurable
+		}
 	}
 }
 

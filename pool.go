@@ -20,10 +20,23 @@ type Q struct {
 	quit       chan struct{}
 	workerMu   sync.Mutex
 	workerList []*Worker
+	breakersMu sync.RWMutex
+	config     *Config
+}
+
+// Config struct
+type Config struct {
+	SchedulingTimeout time.Duration
 }
 
 // NewQ creates a new quantum pool
-func NewQ(ctx context.Context, minWorkers, maxWorkers int) *Q {
+func NewQ(ctx context.Context, minWorkers, maxWorkers int, config *Config) *Q {
+	if config == nil {
+		config = &Config{
+			SchedulingTimeout: 5 * time.Second,
+		}
+	}
+
 	q := &Q{
 		ctx:        ctx,
 		workers:    make(chan chan Job, maxWorkers),
@@ -33,6 +46,8 @@ func NewQ(ctx context.Context, minWorkers, maxWorkers int) *Q {
 		breakers:   make(map[string]*CircuitBreaker),
 		quit:       make(chan struct{}),
 		workerList: []*Worker{},
+		breakersMu: sync.RWMutex{},
+		config:     config,
 	}
 
 	// Initialize scaler
@@ -101,6 +116,10 @@ func (q *Q) collectMetrics() {
 
 // Public API methods
 func (q *Q) Schedule(id string, fn func() (any, error), opts ...JobOption) chan QuantumValue {
+	// Create context with configured timeout
+	ctx, cancel := context.WithTimeout(q.ctx, q.getSchedulingTimeout())
+	defer cancel()
+
 	startTime := time.Now()
 
 	job := Job{
@@ -118,13 +137,23 @@ func (q *Q) Schedule(id string, fn func() (any, error), opts ...JobOption) chan 
 		opt(&job)
 	}
 
+	// Try to schedule job with context timeout
 	select {
 	case q.jobs <- job:
 		return q.space.Await(id)
-	case <-time.After(5 * time.Second): // Add timeout
+	case <-ctx.Done():
 		ch := make(chan QuantumValue, 1)
-		ch <- QuantumValue{Error: fmt.Errorf("job scheduling timeout")}
+		ch <- QuantumValue{
+			Error:     fmt.Errorf("job scheduling timeout: %w", ctx.Err()),
+			CreatedAt: time.Now(),
+		}
 		close(ch)
+
+		// Update metrics for scheduling failure
+		q.metrics.mu.Lock()
+		q.metrics.SchedulingFailures++
+		q.metrics.mu.Unlock()
+
 		return ch
 	}
 }
@@ -166,7 +195,7 @@ func WithTTL(ttl time.Duration) JobOption {
 // Example demonstrates usage of the quantum pool
 func Example() {
 	ctx := context.Background()
-	q := NewQ(ctx, 5, 20)
+	q := NewQ(ctx, 5, 20, nil)
 
 	// Create a broadcast group
 	group := q.CreateBroadcastGroup("sensors", time.Minute)
@@ -238,4 +267,40 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// Add method to get or create circuit breaker
+func (q *Q) getCircuitBreaker(job Job) *CircuitBreaker {
+	if job.CircuitID == "" || job.CircuitConfig == nil {
+		return nil
+	}
+
+	q.breakersMu.Lock()
+	defer q.breakersMu.Unlock()
+
+	breaker, exists := q.breakers[job.CircuitID]
+	if !exists {
+		breaker = &CircuitBreaker{
+			maxFailures:  job.CircuitConfig.MaxFailures,
+			resetTimeout: job.CircuitConfig.ResetTimeout,
+			halfOpenMax:  job.CircuitConfig.HalfOpenMax,
+			state:        CircuitClosed,
+		}
+		q.breakers[job.CircuitID] = breaker
+
+		// Update metrics
+		q.metrics.mu.Lock()
+		q.metrics.CircuitBreakerStates[job.CircuitID] = CircuitClosed
+		q.metrics.mu.Unlock()
+	}
+
+	return breaker
+}
+
+// Add method to get scheduling timeout from config or use default
+func (q *Q) getSchedulingTimeout() time.Duration {
+	if q.config != nil && q.config.SchedulingTimeout > 0 {
+		return q.config.SchedulingTimeout
+	}
+	return 5 * time.Second // Default timeout
 }

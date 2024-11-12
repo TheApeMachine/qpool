@@ -11,10 +11,13 @@ import (
 
 func TestScaler(t *testing.T) {
 	Convey("Given a pool with scaling enabled", t, func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second) // Increased timeout
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
-		q := NewQ(ctx, 2, 10)
+		config := &Config{
+			SchedulingTimeout: 5 * time.Second,
+		}
+		q := NewQ(ctx, 2, 10, config)
 
 		Convey("When load increases", func() {
 			// Simulate high load

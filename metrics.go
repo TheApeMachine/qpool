@@ -1,14 +1,16 @@
 package qpool
 
 import (
+	"math"
 	"sort"
 	"sync"
 	"time"
 )
 
-type timeWindow struct {
-	duration time.Duration
-	count    int
+// tDigestCentroid represents a centroid in the t-digest
+type tDigestCentroid struct {
+	mean  float64
+	count int64
 }
 
 type Metrics struct {
@@ -34,16 +36,26 @@ type Metrics struct {
 	RateLimitHits int64
 	ThrottledJobs int64
 
-	// Add fields for percentile calculation
-	latencyWindows []timeWindow
-	windowSize     int
+	// t-digest fields for percentile calculation
+	centroids    []tDigestCentroid
+	compression  float64
+	totalWeight  int64
+	maxCentroids int
+
+	// SchedulingFailures field to track scheduling timeouts
+	SchedulingFailures int64
 }
 
 func newMetrics() *Metrics {
 	return &Metrics{
-		ErrorRates:     make(map[string]float64),
-		latencyWindows: make([]timeWindow, 0, 1000), // Store last 1000 measurements
-		windowSize:     1000,
+		ErrorRates:           make(map[string]float64),
+		CircuitBreakerStates: make(map[string]CircuitState),
+		SchedulingFailures:   0,
+		compression:          100, // Controls accuracy vs performance trade-off
+		maxCentroids:         100, // Maximum number of centroids to maintain
+		centroids:            make([]tDigestCentroid, 0, 100),
+		totalWeight:          0,
+		JobSuccessRate:       1.0, // Start at 100% success rate
 	}
 }
 
@@ -69,47 +81,127 @@ func (m *Metrics) recordJobExecution(startTime time.Time, success bool) {
 
 // Add updateLatencyPercentiles method
 func (m *Metrics) updateLatencyPercentiles(duration time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	// Update average using existing calculation
 	m.AverageJobLatency = (m.AverageJobLatency*time.Duration(m.JobCount-1) + duration) / time.Duration(m.JobCount)
 
-	// Add new duration to sliding window
-	m.latencyWindows = append(m.latencyWindows, timeWindow{
-		duration: duration,
-		count:    1,
+	// Convert duration to float64 milliseconds for t-digest
+	value := float64(duration.Milliseconds())
+
+	// Find the closest centroid or create a new one
+	inserted := false
+	m.totalWeight++
+
+	if len(m.centroids) == 0 {
+		m.centroids = append(m.centroids, tDigestCentroid{mean: value, count: 1})
+		return
+	}
+
+	// Find insertion point
+	idx := sort.Search(len(m.centroids), func(i int) bool {
+		return m.centroids[i].mean >= value
 	})
 
-	// Remove oldest entries if we exceed window size
-	if len(m.latencyWindows) > m.windowSize {
-		m.latencyWindows = m.latencyWindows[1:]
+	// Calculate maximum weight for this point
+	q := m.calculateQuantile(value)
+	maxWeight := int64(4 * m.compression * math.Min(q, 1-q))
+
+	// Try to merge with existing centroid
+	if idx < len(m.centroids) && m.centroids[idx].count < maxWeight {
+		c := &m.centroids[idx]
+		c.mean = (c.mean*float64(c.count) + value) / float64(c.count+1)
+		c.count++
+		inserted = true
+	} else if idx > 0 && m.centroids[idx-1].count < maxWeight {
+		c := &m.centroids[idx-1]
+		c.mean = (c.mean*float64(c.count) + value) / float64(c.count+1)
+		c.count++
+		inserted = true
 	}
 
-	// Sort durations for percentile calculation
-	sorted := make([]time.Duration, 0, len(m.latencyWindows))
-	for _, w := range m.latencyWindows {
-		for i := 0; i < w.count; i++ {
-			sorted = append(sorted, w.duration)
+	// If we couldn't merge, insert new centroid
+	if !inserted {
+		newCentroid := tDigestCentroid{mean: value, count: 1}
+		m.centroids = append(m.centroids, tDigestCentroid{})
+		copy(m.centroids[idx+1:], m.centroids[idx:])
+		m.centroids[idx] = newCentroid
+	}
+
+	// Compress if we have too many centroids
+	if len(m.centroids) > m.maxCentroids {
+		m.compress()
+	}
+
+	// Update P95 and P99
+	m.P95JobLatency = time.Duration(m.estimatePercentile(0.95)) * time.Millisecond
+	m.P99JobLatency = time.Duration(m.estimatePercentile(0.99)) * time.Millisecond
+}
+
+func (m *Metrics) calculateQuantile(value float64) float64 {
+	rank := 0.0
+	for _, c := range m.centroids {
+		if c.mean < value {
+			rank += float64(c.count)
 		}
 	}
-	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i] < sorted[j]
+	return rank / float64(m.totalWeight)
+}
+
+func (m *Metrics) estimatePercentile(p float64) float64 {
+	if len(m.centroids) == 0 {
+		return 0
+	}
+
+	targetRank := p * float64(m.totalWeight)
+	cumulative := 0.0
+
+	for i, c := range m.centroids {
+		cumulative += float64(c.count)
+		if cumulative >= targetRank {
+			// Linear interpolation between centroids
+			if i > 0 {
+				prev := m.centroids[i-1]
+				prevCumulative := cumulative - float64(c.count)
+				t := (targetRank - prevCumulative) / float64(c.count)
+				return prev.mean + t*(c.mean-prev.mean)
+			}
+			return c.mean
+		}
+	}
+	return m.centroids[len(m.centroids)-1].mean
+}
+
+func (m *Metrics) compress() {
+	if len(m.centroids) <= 1 {
+		return
+	}
+
+	// Sort centroids by mean if needed
+	sort.Slice(m.centroids, func(i, j int) bool {
+		return m.centroids[i].mean < m.centroids[j].mean
 	})
 
-	// Calculate percentiles
-	if len(sorted) > 0 {
-		p95Index := int(float64(len(sorted)) * 0.95)
-		p99Index := int(float64(len(sorted)) * 0.99)
+	// Merge adjacent centroids while respecting size constraints
+	newCentroids := make([]tDigestCentroid, 0, m.maxCentroids)
+	current := m.centroids[0]
 
-		// Ensure indices are within bounds
-		if p95Index >= len(sorted) {
-			p95Index = len(sorted) - 1
+	for i := 1; i < len(m.centroids); i++ {
+		if current.count+m.centroids[i].count <= int64(m.compression) {
+			// Merge centroids
+			totalCount := current.count + m.centroids[i].count
+			current.mean = (current.mean*float64(current.count) +
+				m.centroids[i].mean*float64(m.centroids[i].count)) /
+				float64(totalCount)
+			current.count = totalCount
+		} else {
+			newCentroids = append(newCentroids, current)
+			current = m.centroids[i]
 		}
-		if p99Index >= len(sorted) {
-			p99Index = len(sorted) - 1
-		}
-
-		m.P95JobLatency = sorted[p95Index]
-		m.P99JobLatency = sorted[p99Index]
 	}
+	newCentroids = append(newCentroids, current)
+	m.centroids = newCentroids
 }
 
 // Add metrics export functionality

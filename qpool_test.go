@@ -23,7 +23,10 @@ func TestQuantumPool(t *testing.T) {
 			time.Sleep(cleanupTimeout)
 		}()
 
-		q := NewQ(ctx, 2, 5)
+		config := &Config{
+			SchedulingTimeout: 5 * time.Second,
+		}
+		q := NewQ(ctx, 2, 5, config)
 
 		Reset(func() {
 			cancel()

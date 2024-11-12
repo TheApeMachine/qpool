@@ -55,7 +55,7 @@ func TestQuantumPool(t *testing.T) {
 		Convey("When scheduling a job with retries", func() {
 			ctx, cancel := context.WithTimeout(ctx, channelTimeout)
 			defer cancel()
-
+      
 			attempts := 0
 			result := q.Schedule("retry-job", func() (any, error) {
 				attempts++

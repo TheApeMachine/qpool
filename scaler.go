@@ -2,9 +2,19 @@ package qpool
 
 import (
 	"log"
-	"math"
 	"time"
 )
+
+// Scaler manages pool size
+type Scaler struct {
+	pool               *Q
+	minWorkers         int
+	maxWorkers         int
+	targetLoad         float64
+	scaleUpThreshold   float64
+	scaleDownThreshold float64
+	cooldown           time.Duration
+}
 
 // Scaler implementation
 func (s *Scaler) evaluate() {
@@ -17,15 +27,11 @@ func (s *Scaler) evaluate() {
 
 	currentLoad := float64(s.pool.metrics.JobQueueSize) / float64(s.pool.metrics.WorkerCount)
 
-	switch {
-	case currentLoad > s.scaleUpThreshold && s.pool.metrics.WorkerCount < s.maxWorkers:
-		needed := int(math.Ceil(float64(s.pool.metrics.JobQueueSize) / s.targetLoad))
-		toAdd := min(needed-s.pool.metrics.WorkerCount, s.maxWorkers-s.pool.metrics.WorkerCount)
+	if currentLoad > s.scaleUpThreshold && s.pool.metrics.WorkerCount < s.maxWorkers {
+		toAdd := min(s.maxWorkers-s.pool.metrics.WorkerCount, max(1, s.pool.metrics.JobQueueSize/2))
 		s.scaleUp(toAdd)
-
-	case currentLoad < s.scaleDownThreshold && s.pool.metrics.WorkerCount > s.minWorkers:
-		needed := max(int(math.Ceil(float64(s.pool.metrics.JobQueueSize)/s.targetLoad)), s.minWorkers)
-		toRemove := s.pool.metrics.WorkerCount - needed
+	} else if currentLoad < s.scaleDownThreshold && s.pool.metrics.WorkerCount > s.minWorkers {
+		toRemove := max(1, (s.pool.metrics.WorkerCount-s.minWorkers)/2)
 		s.scaleDown(toRemove)
 	}
 

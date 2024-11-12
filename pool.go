@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"math"
 	"sync"
 	"time"
 )
@@ -22,113 +21,6 @@ type Q struct {
 	workerMu   sync.Mutex
 	workerList []*Worker
 }
-
-// QuantumValue wraps a value with metadata
-type QuantumValue struct {
-	Value     any
-	Error     error
-	CreatedAt time.Time
-	TTL       time.Duration
-}
-
-// QuantumSpace handles value storage and messaging
-type QuantumSpace struct {
-	mu       sync.RWMutex
-	values   map[string]*QuantumValue
-	waiting  map[string][]chan QuantumValue
-	errors   map[string]error
-	children map[string][]string
-	groups   map[string]*BroadcastGroup
-}
-
-// Job represents work to be done
-type Job struct {
-	ID                    string
-	Fn                    func() (any, error)
-	RetryPolicy           *RetryPolicy
-	CircuitID             string
-	Dependencies          []string
-	TTL                   time.Duration
-	Attempt               int
-	LastError             error
-	DependencyRetryPolicy *RetryPolicy
-}
-
-// Metrics tracks pool performance
-type Metrics struct {
-	mu            sync.RWMutex
-	WorkerCount   int
-	JobQueueSize  int
-	ActiveWorkers int
-	LastScale     time.Time
-	ErrorRates    map[string]float64
-	TotalJobTime  time.Duration
-	JobCount      int64
-}
-
-// Scaler manages pool size
-type Scaler struct {
-	pool               *Q
-	minWorkers         int
-	maxWorkers         int
-	targetLoad         float64
-	scaleUpThreshold   float64
-	scaleDownThreshold float64
-	cooldown           time.Duration
-}
-
-// RetryPolicy defines retry behavior
-type RetryPolicy struct {
-	MaxAttempts int
-	Strategy    RetryStrategy
-	BackoffFunc func(attempt int) time.Duration
-	Filter      func(error) bool
-}
-
-// CircuitBreaker prevents cascading failures
-type CircuitBreaker struct {
-	mu           sync.RWMutex
-	failures     int
-	lastFailure  time.Time
-	state        CircuitState
-	maxFailures  int
-	resetTimeout time.Duration
-	halfOpenMax  int
-	halfOpenPass int
-}
-
-type CircuitState int
-
-const (
-	CircuitClosed CircuitState = iota
-	CircuitOpen
-	CircuitHalfOpen
-)
-
-// BroadcastGroup handles pub/sub
-type BroadcastGroup struct {
-	ID       string
-	channels []chan QuantumValue
-	TTL      time.Duration
-	LastUsed time.Time
-}
-
-// RetryStrategy defines the interface for retry behavior
-type RetryStrategy interface {
-	NextDelay(attempt int) time.Duration
-}
-
-// ExponentialBackoff implements RetryStrategy
-type ExponentialBackoff struct {
-	Initial time.Duration
-}
-
-func (eb *ExponentialBackoff) NextDelay(attempt int) time.Duration {
-	return eb.Initial * time.Duration(math.Pow(2, float64(attempt-1)))
-}
-
-// JobOption is a function type for configuring jobs
-type JobOption func(*Job)
 
 // NewQ creates a new quantum pool
 func NewQ(ctx context.Context, minWorkers, maxWorkers int) *Q {
@@ -166,25 +58,6 @@ func NewQ(ctx context.Context, minWorkers, maxWorkers int) *Q {
 	return q
 }
 
-func newQuantumSpace() *QuantumSpace {
-	qs := &QuantumSpace{
-		values:   make(map[string]*QuantumValue),
-		waiting:  make(map[string][]chan QuantumValue),
-		errors:   make(map[string]error),
-		children: make(map[string][]string),
-		groups:   make(map[string]*BroadcastGroup),
-	}
-
-	go qs.cleanup()
-	return qs
-}
-
-func newMetrics() *Metrics {
-	return &Metrics{
-		ErrorRates: make(map[string]float64),
-	}
-}
-
 // Pool management
 func (q *Q) manage() {
 	ticker := time.NewTicker(time.Second)
@@ -194,6 +67,9 @@ func (q *Q) manage() {
 		select {
 		case <-q.ctx.Done():
 			q.workerMu.Lock()
+			// First close the jobs channel to prevent new jobs
+			close(q.jobs)
+			// Then cancel all workers
 			for _, w := range q.workerList {
 				w.cancel()
 			}
@@ -225,6 +101,8 @@ func (q *Q) collectMetrics() {
 
 // Public API methods
 func (q *Q) Schedule(id string, fn func() (any, error), opts ...JobOption) chan QuantumValue {
+	startTime := time.Now()
+
 	job := Job{
 		ID: id,
 		Fn: fn,
@@ -232,6 +110,7 @@ func (q *Q) Schedule(id string, fn func() (any, error), opts ...JobOption) chan 
 			MaxAttempts: 3,
 			Strategy:    &ExponentialBackoff{Initial: time.Second},
 		},
+		StartTime: startTime,
 	}
 
 	// Apply options
@@ -239,8 +118,15 @@ func (q *Q) Schedule(id string, fn func() (any, error), opts ...JobOption) chan 
 		opt(&job)
 	}
 
-	q.jobs <- job
-	return q.space.Await(id)
+	select {
+	case q.jobs <- job:
+		return q.space.Await(id)
+	case <-time.After(5 * time.Second): // Add timeout
+		ch := make(chan QuantumValue, 1)
+		ch <- QuantumValue{Error: fmt.Errorf("job scheduling timeout")}
+		close(ch)
+		return ch
+	}
 }
 
 func (q *Q) CreateBroadcastGroup(id string, ttl time.Duration) *BroadcastGroup {
@@ -268,23 +154,6 @@ func (q *Q) startWorker() {
 	q.metrics.mu.Unlock()
 	go w.start(workerCtx)
 	log.Printf("Started worker, total workers: %d", q.metrics.WorkerCount)
-}
-
-// WithRetry configures retry behavior for a job
-func WithRetry(attempts int, strategy RetryStrategy) JobOption {
-	return func(j *Job) {
-		j.RetryPolicy = &RetryPolicy{
-			MaxAttempts: attempts,
-			Strategy:    strategy,
-		}
-	}
-}
-
-// WithCircuitBreaker configures circuit breaker for a job
-func WithCircuitBreaker(id string, maxFailures int, resetTimeout time.Duration) JobOption {
-	return func(j *Job) {
-		j.CircuitID = id
-	}
 }
 
 // WithTTL configures TTL for a job

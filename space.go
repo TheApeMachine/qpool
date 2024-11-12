@@ -1,6 +1,48 @@
 package qpool
 
-import "time"
+import (
+	"sync"
+	"time"
+)
+
+// BroadcastGroup handles pub/sub
+type BroadcastGroup struct {
+	ID       string
+	channels []chan QuantumValue
+	TTL      time.Duration
+	LastUsed time.Time
+}
+
+// QuantumValue wraps a value with metadata
+type QuantumValue struct {
+	Value     any
+	Error     error
+	CreatedAt time.Time
+	TTL       time.Duration
+}
+
+// QuantumSpace handles value storage and messaging
+type QuantumSpace struct {
+	mu       sync.RWMutex
+	values   map[string]*QuantumValue
+	waiting  map[string][]chan QuantumValue
+	errors   map[string]error
+	children map[string][]string
+	groups   map[string]*BroadcastGroup
+}
+
+func newQuantumSpace() *QuantumSpace {
+	qs := &QuantumSpace{
+		values:   make(map[string]*QuantumValue),
+		waiting:  make(map[string][]chan QuantumValue),
+		errors:   make(map[string]error),
+		children: make(map[string][]string),
+		groups:   make(map[string]*BroadcastGroup),
+	}
+
+	go qs.cleanup()
+	return qs
+}
 
 func (qs *QuantumSpace) Store(id string, value any, err error, ttl time.Duration) {
 	qs.mu.Lock()
@@ -108,22 +150,32 @@ func (qs *QuantumSpace) Close() {
 	qs.mu.Lock()
 	defer qs.mu.Unlock()
 
-	// Close waiting channels
-	for id, channels := range qs.waiting {
+	// Create a set of channels to close
+	channelsToClose := make(map[chan QuantumValue]struct{})
+
+	// Collect all channels
+	for _, channels := range qs.waiting {
 		for _, ch := range channels {
-			close(ch)
+			channelsToClose[ch] = struct{}{}
 		}
-		delete(qs.waiting, id)
 	}
-
-	// Close BroadcastGroup channels
-	for id, group := range qs.groups {
+	for _, group := range qs.groups {
 		for _, ch := range group.channels {
-			close(ch)
+			channelsToClose[ch] = struct{}{}
 		}
-		delete(qs.groups, id)
 	}
 
-	// Clear values
-	qs.values = nil
+	// Close each channel exactly once with a timeout
+	for ch := range channelsToClose {
+		select {
+		case <-ch: // Try to drain with timeout
+		case <-time.After(100 * time.Millisecond):
+		}
+		close(ch)
+	}
+
+	// Clear all maps
+	qs.values = make(map[string]*QuantumValue)
+	qs.waiting = make(map[string][]chan QuantumValue)
+	qs.groups = make(map[string]*BroadcastGroup)
 }

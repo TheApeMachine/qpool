@@ -17,23 +17,45 @@ type Worker struct {
 func (w *Worker) start(ctx context.Context) {
 	for {
 		select {
-		case w.pool.workers <- w.jobs:
 		case <-ctx.Done():
 			return
-		}
+		default:
+			select {
+			case w.pool.workers <- w.jobs:
+				select {
+				case job := <-w.jobs:
+					// Add timeout for job processing
+					done := make(chan struct{})
+					go func() {
+						result, err := w.processJob(job)
+						w.pool.space.Store(job.ID, result, err, job.TTL)
+						close(done)
+					}()
 
-		select {
-		case job := <-w.jobs:
-			result, err := w.processJob(job)
-			w.pool.space.Store(job.ID, result, err, job.TTL)
-		case <-ctx.Done():
-			return
+					select {
+					case <-done:
+					case <-ctx.Done():
+						return
+					case <-time.After(30 * time.Second): // Timeout for job processing
+						log.Printf("Job %s timed out", job.ID)
+						continue
+					}
+				case <-ctx.Done():
+					return
+				case <-time.After(time.Second):
+					continue
+				}
+			case <-ctx.Done():
+				return
+			case <-time.After(100 * time.Millisecond):
+				continue
+			}
 		}
 	}
 }
 
 func (w *Worker) processJob(job Job) (any, error) {
-	startTime := time.Now()
+	startTime := job.StartTime
 
 	// Circuit breaker check
 	if err := w.checkCircuitBreaker(job.CircuitID); err != nil {
@@ -46,6 +68,10 @@ func (w *Worker) processJob(job Job) (any, error) {
 	}
 
 	result, err := w.executeWithRetries(job)
+
+	// Record metrics before storing result
+	w.pool.metrics.recordJobExecution(startTime, err == nil)
+
 	if err != nil {
 		return nil, err
 	}

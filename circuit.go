@@ -2,7 +2,28 @@ package qpool
 
 import (
 	"log"
+	"sync"
 	"time"
+)
+
+// CircuitBreaker prevents cascading failures
+type CircuitBreaker struct {
+	mu           sync.RWMutex
+	failures     int
+	lastFailure  time.Time
+	state        CircuitState
+	maxFailures  int
+	resetTimeout time.Duration
+	halfOpenMax  int
+	halfOpenPass int
+}
+
+type CircuitState int
+
+const (
+	CircuitClosed CircuitState = iota
+	CircuitOpen
+	CircuitHalfOpen
 )
 
 func (cb *CircuitBreaker) Allow() bool {

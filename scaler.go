@@ -16,7 +16,6 @@ type Scaler struct {
 	scaleDownThreshold float64
 	cooldown           time.Duration
 	lastScale          time.Time
-	testMode           bool
 }
 
 // ScalerConfig defines configuration for the Scaler

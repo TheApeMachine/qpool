@@ -83,6 +83,17 @@ Inspired by electrical circuit breakers, this pattern prevents system failure by
 
 [Learn more about Circuit Breakers →](docs/circuitbreaker.md)
 
+### ⚖️ Load Balancer
+
+Like a traffic controller directing vehicles to different lanes based on congestion, the Load Balancer ensures optimal work distribution across workers by considering their capacity, current load, and performance characteristics.
+
+- Intelligent work distribution based on metrics
+- Automatic worker selection and load tracking
+- Adapts to worker pool scaling
+- Perfect for optimizing resource utilization
+
+[Learn more about Load Balancing →](docs/loadbalancer.md)
+
 [Learn more about the Regulation System →](docs/regulator.md)
 
 ## 📦 Installation
@@ -301,3 +312,21 @@ For detailed documentation, please visit our [Go Docs](https://pkg.go.dev/github
 ---
 
 Made with ❤️ by Daniel Owen van Dommelen
+
+## Regulators
+
+QPool implements a biological-inspired regulation system that helps maintain system stability and optimal performance under varying loads. Like a living organism that regulates its internal state through multiple coordinated mechanisms, QPool uses a set of regulators to control different aspects of the worker pool:
+
+- **RateLimiter**: Implements the token bucket algorithm to provide smooth, predictable rate limiting with burst capacity. Perfect for API rate limiting or controlling resource consumption rates. [Learn more](docs/ratelimiter.md)
+
+- **CircuitBreaker**: Prevents system failures by stopping operations when error rates exceed acceptable thresholds. Features self-healing capabilities through gradual recovery mechanisms. [Learn more](docs/circuitbreaker.md)
+
+- **LoadBalancer**: Distributes work evenly across workers while making intelligent routing decisions based on worker performance metrics and current load. [Learn more](docs/loadbalancer.md)
+
+- **BackPressureRegulator**: Manages system pressure by controlling job intake based on queue size and processing times, preventing system overload. [Learn more](docs/backpressure.md)
+
+- **ResourceGovernorRegulator**: Monitors and manages system resource usage (CPU, memory) to prevent resource exhaustion and maintain system stability. [Learn more](docs/resourcegovernor.md)
+
+- **AdaptiveScalerRegulator**: Dynamically adjusts the worker pool size based on load metrics and performance data to optimize resource utilization. [Learn more](docs/adaptivescaler.md)
+
+All regulators implement the `Regulator` interface, allowing them to be composed and combined to create sophisticated control systems. [Learn more about the Regulator interface](docs/regulator.md)

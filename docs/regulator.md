@@ -1,14 +1,14 @@
-# Regulation System
+# Regulator Interface
 
-The QPool regulation system provides a flexible framework for implementing various control mechanisms that maintain system stability and prevent resource exhaustion. Inspired by control systems in nature and engineering, regulators act as the system's homeostatic mechanisms.
+The Regulator interface is the cornerstone of QPool's regulation system, providing a unified way to implement various control mechanisms that help maintain system stability and performance.
 
 ## Overview
 
-Just as biological systems use feedback loops to maintain stability, and mechanical systems use governors to control speed, QPool's regulators monitor and adjust system behavior to maintain optimal performance. Each regulator implements a common interface that provides three key operations:
+Like biological and mechanical control systems, QPool's regulators observe system metrics, make decisions based on those observations, and take corrective actions when necessary. The Regulator interface defines three key methods that enable this feedback loop:
 
 ```go
 type Regulator interface {
-    Observe(metrics *Metrics)
+    Observe(*Metrics)
     Limit() bool
     Renormalize()
 }
@@ -16,143 +16,93 @@ type Regulator interface {
 
 ## Core Concepts
 
-### Observation (Sensing)
+### Observation (Observe method)
 
-Like sensors in a control system, regulators observe system metrics through the `Observe()` method. This provides the feedback necessary for making control decisions:
+The `Observe` method is where regulators receive and process system metrics. This is analogous to how a thermostat reads room temperature or how your body's receptors detect changes in blood sugar levels. Regulators can:
 
-```go
-metrics := &Metrics{
-    QueueDepth: 100,
-    ErrorRate: 0.05,
-    Latency: 50 * time.Millisecond,
-}
-regulator.Observe(metrics)
-```
+- Process current system metrics
+- Update internal state
+- Calculate derived metrics
+- Store historical data for trend analysis
 
-### Limitation (Control)
+### Limitation (Limit method)
 
-The `Limit()` method acts as the control point, determining whether operations should proceed or be restricted based on observed conditions:
+The `Limit` method determines whether the system should restrict operations based on current conditions. This is similar to how a circuit breaker trips when detecting a power surge. The method:
 
-```go
-if regulator.Limit() {
-    // Operation should be restricted
-    return ErrRateLimited
-}
-// Proceed with operation
-```
+- Returns `true` if operations should be limited
+- Returns `false` if operations can proceed normally
+- Makes decisions based on internal state and thresholds
 
-### Renormalization (Recovery)
+### Renormalization (Renormalize method)
 
-Like a feedback loop seeking equilibrium, `Renormalize()` attempts to restore normal operation after periods of restriction:
+The `Renormalize` method provides a way to adjust the regulator's internal state when conditions improve. Like how your body returns to homeostasis after stress, this method:
 
-```go
-// Periodically attempt system recovery
-go func() {
-    ticker := time.NewTicker(checkInterval)
-    for range ticker.C {
-        regulator.Renormalize()
-    }
-}()
-```
+- Reduces pressure or limitations gradually
+- Prevents oscillation between states
+- Implements recovery logic
 
-## Implementation Examples
+## Built-in Regulators
 
-### Creating Custom Regulators
+QPool provides several built-in regulators, each specializing in different aspects of system control:
 
-You can implement custom regulators by satisfying the Regulator interface:
+- [RateLimiter](ratelimiter.md): Controls operation rates
+- [CircuitBreaker](circuitbreaker.md): Prevents cascading failures
+- [LoadBalancer](loadbalancer.md): Distributes work efficiently
+- [BackPressureRegulator](backpressure.md): Manages system pressure
+- [ResourceGovernorRegulator](resourcegovernor.md): Controls resource usage
+- [AdaptiveScalerRegulator](adaptivescaler.md): Optimizes worker pool size
+
+## Creating Custom Regulators
+
+You can create custom regulators by implementing the Regulator interface. Here's a simple example:
 
 ```go
 type CustomRegulator struct {
-    threshold int
-    current   int
-    mu        sync.Mutex
+    threshold float64
+    current   float64
 }
 
-func (cr *CustomRegulator) Observe(metrics *Metrics) {
-    cr.mu.Lock()
-    defer cr.mu.Unlock()
-    cr.current = metrics.QueueDepth
+func (r *CustomRegulator) Observe(m *Metrics) {
+    r.current = m.ResourceUtilization
 }
 
-func (cr *CustomRegulator) Limit() bool {
-    return cr.current >= cr.threshold
+func (r *CustomRegulator) Limit() bool {
+    return r.current > r.threshold
 }
 
-func (cr *CustomRegulator) Renormalize() {
-    cr.mu.Lock()
-    defer cr.mu.Unlock()
-    cr.current = 0
+func (r *CustomRegulator) Renormalize() {
+    if r.current > 0 {
+        r.current -= 0.1 // Gradual reduction
+    }
 }
-```
-
-### Combining Regulators
-
-Multiple regulators can be combined for comprehensive system protection:
-
-```go
-pool := qpool.NewQ(ctx, minWorkers, maxWorkers, &qpool.Config{
-    Regulators: []qpool.Regulator{
-        qpool.NewRateLimiter(100, time.Second),
-        qpool.NewCircuitBreaker(5, time.Minute, 3),
-    },
-})
 ```
 
 ## Best Practices
 
-1. **Appropriate Thresholds**: Choose regulation thresholds based on system capacity and requirements.
-2. **Gradual Recovery**: Implement gentle recovery mechanisms to prevent oscillation.
-3. **Metric Selection**: Monitor metrics that directly indicate system health.
-4. **Coordination**: Consider how multiple regulators interact when used together.
-
-## Built-in Regulators
-
-QPool provides two built-in regulators:
-
-- [Rate Limiter](ratelimiter.md): Controls operation rates using a token bucket algorithm
-- [Circuit Breaker](circuitbreaker.md): Prevents cascade failures by stopping operations during error conditions
-
-## Use Cases
-
-- **API Rate Limiting**: Protect external services from overload
-- **Resource Protection**: Prevent system resource exhaustion
-- **Graceful Degradation**: Maintain partial service during high load
-- **Error Prevention**: Stop operations when error rates are high
-- **Load Shedding**: Reject excess work during peak periods
+1. **Smooth Transitions**: Avoid abrupt state changes that could cause system instability
+2. **Metric Selection**: Choose relevant metrics that directly indicate system health
+3. **Threshold Tuning**: Set appropriate thresholds based on system capacity and requirements
+4. **Composition**: Combine multiple regulators to create comprehensive control systems
+5. **State Management**: Maintain clean state management for predictable behavior
 
 ## Advanced Topics
 
 ### Adaptive Regulation
 
-Regulators can adapt their behavior based on system conditions:
-
-```go
-func (r *AdaptiveRegulator) Observe(metrics *Metrics) {
-    r.threshold = calculateThreshold(metrics)
-}
-```
+Regulators can implement adaptive behavior by:
+- Learning from historical data
+- Adjusting thresholds dynamically
+- Predicting future system states
 
 ### Hierarchical Regulation
 
-Regulators can be organized in hierarchies for complex systems:
-
-```go
-type HierarchicalRegulator struct {
-    children []Regulator
-}
-
-func (hr *HierarchicalRegulator) Limit() bool {
-    for _, child := range hr.children {
-        if child.Limit() {
-            return true
-        }
-    }
-    return false
-}
-```
+Multiple regulators can be organized hierarchically:
+- High-level regulators manage system-wide concerns
+- Mid-level regulators handle subsystem regulation
+- Low-level regulators control specific components
 
 ## Further Reading
 
 - [Circuit Breaker Pattern](https://martinfowler.com/bliki/CircuitBreaker.html)
 - [Rate Limiting Patterns](https://cloud.google.com/architecture/rate-limiting-strategies-patterns)
-- [Control Theory](https://en.wikipedia.org/wiki/Control_theory)
+- [Back Pressure in Distributed Systems](https://mechanical-sympathy.blogspot.com/2012/05/apply-back-pressure-when-overloaded.html)

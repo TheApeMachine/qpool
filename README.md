@@ -212,7 +212,7 @@ group := pool.CreateBroadcastGroup("sensors", time.Minute)
 subscriber := pool.Subscribe("sensors")
 
 // Send updates to all subscribers
-group.Send(qpool.QuantumValue{
+group.Send(qpool.QValue{
     Value: "sensor-update",
     CreatedAt: time.Now(),
 })

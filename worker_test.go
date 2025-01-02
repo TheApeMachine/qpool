@@ -19,7 +19,7 @@ func TestWorker(t *testing.T) {
 			pool := &Q{
 				ctx:     context.Background(),
 				workers: make(chan chan Job, 1),
-				space:   newQuantumSpace(),
+				space:   NewQSpace(),
 				metrics: NewMetrics(),
 			}
 
@@ -62,7 +62,7 @@ func TestWorker(t *testing.T) {
 			pool := &Q{
 				ctx:     context.Background(),
 				workers: make(chan chan Job, 1),
-				space:   newQuantumSpace(),
+				space:   NewQSpace(),
 				metrics: NewMetrics(),
 			}
 
@@ -113,7 +113,7 @@ func TestWorker(t *testing.T) {
 			pool := &Q{
 				ctx:     context.Background(),
 				workers: make(chan chan Job, 1),
-				space:   newQuantumSpace(),
+				space:   NewQSpace(),
 				metrics: NewMetrics(),
 			}
 

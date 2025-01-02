@@ -43,6 +43,48 @@ QPool is a high-performance, feature-rich worker pool implementation in Go that 
     -   Resource utilization stats
     -   Dependency resolution tracking
 
+## ⚛️ Quantum Entanglement
+
+QPool introduces the concept of Entanglement, inspired by quantum mechanics. Just as quantum particles can be entangled so that the state of one instantly affects the other, jobs in an Entanglement share state that persists across time and space. When one job updates the shared state, all other jobs in the entanglement—even those not yet processed—will see these changes.
+
+This powerful feature enables:
+- Shared state between related jobs that persists even across job completion
+- Automatic state synchronization for jobs processed at different times
+- Immutable history of all state changes
+- Perfect for distributed data processing and coordinated task execution
+
+[Learn more about Entanglement with code samples →](docs/entanglement.md)
+
+## 📦️ Regulators
+
+QPool implements a sophisticated regulation system inspired by biological and mechanical control systems. Like a thermostat regulating temperature or a governor controlling engine speed, Regulators maintain system stability and prevent resource exhaustion through adaptive control mechanisms.
+
+The regulation system includes:
+
+### 🚦 Rate Limiter
+
+A token bucket-based rate limiter that provides smooth, burst-capable traffic control. Like a water tank with controlled inflow and outflow, it ensures operations proceed at a sustainable pace while allowing brief bursts of activity when needed.
+
+- Configurable steady-state rate and burst capacity
+- Smooth operation without sharp cutoffs
+- Perfect for API rate limiting and resource protection
+- Automatic token replenishment
+
+[Learn more about Rate Limiting →](docs/ratelimiter.md)
+
+### 🔌 Circuit Breaker
+
+Inspired by electrical circuit breakers, this pattern prevents system failure by automatically stopping operations when error rates exceed acceptable thresholds. Like its electrical counterpart, it "trips" to protect the system and automatically tests for recovery.
+
+- Prevents cascade failures in distributed systems
+- Self-healing with automatic recovery testing
+- Configurable error thresholds and recovery timing
+- Perfect for protecting external service calls
+
+[Learn more about Circuit Breakers →](docs/circuitbreaker.md)
+
+[Learn more about the Regulation System →](docs/regulator.md)
+
 ## 📦 Installation
 
 ```bash
@@ -88,16 +130,48 @@ func main() {
 
 ### Job Dependencies
 
+QPool supports a robust job dependency system that allows you to create complex workflows. Jobs can depend on one or more other jobs, and the system ensures proper execution order.
+
 ```go
 // Create jobs with dependencies
-pool.Schedule("data-fetch", func() (any, error) {
+job1Result := pool.Schedule("data-fetch", func() (any, error) {
     return fetchData()
 }, qpool.WithTTL(time.Minute))
 
-pool.Schedule("data-process", func() (any, error) {
+// This job will only execute after data-fetch completes successfully
+job2Result := pool.Schedule("data-process", func() (any, error) {
     return processData()
 }, qpool.WithDependencies([]string{"data-fetch"}))
+
+// You can also add multiple dependencies
+job3Result := pool.Schedule("data-aggregate", func() (any, error) {
+    return aggregateData()
+}, qpool.WithDependencies([]string{"data-fetch", "data-process"}))
+
+// Configure dependency retry behavior
+job4Result := pool.Schedule("data-transform", func() (any, error) {
+    return transformData()
+}, 
+    qpool.WithDependencies([]string{"data-aggregate"}),
+    qpool.WithDependencyRetry(3, &qpool.ExponentialBackoff{Initial: time.Second}))
+
+// Process results
+for result := range job4Result {
+    if result.Error != nil {
+        log.Printf("Error: %v", result.Error)
+        continue
+    }
+    // Process the result
+    log.Printf("Success: %v", result.Value)
+}
 ```
+
+Key features of the dependency system:
+- Jobs wait for all dependencies to complete successfully before starting
+- If any dependency fails, dependent jobs fail automatically
+- Configurable retry policies for dependency resolution
+- Automatic cleanup of completed job results based on TTL
+- Non-blocking dependency resolution with timeout handling
 
 ### Circuit Breaker
 

@@ -75,6 +75,9 @@ func (s *Scaler) scaleUp(count int) {
 
 // scaleDown removes 'count' number of workers from the pool
 func (s *Scaler) scaleDown(count int) {
+	s.pool.workerMu.Lock()
+	defer s.pool.workerMu.Unlock()
+
 	for i := 0; i < count; i++ {
 		if len(s.pool.workerList) == 0 {
 			break
@@ -84,17 +87,26 @@ func (s *Scaler) scaleDown(count int) {
 		w := s.pool.workerList[len(s.pool.workerList)-1]
 		s.pool.workerList = s.pool.workerList[:len(s.pool.workerList)-1]
 
-		// Cancel the worker's context
-		if w.cancel != nil {
-			w.cancel()
-		}
+		// Cancel the worker's context outside the lock to avoid holding it during cleanup
+		cancelFunc := w.cancel
 
 		s.pool.metrics.WorkerCount--
+
+		// Release the lock before cleanup operations
+		s.pool.workerMu.Unlock()
+
+		// Cancel the worker's context
+		if cancelFunc != nil {
+			cancelFunc()
+		}
 
 		log.Printf("Scaled down worker, total workers: %d", s.pool.metrics.WorkerCount)
 
 		// Add a small delay between worker removals
 		time.Sleep(time.Millisecond * 50)
+
+		// Re-acquire the lock for the next iteration
+		s.pool.workerMu.Lock()
 	}
 }
 

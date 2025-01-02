@@ -11,24 +11,19 @@ import (
 // Q is our hybrid worker pool/message queue
 type Q struct {
 	ctx        context.Context
+	cancel     context.CancelFunc
+	quit       chan struct{}
+	wg         sync.WaitGroup
 	workers    chan chan Job
 	jobs       chan Job
 	space      *QuantumSpace
 	scaler     *Scaler
 	metrics    *Metrics
 	breakers   map[string]*CircuitBreaker
-	quit       chan struct{}
 	workerMu   sync.Mutex
 	workerList []*Worker
 	breakersMu sync.RWMutex
 	config     *Config
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
-}
-
-// Config struct
-type Config struct {
-	SchedulingTimeout time.Duration
 }
 
 // NewQ creates a new quantum pool
@@ -43,7 +38,7 @@ func NewQ(ctx context.Context, minWorkers, maxWorkers int, config *Config) *Q {
 		jobs:       make(chan Job, maxWorkers*10),
 		workers:    make(chan chan Job, maxWorkers),
 		space:      newQuantumSpace(),
-		metrics:    newMetrics(),
+		metrics:    NewMetrics(),
 		config:     config,
 	}
 

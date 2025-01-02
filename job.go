@@ -36,3 +36,10 @@ func WithDependencyRetry(attempts int, strategy RetryStrategy) JobOption {
 		}
 	}
 }
+
+// WithDependencies configures job dependencies
+func WithDependencies(dependencies []string) JobOption {
+	return func(j *Job) {
+		j.Dependencies = dependencies
+	}
+}

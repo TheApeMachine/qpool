@@ -79,6 +79,18 @@ func (w *Worker) run() {
 // processJobWithTimeout processes a job with a timeout
 func (w *Worker) processJobWithTimeout(ctx context.Context, job Job) (any, error) {
 	startTime := time.Now()
+
+	// Check dependencies before job execution
+	for _, depID := range job.Dependencies {
+		if err := w.checkSingleDependency(depID, job.DependencyRetryPolicy); err != nil {
+			w.pool.metrics.RecordJobExecution(startTime, false)
+			if job.CircuitID != "" {
+				w.recordFailure(job.CircuitID)
+			}
+			return nil, err
+		}
+	}
+
 	done := make(chan struct{})
 	var result any
 	var err error
@@ -96,17 +108,7 @@ func (w *Worker) processJobWithTimeout(ctx context.Context, job Job) (any, error
 		w.handleJobTimeout(job)
 		return nil, fmt.Errorf("job %s timed out", job.ID)
 	case <-done:
-		// Check dependencies after job execution
-		for _, depID := range job.Dependencies {
-			if err := w.checkSingleDependency(depID, job.DependencyRetryPolicy); err != nil {
-				w.pool.metrics.recordJobExecution(startTime, false)
-				if job.CircuitID != "" {
-					w.recordFailure(job.CircuitID)
-				}
-				return nil, err
-			}
-		}
-		w.pool.metrics.recordJobExecution(startTime, err == nil)
+		w.pool.metrics.RecordJobExecution(startTime, err == nil)
 		return result, err
 	}
 }

@@ -13,6 +13,7 @@ type tDigestCentroid struct {
 	count int64
 }
 
+// Metrics tracks and stores various performance metrics for the worker pool.
 type Metrics struct {
 	mu                   sync.RWMutex
 	WorkerCount          int
@@ -49,7 +50,8 @@ type Metrics struct {
 	FailureCount int64
 }
 
-func newMetrics() *Metrics {
+// NewMetrics creates and initializes a new Metrics instance.
+func NewMetrics() *Metrics {
 	return &Metrics{
 		ErrorRates:           make(map[string]float64),
 		CircuitBreakerStates: make(map[string]CircuitState),
@@ -62,8 +64,8 @@ func newMetrics() *Metrics {
 	}
 }
 
-// Add prometheus-style metrics collection
-func (m *Metrics) recordJobExecution(startTime time.Time, success bool) {
+// RecordJobExecution records the execution time and success status of a job.
+func (m *Metrics) RecordJobExecution(startTime time.Time, success bool) {
 	m.mu.RLock()
 	oldTime := m.TotalJobTime
 	m.mu.RUnlock()
@@ -143,6 +145,11 @@ func (m *Metrics) updateLatencyPercentiles(duration time.Duration) {
 }
 
 func (m *Metrics) calculateQuantile(value float64) float64 {
+	// Guard against division by zero
+	if m.totalWeight == 0 {
+		return 0.0
+	}
+
 	rank := 0.0
 	for _, c := range m.centroids {
 		if c.mean < value {
@@ -167,6 +174,12 @@ func (m *Metrics) estimatePercentile(p float64) float64 {
 			if i > 0 {
 				prev := m.centroids[i-1]
 				prevCumulative := cumulative - float64(c.count)
+
+				// Guard against division by zero
+				if c.count == 0 {
+					return prev.mean
+				}
+
 				t := (targetRank - prevCumulative) / float64(c.count)
 				return prev.mean + t*(c.mean-prev.mean)
 			}
@@ -228,10 +241,15 @@ func (m *Metrics) RecordJobSuccess(latency time.Duration) {
 	defer m.mu.Unlock()
 	m.JobCount++
 	m.TotalJobTime += latency
-	m.AverageJobLatency = time.Duration(int64(m.TotalJobTime) / m.JobCount)
+
+	// Guard against division by zero
+	if m.JobCount > 0 {
+		m.AverageJobLatency = time.Duration(int64(m.TotalJobTime) / m.JobCount)
+		m.JobSuccessRate = float64(m.JobCount-m.FailureCount) / float64(m.JobCount)
+	}
+
 	// Update t-digest for percentiles
 	m.updateLatencyMetrics(latency)
-	m.JobSuccessRate = float64(m.JobCount-m.FailureCount) / float64(m.JobCount)
 }
 
 // RecordJobFailure records the failure of a job and updates metrics
@@ -239,7 +257,13 @@ func (m *Metrics) RecordJobFailure() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.FailureCount++
-	m.JobSuccessRate = float64(m.JobCount-m.FailureCount) / float64(m.JobCount)
+
+	// Guard against division by zero
+	if m.JobCount > 0 {
+		m.JobSuccessRate = float64(m.JobCount-m.FailureCount) / float64(m.JobCount)
+	} else {
+		m.JobSuccessRate = 0.0
+	}
 }
 
 // updateLatencyMetrics updates latency percentiles

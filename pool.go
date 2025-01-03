@@ -173,9 +173,9 @@ Parameters:
   - opts: Optional job configuration parameters
 
 Returns:
-  - chan QValue: Channel that will receive the job's result
+  - chan *QValue: Channel that will receive the job's result
 */
-func (q *Q) Schedule(id string, fn func() (any, error), opts ...JobOption) chan QValue {
+func (q *Q) Schedule(id string, fn func() (any, error), opts ...JobOption) chan *QValue {
 	// Create context with configured timeout
 	ctx, cancel := context.WithTimeout(q.ctx, q.getSchedulingTimeout())
 	defer cancel()
@@ -201,8 +201,8 @@ func (q *Q) Schedule(id string, fn func() (any, error), opts ...JobOption) chan 
 	if job.CircuitID != "" {
 		breaker := q.getCircuitBreaker(job)
 		if breaker != nil && !breaker.Allow() {
-			ch := make(chan QValue, 1)
-			ch <- QValue{
+			ch := make(chan *QValue, 1)
+			ch <- &QValue{
 				Error:     fmt.Errorf("circuit breaker %s is open", job.CircuitID),
 				CreatedAt: time.Now(),
 			}
@@ -214,23 +214,11 @@ func (q *Q) Schedule(id string, fn func() (any, error), opts ...JobOption) chan 
 	// Try to schedule job with context timeout
 	select {
 	case q.jobs <- job:
-		// Convert *QValue channel to QValue channel
-		qvChan := q.space.Await(id)
-		resultChan := make(chan QValue, 1)
-		go func() {
-			defer close(resultChan)
-			if qv := <-qvChan; qv != nil {
-				resultChan <- QValue{
-					Value:     qv.Value,
-					Error:     qv.Error,
-					CreatedAt: qv.CreatedAt,
-				}
-			}
-		}()
-		return resultChan
+		// Use the pointer channel directly from QSpace
+		return q.space.Await(id)
 	case <-ctx.Done():
-		ch := make(chan QValue, 1)
-		ch <- QValue{
+		ch := make(chan *QValue, 1)
+		ch <- &QValue{
 			Error:     fmt.Errorf("job scheduling timeout: %w", ctx.Err()),
 			CreatedAt: time.Now(),
 		}

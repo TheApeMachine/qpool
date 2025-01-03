@@ -12,13 +12,6 @@ import (
 // Probability represents a quantum state probability
 type Probability float64
 
-// State represents a possible quantum state
-type State struct {
-	Value       interface{}
-	Amplitude   complex128
-	Probability Probability
-}
-
 // UncertaintyLevel defines how uncertain we are about a value
 type UncertaintyLevel float64
 
@@ -193,10 +186,10 @@ func mergeSates(a, b []State) []State {
 	// Normalize probabilities
 	totalProb := Probability(0)
 	for _, s := range merged {
-		totalProb += s.Probability
+		totalProb += Probability(s.Probability)
 	}
 	for i := range merged {
-		merged[i].Probability /= totalProb
+		merged[i].Probability /= float64(totalProb)
 	}
 
 	return merged

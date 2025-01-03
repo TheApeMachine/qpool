@@ -3,6 +3,15 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/theapemachine/qpool.svg)](https://pkg.go.dev/github.com/theapemachine/qpool)
 [![Go Report Card](https://goreportcard.com/badge/github.com/theapemachine/qpool)](https://goreportcard.com/report/github.com/theapemachine/qpool)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Bugs](https://sonarcloud.io/api/project_badges/measure?project=TheApeMachine_qpool&metric=bugs)](https://sonarcloud.io/summary/new_code?id=TheApeMachine_qpool)
+[![Code Smells](https://sonarcloud.io/api/project_badges/measure?project=TheApeMachine_qpool&metric=code_smells)](https://sonarcloud.io/summary/new_code?id=TheApeMachine_qpool)
+[![Duplicated Lines (%)](https://sonarcloud.io/api/project_badges/measure?project=TheApeMachine_qpool&metric=duplicated_lines_density)](https://sonarcloud.io/summary/new_code?id=TheApeMachine_qpool)
+[![Lines of Code](https://sonarcloud.io/api/project_badges/measure?project=TheApeMachine_qpool&metric=ncloc)](https://sonarcloud.io/summary/new_code?id=TheApeMachine_qpool)
+[![Reliability Rating](https://sonarcloud.io/api/project_badges/measure?project=TheApeMachine_qpool&metric=reliability_rating)](https://sonarcloud.io/summary/new_code?id=TheApeMachine_qpool)
+[![Security Rating](https://sonarcloud.io/api/project_badges/measure?project=TheApeMachine_qpool&metric=security_rating)](https://sonarcloud.io/summary/new_code?id=TheApeMachine_qpool)
+[![Technical Debt](https://sonarcloud.io/api/project_badges/measure?project=TheApeMachine_qpool&metric=sqale_index)](https://sonarcloud.io/summary/new_code?id=TheApeMachine_qpool)
+[![Maintainability Rating](https://sonarcloud.io/api/project_badges/measure?project=TheApeMachine_qpool&metric=sqale_rating)](https://sonarcloud.io/summary/new_code?id=TheApeMachine_qpool)
+[![Vulnerabilities](https://sonarcloud.io/api/project_badges/measure?project=TheApeMachine_qpool&metric=vulnerabilities)](https://sonarcloud.io/summary/new_code?id=TheApeMachine_qpool)
 
 QPool is a high-performance, feature-rich worker pool implementation in Go that combines the capabilities of a traditional worker pool with a sophisticated message queue. It's designed to handle complex job dependencies, provide robust error handling, and scale automatically based on workload.
 

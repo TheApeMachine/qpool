@@ -127,8 +127,10 @@ func TestLoadBalancerSelectWorker(t *testing.T) {
 		Convey("When workers have equal load but different latencies", func() {
 			balancer.workerLoads[0] = 2.0
 			balancer.workerLoads[1] = 2.0
+			balancer.workerLoads[2] = 2.0
 			balancer.workerLatency[0] = 100 * time.Millisecond
 			balancer.workerLatency[1] = 50 * time.Millisecond
+			balancer.workerLatency[2] = 150 * time.Millisecond
 
 			workerID, err := balancer.SelectWorker()
 

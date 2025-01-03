@@ -43,11 +43,12 @@ Example:
     limiter := NewRateLimiter(100, time.Second) // 100 ops/second with burst capacity
 */
 func NewRateLimiter(maxTokens int, refillRate time.Duration) *RateLimiter {
+	now := time.Now()
 	return &RateLimiter{
 		tokens:     maxTokens,
 		maxTokens:  maxTokens,
 		refillRate: refillRate,
-		lastRefill: time.Now(),
+		lastRefill: now.Add(-refillRate), // Start with a full refill period elapsed
 	}
 }
 
@@ -117,9 +118,17 @@ Thread-safety: This method assumes the caller holds the mutex lock.
 func (rl *RateLimiter) refill() {
 	now := time.Now()
 	elapsed := now.Sub(rl.lastRefill)
-	tokensToAdd := int(elapsed / rl.refillRate)
+	
+	// Convert to nanoseconds for integer division
+	elapsedNs := elapsed.Nanoseconds()
+	refillRateNs := rl.refillRate.Nanoseconds()
+
+	// Calculate tokens to add - only round up if we're at least halfway through a period
+	tokensToAdd := (elapsedNs + (refillRateNs / 2)) / refillRateNs
+	
 	if tokensToAdd > 0 {
-		rl.tokens = Min(rl.maxTokens, rl.tokens+tokensToAdd)
-		rl.lastRefill = now
+		rl.tokens = Min(rl.maxTokens, rl.tokens+int(tokensToAdd))
+		// Only move lastRefill forward by the number of complete periods
+		rl.lastRefill = rl.lastRefill.Add(time.Duration(tokensToAdd) * rl.refillRate)
 	}
 } 

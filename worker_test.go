@@ -12,10 +12,7 @@ const timeoutMsg = "Test timed out waiting for value retrieval"
 
 func TestWorker(t *testing.T) {
 	Convey("Given a worker", t, func() {
-		// Initialization is moved inside each Convey block for isolation
-
 		Convey("It should process a job successfully", func() {
-			// Initialize pool and worker for this test case
 			pool := &Q{
 				ctx:     context.Background(),
 				workers: make(chan chan Job, 1),
@@ -28,10 +25,9 @@ func TestWorker(t *testing.T) {
 				jobs: make(chan Job, 1),
 			}
 
-			// Ensure cleanup after test
 			Reset(func() {
 				close(worker.jobs)
-				pool.space.Close() // Assuming Close method exists
+				pool.space.Close()
 			})
 
 			job := Job{
@@ -45,11 +41,9 @@ func TestWorker(t *testing.T) {
 			worker.jobs <- job
 			go worker.run()
 
-			time.Sleep(100 * time.Millisecond) // Allow some time for processing
-
 			result := pool.space.Await(job.ID)
 			select {
-			case <-pool.ctx.Done():
+			case <-time.After(2 * time.Second):
 				t.Fatal(timeoutMsg)
 			case value := <-result:
 				So(value.Error, ShouldBeNil)
@@ -58,7 +52,6 @@ func TestWorker(t *testing.T) {
 		})
 
 		Convey("It should handle job timeout", func() {
-			// Initialize pool and worker for this test case
 			pool := &Q{
 				ctx:     context.Background(),
 				workers: make(chan chan Job, 1),
@@ -71,13 +64,11 @@ func TestWorker(t *testing.T) {
 				jobs: make(chan Job, 1),
 			}
 
-			// Ensure cleanup after test
 			Reset(func() {
 				close(worker.jobs)
-				pool.space.Close() // Assuming Close method exists
+				pool.space.Close()
 			})
 
-			// Create a job that will timeout
 			job := Job{
 				ID: "job_timeout",
 				Fn: func() (any, error) {
@@ -85,22 +76,21 @@ func TestWorker(t *testing.T) {
 					return nil, nil
 				},
 				StartTime:    time.Now(),
-				TTL:          100 * time.Millisecond, // Set TTL less than sleep to trigger timeout
+				TTL:          100 * time.Millisecond,
 				Dependencies: []string{},
 			}
 
-			worker.jobs <- job
 			ctx, cancel := context.WithTimeout(pool.ctx, 100*time.Millisecond)
 			defer cancel()
 			worker.pool.ctx = ctx
 
+			
+			worker.jobs <- job
 			go worker.run()
-
-			time.Sleep(150 * time.Millisecond) // Allow some time for processing
 
 			result := pool.space.Await(job.ID)
 			select {
-			case <-pool.ctx.Done():
+			case <-time.After(2 * time.Second):
 				t.Fatal(timeoutMsg)
 			case value := <-result:
 				So(value.Error, ShouldNotBeNil)
@@ -109,7 +99,6 @@ func TestWorker(t *testing.T) {
 		})
 
 		Convey("It should not process a job if dependencies are not met", func() {
-			// Initialize pool and worker for this test case
 			pool := &Q{
 				ctx:     context.Background(),
 				workers: make(chan chan Job, 1),
@@ -122,13 +111,11 @@ func TestWorker(t *testing.T) {
 				jobs: make(chan Job, 1),
 			}
 
-			// Ensure cleanup after test
 			Reset(func() {
 				close(worker.jobs)
-				pool.space.Close() // Assuming Close method exists
+				pool.space.Close()
 			})
 
-			// Add a dependency that is not met
 			job := Job{
 				ID:           "job_dependency",
 				Fn:           func() (any, error) { return "result", nil },
@@ -140,11 +127,9 @@ func TestWorker(t *testing.T) {
 			worker.jobs <- job
 			go worker.run()
 
-			time.Sleep(100 * time.Millisecond) // Allow some time for processing
-
 			result := pool.space.Await(job.ID)
 			select {
-			case <-pool.ctx.Done():
+			case <-time.After(2 * time.Second):
 				t.Fatal(timeoutMsg)
 			case value := <-result:
 				So(value.Error, ShouldNotBeNil)

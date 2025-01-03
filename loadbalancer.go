@@ -2,6 +2,7 @@ package qpool
 
 import (
 	"errors"
+	"log"
 	"sync"
 	"time"
 )
@@ -131,27 +132,38 @@ func (lb *LoadBalancer) SelectWorker() (int, error) {
 	lb.mu.RLock()
 	defer lb.mu.RUnlock()
 
-	var (
-		selectedWorker = -1
-		minLoad       = float64(^uint(0) >> 1)
-		minLatency    = time.Duration(^uint64(0) >> 1)
-	)
+	selectedWorker := -1
 
-	// Find worker with minimum load and good performance
 	for i := 0; i < lb.activeWorkers; i++ {
-		load := lb.workerLoads[i]
-		latency := lb.workerLatency[i]
-
-		// Skip overloaded workers
-		if load >= float64(lb.workerCapacity[i]) {
+		// Skip workers at capacity
+		if lb.workerLoads[i] >= float64(lb.workerCapacity[i]) {
+			log.Printf("Worker %d at capacity: load=%v, capacity=%v", i, lb.workerLoads[i], lb.workerCapacity[i])
 			continue
 		}
 
-		// Prefer workers with lower load and better latency
-		if load < minLoad || (load == minLoad && latency < minLatency) {
+		// If no worker selected yet, select this one
+		if selectedWorker == -1 {
+			log.Printf("First worker %d: load=%v, latency=%v", i, lb.workerLoads[i], lb.workerLatency[i])
 			selectedWorker = i
-			minLoad = load
-			minLatency = latency
+			continue
+		}
+
+		log.Printf("Comparing worker %d (load=%v, latency=%v) with selected worker %d (load=%v, latency=%v)",
+			i, lb.workerLoads[i], lb.workerLatency[i],
+			selectedWorker, lb.workerLoads[selectedWorker], lb.workerLatency[selectedWorker])
+
+		// Compare loads first
+		if lb.workerLoads[i] < lb.workerLoads[selectedWorker] {
+			log.Printf("Selected worker %d due to lower load", i)
+			selectedWorker = i
+		} else if lb.workerLoads[i] == lb.workerLoads[selectedWorker] {
+			// If loads are equal, compare latencies
+			// Only consider latency if both workers have non-zero latency
+			if lb.workerLatency[selectedWorker] == 0 || 
+				(lb.workerLatency[i] > 0 && lb.workerLatency[i] < lb.workerLatency[selectedWorker]) {
+				log.Printf("Selected worker %d due to better latency", i)
+				selectedWorker = i
+			}
 		}
 	}
 
@@ -159,6 +171,7 @@ func (lb *LoadBalancer) SelectWorker() (int, error) {
 		return -1, ErrNoAvailableWorkers
 	}
 
+	log.Printf("Final selection: worker %d", selectedWorker)
 	return selectedWorker, nil
 }
 

@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/davecgh/go-spew/spew"
 	. "github.com/smartystreets/goconvey/convey"
 )
 
@@ -131,18 +132,17 @@ func TestReplayStateChanges(t *testing.T) {
 		entanglement := NewEntanglement("test-entanglement", []Job{}, 1*time.Hour)
 		
 		Convey("When replaying state changes", func() {
-			stateChanges := make([]map[string]any, 0)
-			entanglement.OnStateChange = func(old, new map[string]any) {
-				stateChanges = append(stateChanges, new)
-			}
-
-			// Create some state history
+			// Create some state history first
 			entanglement.UpdateState("key1", "value1")
 			entanglement.UpdateState("key2", "value2")
 			entanglement.UpdateState("key1", "updated-value1")
 
-			// Clear the state changes array to test replay
-			stateChanges = make([]map[string]any, 0)
+			// Set up callback for replay
+			stateChanges := make([]map[string]any, 0)
+			entanglement.OnStateChange = func(old, new map[string]any) {
+				spew.Dump(new)
+				stateChanges = append(stateChanges, new)
+			}
 
 			// Replay for a new job
 			job := Job{ID: "test-job"}

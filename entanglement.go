@@ -163,13 +163,28 @@ Parameters:
   - job: The job to replay state changes for
 */
 func (e *Entanglement) ReplayStateChanges(job Job) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
 	history := e.GetStateHistory(0)
 	currentState := make(map[string]any)
 
 	for _, change := range history {
-		currentState[change.Key] = change.Value
+		oldState := make(map[string]any)
+		for k, v := range currentState {
+			oldState[k] = v
+		}
+
+		// Create a new map for the new state
+		newState := make(map[string]any)
+		for k, v := range currentState {
+			newState[k] = v
+		}
+		newState[change.Key] = change.Value
+
+		currentState = newState
 		if e.OnStateChange != nil {
-			e.OnStateChange(nil, currentState)
+			e.OnStateChange(oldState, newState)
 		}
 	}
 }

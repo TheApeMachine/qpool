@@ -53,19 +53,20 @@ func (w *Worker) run() {
 			if err != nil {
 				w.pool.metrics.RecordJobFailure()
 				log.Printf("Job %s failed: %v", job.ID, err)
+				// Store error result
+				w.pool.space.StoreError(job.ID, err, job.TTL)
 			} else {
 				w.pool.metrics.RecordJobSuccess(time.Since(job.StartTime))
 				log.Printf("Job %s succeeded", job.ID)
+				// Store successful result
+				w.pool.space.Store(job.ID, result, []State{{Value: result, Probability: 1.0}}, job.TTL)
 			}
-
-			// Always store the result, even if there was an error
-			w.pool.space.Store(job.ID, result, err, job.TTL)
 			log.Printf("Stored result for job: %s", job.ID)
 
 			// Notify dependents
 			if len(job.Dependencies) > 0 {
 				for _, depID := range job.Dependencies {
-					if children := w.pool.space.GetChildren(depID); len(children) > 0 {
+					if children := w.pool.space.children[depID]; len(children) > 0 {
 						for _, childID := range children {
 							log.Printf("Notifying dependent job %s", childID)
 						}
@@ -98,14 +99,12 @@ func (w *Worker) processJobWithTimeout(ctx context.Context, job Job) (any, error
 	go func() {
 		defer close(done)
 		result, err = job.Fn()
-		// Store result immediately after job completion
-		w.pool.space.Store(job.ID, result, err, job.TTL)
-		log.Printf("Job %s completed and result stored", job.ID)
+		log.Printf("Job %s completed", job.ID)
 	}()
 
 	select {
 	case <-ctx.Done():
-		w.handleJobTimeout(job)
+		w.pool.metrics.RecordJobFailure()
 		return nil, fmt.Errorf("job %s timed out", job.ID)
 	case <-done:
 		w.pool.metrics.RecordJobExecution(startTime, err == nil)
@@ -129,10 +128,26 @@ func (w *Worker) checkSingleDependency(depID string, retryPolicy *RetryPolicy) e
 	}
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
+		// First check if the dependency exists
+		if !w.pool.space.Exists(depID) {
+			if attempt < maxAttempts-1 {
+				time.Sleep(strategy.NextDelay(attempt + 1))
+				continue
+			}
+			break
+		}
+
 		ch := w.pool.space.Await(depID)
-		if result := <-ch; result.Error == nil {
-			return nil
-		} else if attempt < maxAttempts-1 {
+		select {
+		case result := <-ch:
+			if result.Error == nil {
+				return nil
+			}
+		case <-time.After(time.Second): // Add timeout for each attempt
+			// Continue to next attempt or break
+		}
+
+		if attempt < maxAttempts-1 {
 			time.Sleep(strategy.NextDelay(attempt + 1))
 			continue
 		}
@@ -174,9 +189,9 @@ func (w *Worker) recordFailure(circuitID string) {
 }
 
 // Add this method to the Worker struct
-func (w *Worker) handleJobTimeout(job Job) {
+func (w *Worker) handleJobTimeout(job Job) error {
 	w.pool.metrics.RecordJobFailure()
 	err := fmt.Errorf("job %s timed out", job.ID)
-	w.pool.space.Store(job.ID, nil, err, job.TTL)
 	log.Printf("Job %s timed out", job.ID)
+	return err
 }

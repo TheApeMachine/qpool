@@ -578,3 +578,47 @@ func (qs *QSpace) Subscribe(groupID string) chan *QValue {
 	}
 	return nil
 }
+
+/*
+	Exists checks if a value exists in the space
+*/
+func (qs *QSpace) Exists(id string) bool {
+	qs.mu.RLock()
+	defer qs.mu.RUnlock()
+	_, exists := qs.values[id]
+	return exists
+}
+
+/*
+	StoreError stores an error result in the quantum space
+*/
+func (qs *QSpace) StoreError(id string, err error, ttl time.Duration) {
+	qs.mu.Lock()
+	defer qs.mu.Unlock()
+
+	// Create new quantum value with error
+	qv := NewQValue(nil, []State{{Value: nil, Probability: 1.0}})
+	qv.Error = err
+	qv.TTL = ttl
+
+	// Record state transition if value existed
+	if oldQV, exists := qs.values[id]; exists {
+		qs.recordTransition(id, oldQV.States[0], qv.States[0], "error")
+	}
+
+	qs.values[id] = qv
+
+	// Notify waiting observers
+	if channels, ok := qs.waiting[id]; ok {
+		for _, ch := range channels {
+			select {
+			case ch <- qv:
+				// Value successfully sent
+			default:
+				// Channel full or closed, remove it
+				qs.removeWaitingChannel(id, ch)
+			}
+		}
+		delete(qs.waiting, id)
+	}
+}

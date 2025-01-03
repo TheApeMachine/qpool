@@ -1,5 +1,6 @@
 # QPool - Quantum Worker Pool & Message Queue
 
+[![Go CI/CD](https://github.com/theapemachine/qpool/actions/workflows/master.yml/badge.svg)](https://github.com/theapemachine/qpool/actions/workflows/master.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/theapemachine/qpool.svg)](https://pkg.go.dev/github.com/theapemachine/qpool)
 [![Go Report Card](https://goreportcard.com/badge/github.com/theapemachine/qpool)](https://goreportcard.com/report/github.com/theapemachine/qpool)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)

@@ -9,7 +9,7 @@ import (
 )
 
 /*
-	StateTransition represents a change in quantum state.
+StateTransition represents a change in quantum state.
 
 It records the complete history of state changes, including the previous and new states,
 timing information, and the cause of the transition. This maintains a quantum-like
@@ -24,7 +24,7 @@ type StateTransition struct {
 }
 
 /*
-	UncertaintyPrinciple enforces quantum-like uncertainty rules.
+UncertaintyPrinciple enforces quantum-like uncertainty rules.
 
 It implements Heisenberg-inspired uncertainty principles where observation and
 time affect the certainty of quantum values. The principle ensures that values
@@ -43,7 +43,7 @@ type UncertaintyPrinciple struct {
 }
 
 /*
-	QSpace represents a quantum-like state space.
+QSpace represents a quantum-like state space.
 
 It provides a managed environment for quantum-inspired values, maintaining their
 states, relationships, and uncertainties. The space implements concepts from
@@ -81,7 +81,7 @@ type QSpace struct {
 }
 
 /*
-	NewQSpace creates a new quantum space.
+NewQSpace creates a new quantum space.
 
 Initializes a new space with default uncertainty principles and starts
 maintenance goroutines for cleanup and uncertainty monitoring.
@@ -115,7 +115,7 @@ func NewQSpace() *QSpace {
 }
 
 /*
-	Store stores a quantum value with proper uncertainty handling.
+Store stores a quantum value with proper uncertainty handling.
 
 Values are stored with their associated states and TTL, maintaining
 quantum-inspired properties such as superposition and uncertainty.
@@ -164,7 +164,7 @@ func (qs *QSpace) Store(id string, value interface{}, states []State, ttl time.D
 }
 
 /*
-	Await returns a channel that will receive the quantum value.
+Await returns a channel that will receive the quantum value.
 
 Implements quantum-inspired delayed observation, where values may be uncertain
 or not yet collapsed to a definite state.
@@ -200,7 +200,7 @@ func (qs *QSpace) Await(id string) chan *QValue {
 }
 
 /*
-	CreateEntanglement establishes quantum entanglement between values.
+CreateEntanglement establishes quantum entanglement between values.
 
 Creates and manages relationships between quantum values that should maintain
 synchronized states. Like quantum entanglement in physics, changes to one value
@@ -239,7 +239,7 @@ func (qs *QSpace) CreateEntanglement(ids []string) *Entanglement {
 }
 
 /*
-	recordTransition records a state transition in history.
+recordTransition records a state transition in history.
 
 Maintains an immutable record of state changes for quantum values, allowing
 for analysis of state evolution over time.
@@ -264,7 +264,7 @@ func (qs *QSpace) recordTransition(valueID string, from, to State, cause string)
 }
 
 /*
-	runCleanup periodically cleans up expired values.
+runCleanup periodically cleans up expired values.
 
 Runs as a background goroutine to maintain the quantum space by removing
 expired values and relationships, preventing resource leaks.
@@ -287,7 +287,7 @@ func (qs *QSpace) runCleanup() {
 }
 
 /*
-	monitorUncertainty updates uncertainty levels based on time.
+monitorUncertainty updates uncertainty levels based on time.
 
 Implements quantum-inspired uncertainty principles by adjusting uncertainty
 levels of values based on time elapsed since last observation.
@@ -310,7 +310,7 @@ func (qs *QSpace) monitorUncertainty() {
 }
 
 /*
-	cleanup removes expired values and updates relationships.
+cleanup removes expired values and updates relationships.
 
 Performs the actual cleanup operations, removing expired values and updating
 relationship mappings to maintain consistency.
@@ -348,7 +348,7 @@ func (qs *QSpace) cleanup() {
 }
 
 /*
-	updateUncertainties updates uncertainty for all quantum values.
+updateUncertainties updates uncertainty for all quantum values.
 
 Implements the time-based uncertainty principle where values become more
 uncertain as time passes since their last observation.
@@ -382,7 +382,7 @@ func (qs *QSpace) updateUncertainties() {
 }
 
 /*
-	removeWaitingChannel removes a channel from the waiting list.
+removeWaitingChannel removes a channel from the waiting list.
 
 Maintains the waiting channel list by safely removing closed or unneeded channels.
 
@@ -403,7 +403,7 @@ func (qs *QSpace) removeWaitingChannel(id string, ch chan *QValue) {
 }
 
 /*
-	GetStateHistory returns the state transition history for a value.
+GetStateHistory returns the state transition history for a value.
 
 Provides access to the complete history of state transitions for analysis
 and debugging purposes.
@@ -430,7 +430,7 @@ func (qs *QSpace) GetStateHistory(valueID string) []StateTransition {
 }
 
 /*
-	AddRelationship establishes a parent-child relationship between values.
+AddRelationship establishes a parent-child relationship between values.
 
 Creates directed relationships between values while preventing circular
 dependencies that could cause deadlocks or infinite loops.
@@ -459,7 +459,7 @@ func (qs *QSpace) AddRelationship(parentID, childID string) error {
 }
 
 /*
-	wouldCreateCircle checks if adding a relationship would create a circular dependency.
+wouldCreateCircle checks if adding a relationship would create a circular dependency.
 
 Performs depth-first search to detect potential circular dependencies before
 they are created.
@@ -498,7 +498,7 @@ func (qs *QSpace) wouldCreateCircle(parentID, childID string) bool {
 }
 
 /*
-	Close shuts down the quantum space.
+Close shuts down the quantum space.
 
 Performs graceful shutdown of the quantum space, cleaning up resources
 and closing all channels safely.
@@ -536,7 +536,7 @@ func (qs *QSpace) Close() {
 }
 
 /*
-	removeString removes a string from a slice.
+removeString removes a string from a slice.
 
 Helper function to remove a string from a slice.
 */
@@ -550,7 +550,7 @@ func removeString(slice []string, s string) []string {
 }
 
 /*
-	CreateBroadcastGroup creates a new broadcast group.
+CreateBroadcastGroup creates a new broadcast group.
 
 Initializes a new broadcast group with specified parameters and default
 quantum properties such as minimum uncertainty.
@@ -565,7 +565,7 @@ func (qs *QSpace) CreateBroadcastGroup(id string, ttl time.Duration) *BroadcastG
 }
 
 /*
-	Subscribe returns a channel for receiving values from a broadcast group.
+Subscribe returns a channel for receiving values from a broadcast group.
 
 Provides a channel for receiving quantum values from a specific broadcast group.
 */
@@ -580,7 +580,7 @@ func (qs *QSpace) Subscribe(groupID string) chan *QValue {
 }
 
 /*
-	Exists checks if a value exists in the space
+Exists checks if a value exists in the space
 */
 func (qs *QSpace) Exists(id string) bool {
 	qs.mu.RLock()
@@ -590,7 +590,7 @@ func (qs *QSpace) Exists(id string) bool {
 }
 
 /*
-	StoreError stores an error result in the quantum space
+StoreError stores an error result in the quantum space
 */
 func (qs *QSpace) StoreError(id string, err error, ttl time.Duration) {
 	qs.mu.Lock()

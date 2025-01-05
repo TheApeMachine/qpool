@@ -3,9 +3,10 @@ package qpool
 import (
 	"context"
 	"fmt"
-	"log"
 	"sync"
 	"time"
+
+	"github.com/theapemachine/errnie"
 )
 
 /*
@@ -126,7 +127,7 @@ func (q *Q) manage() {
 					return
 				}
 			case <-time.After(q.getSchedulingTimeout()):
-				log.Printf("No available workers for job: %s, timeout occurred", job.ID)
+				errnie.Warn("No available workers for job: %s, timeout occurred", job.ID)
 				// Store error result since we couldn't process the job
 				q.space.Store(job.ID, nil, []State{{
 					Value:       fmt.Errorf("no available workers"),
@@ -203,7 +204,7 @@ func (q *Q) Schedule(id string, fn func() (any, error), opts ...JobOption) chan 
 		if breaker != nil && !breaker.Allow() {
 			ch := make(chan *QValue, 1)
 			ch <- &QValue{
-				Error:     fmt.Errorf("circuit breaker %s is open", job.CircuitID),
+				Error:     errnie.Error(fmt.Errorf("circuit breaker %s is open", job.CircuitID)),
 				CreatedAt: time.Now(),
 			}
 			close(ch)
@@ -219,7 +220,7 @@ func (q *Q) Schedule(id string, fn func() (any, error), opts ...JobOption) chan 
 	case <-ctx.Done():
 		ch := make(chan *QValue, 1)
 		ch <- &QValue{
-			Error:     fmt.Errorf("job scheduling timeout: %w", ctx.Err()),
+			Error:     errnie.Error(fmt.Errorf("job scheduling timeout: %w", ctx.Err())),
 			CreatedAt: time.Now(),
 		}
 		close(ch)
@@ -294,7 +295,7 @@ func (q *Q) startWorker() {
 		defer q.wg.Done()
 		worker.run()
 	}()
-	log.Printf("Started worker, total workers: %d", q.metrics.WorkerCount)
+	errnie.Info("Started worker, total workers: %d", q.metrics.WorkerCount)
 }
 
 /*
@@ -313,7 +314,7 @@ func WithTTL(ttl time.Duration) JobOption {
 	getCircuitBreaker returns the circuit breaker for a job.
 
 If the job does not have a circuit ID or configuration, it returns nil.
-*/		
+*/
 func (q *Q) getCircuitBreaker(job Job) *CircuitBreaker {
 	if job.CircuitID == "" || job.CircuitConfig == nil {
 		return nil
@@ -337,8 +338,9 @@ func (q *Q) getCircuitBreaker(job Job) *CircuitBreaker {
 }
 
 /*
-											getSchedulingTimeout returns the scheduling timeout from the configuration or
-	uses a default value if not specified.
+	getSchedulingTimeout returns the scheduling timeout from the configuration or
+
+uses a default value if not specified.
 */
 func (q *Q) getSchedulingTimeout() time.Duration {
 	if q.config != nil && q.config.SchedulingTimeout > 0 {
@@ -362,11 +364,11 @@ func (q *Q) Close() {
 		return
 	}
 
-	log.Println("Closing Quantum Pool")
+	errnie.Info("Closing Quantum Pool")
 
 	// Cancel context first to stop all operations
 	if q.cancel != nil {
-		log.Println("Cancelling context")
+		errnie.Info("Cancelling context")
 		q.cancel()
 	}
 
@@ -385,5 +387,5 @@ func (q *Q) Close() {
 	close(q.jobs)
 	close(q.workers)
 
-	log.Println("Quantum Pool closed")
+	errnie.Info("Quantum Pool closed")
 }

@@ -3,8 +3,9 @@ package qpool
 import (
 	"context"
 	"fmt"
-	"log"
 	"time"
+
+	"github.com/theapemachine/errnie"
 )
 
 // Worker processes jobs
@@ -23,52 +24,52 @@ func (w *Worker) run() {
 		// First check if we should exit
 		select {
 		case <-w.pool.ctx.Done():
-			log.Printf("Worker exiting due to context cancellation")
+			errnie.Info("Worker exiting due to context cancellation")
 			return
 		default:
 		}
 
 		// Register ourselves as available
-		log.Printf("Worker registering as available")
+		errnie.Info("Worker registering as available")
 		w.pool.workers <- jobChan
 
 		// Wait for a job
 		select {
 		case <-w.pool.ctx.Done():
-			log.Printf("Worker exiting while waiting for job")
+			errnie.Info("Worker exiting while waiting for job")
 			return
 		case job, ok := <-jobChan:
 			if !ok {
-				log.Printf("Worker job channel closed")
+				errnie.Warn("Worker job channel closed")
 				return
 			}
 
-			log.Printf("Worker received job: %s", job.ID)
+			errnie.Info("Worker received job: %s", job.ID)
 			w.currentJob = &job
 			result, err := w.processJobWithTimeout(w.pool.ctx, job)
 			w.currentJob = nil
-			log.Printf("Worker completed job: %s, err: %v", job.ID, err)
+			errnie.Info("Worker completed job: %s, err: %v", job.ID, err)
 
 			// Handle result
 			if err != nil {
 				w.pool.metrics.RecordJobFailure()
-				log.Printf("Job %s failed: %v", job.ID, err)
+				errnie.Error(fmt.Errorf("Job %s failed: %v", job.ID, err))
 				// Store error result
 				w.pool.space.StoreError(job.ID, err, job.TTL)
 			} else {
 				w.pool.metrics.RecordJobSuccess(time.Since(job.StartTime))
-				log.Printf("Job %s succeeded", job.ID)
+				errnie.Info("Job %s succeeded", job.ID)
 				// Store successful result
 				w.pool.space.Store(job.ID, result, []State{{Value: result, Probability: 1.0}}, job.TTL)
 			}
-			log.Printf("Stored result for job: %s", job.ID)
+			errnie.Info("Stored result for job: %s", job.ID)
 
 			// Notify dependents
 			if len(job.Dependencies) > 0 {
 				for _, depID := range job.Dependencies {
 					if children := w.pool.space.children[depID]; len(children) > 0 {
 						for _, childID := range children {
-							log.Printf("Notifying dependent job %s", childID)
+							errnie.Info("Notifying dependent job %s", childID)
 						}
 					}
 				}
@@ -99,13 +100,13 @@ func (w *Worker) processJobWithTimeout(ctx context.Context, job Job) (any, error
 	go func() {
 		defer close(done)
 		result, err = job.Fn()
-		log.Printf("Job %s completed", job.ID)
+		errnie.Info("Job %s completed", job.ID)
 	}()
 
 	select {
 	case <-ctx.Done():
 		w.pool.metrics.RecordJobFailure()
-		return nil, fmt.Errorf("job %s timed out", job.ID)
+		return nil, errnie.Error(fmt.Errorf("job %s timed out", job.ID))
 	case <-done:
 		w.pool.metrics.RecordJobExecution(startTime, err == nil)
 		return result, err
@@ -170,7 +171,7 @@ func (w *Worker) checkSingleDependency(depID string, retryPolicy *RetryPolicy) e
 	}
 	w.pool.space.mu.Unlock()
 
-	return fmt.Errorf("dependency %s failed after %d attempts", depID, maxAttempts)
+	return errnie.Error(fmt.Errorf("dependency %s failed after %d attempts", depID, maxAttempts))
 }
 
 // recordFailure records a failure for a specific circuit breaker
@@ -191,7 +192,5 @@ func (w *Worker) recordFailure(circuitID string) {
 // Add this method to the Worker struct
 func (w *Worker) handleJobTimeout(job Job) error {
 	w.pool.metrics.RecordJobFailure()
-	err := fmt.Errorf("job %s timed out", job.ID)
-	log.Printf("Job %s timed out", job.ID)
-	return err
+	return errnie.Error(fmt.Errorf("job %s timed out", job.ID))
 }

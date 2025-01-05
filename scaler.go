@@ -1,9 +1,10 @@
 package qpool
 
 import (
-	"log"
 	"math"
 	"time"
+
+	"github.com/theapemachine/errnie"
 )
 
 // Scaler manages pool size based on current load
@@ -41,7 +42,7 @@ func (s *Scaler) evaluate() {
 	}
 
 	currentLoad := float64(s.pool.metrics.JobQueueSize) / float64(s.pool.metrics.WorkerCount)
-	log.Printf("Current load: %.2f, Workers: %d, Queue: %d",
+	errnie.Log("Current load: %.2f, Workers: %d, Queue: %d",
 		currentLoad, s.pool.metrics.WorkerCount, s.pool.metrics.JobQueueSize)
 
 	switch {
@@ -70,7 +71,7 @@ func (s *Scaler) scaleUp(count int) {
 	for i := 0; i < toAdd; i++ {
 		s.pool.startWorker()
 	}
-	log.Printf("Scaled up by %d workers, total workers: %d", toAdd, s.pool.metrics.WorkerCount)
+	errnie.Info("Scaled up by %d workers, total workers: %d", toAdd, s.pool.metrics.WorkerCount)
 }
 
 // scaleDown removes 'count' number of workers from the pool
@@ -100,7 +101,7 @@ func (s *Scaler) scaleDown(count int) {
 			cancelFunc()
 		}
 
-		log.Printf("Scaled down worker, total workers: %d", s.pool.metrics.WorkerCount)
+		errnie.Info("Scaled down worker, total workers: %d", s.pool.metrics.WorkerCount)
 
 		// Add a small delay between worker removals
 		time.Sleep(time.Millisecond * 50)

@@ -1,0 +1,3970 @@
+
+// File: adaptivescaler.go
+
+package qpool
+
+import (
+	"math"
+	"sync"
+	"time"
+)
+
+/*
+AdaptiveScalerRegulator implements the Regulator interface to dynamically adjust worker pool size.
+It combines the functionality of the existing Scaler with additional adaptive behaviors,
+similar to how an adaptive cruise control system adjusts speed based on traffic conditions.
+
+Key features:
+  - Dynamic worker pool sizing
+  - Load-based scaling
+  - Resource-aware adjustments
+  - Performance optimization
+*/
+type AdaptiveScalerRegulator struct {
+	mu sync.RWMutex
+
+	pool               *Q
+	minWorkers         int
+	maxWorkers         int
+	targetLoad         float64       // Target jobs per worker
+	scaleUpThreshold   float64       // Load threshold for scaling up
+	scaleDownThreshold float64       // Load threshold for scaling down
+	cooldown           time.Duration // Time between scaling operations
+	lastScale          time.Time     // Last scaling operation time
+	metrics           *Metrics      // System metrics
+}
+
+/*
+NewAdaptiveScalerRegulator creates a new adaptive scaler regulator.
+
+Parameters:
+  - pool: The worker pool to manage
+  - minWorkers: Minimum number of workers
+  - maxWorkers: Maximum number of workers
+  - config: Scaling configuration parameters
+
+Returns:
+  - *AdaptiveScalerRegulator: A new adaptive scaler instance
+
+Example:
+    scaler := NewAdaptiveScalerRegulator(pool, 2, 10, &ScalerConfig{...})
+*/
+func NewAdaptiveScalerRegulator(pool *Q, minWorkers, maxWorkers int, config *ScalerConfig) *AdaptiveScalerRegulator {
+	return &AdaptiveScalerRegulator{
+		pool:               pool,
+		minWorkers:         minWorkers,
+		maxWorkers:         maxWorkers,
+		targetLoad:         config.TargetLoad,
+		scaleUpThreshold:   config.ScaleUpThreshold,
+		scaleDownThreshold: config.ScaleDownThreshold,
+		cooldown:           config.Cooldown,
+		lastScale:          time.Now(),
+	}
+}
+
+/*
+Observe implements the Regulator interface by monitoring system metrics.
+This method updates the scaler's view of system load and performance.
+
+Parameters:
+  - metrics: Current system metrics including worker and queue statistics
+*/
+func (as *AdaptiveScalerRegulator) Observe(metrics *Metrics) {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+
+	as.metrics = metrics
+	as.evaluate()
+}
+
+/*
+Limit implements the Regulator interface by determining if scaling operations
+should be limited. Returns true during cooldown periods or at worker limits.
+
+Returns:
+  - bool: true if scaling should be limited, false if it can proceed
+*/
+func (as *AdaptiveScalerRegulator) Limit() bool {
+	as.mu.RLock()
+	defer as.mu.RUnlock()
+
+	if as.metrics == nil {
+		return false
+	}
+
+	// Limit if we're at max workers and load is high
+	if as.metrics.WorkerCount >= as.maxWorkers {
+		currentLoad := float64(as.metrics.JobQueueSize) / float64(as.metrics.WorkerCount)
+		return currentLoad > as.scaleUpThreshold
+	}
+
+	return false
+}
+
+/*
+Renormalize implements the Regulator interface by attempting to restore normal operation.
+This method triggers a scaling evaluation if enough time has passed since the last scale.
+*/
+func (as *AdaptiveScalerRegulator) Renormalize() {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+
+	if time.Since(as.lastScale) >= as.cooldown {
+		as.evaluate()
+	}
+}
+
+// evaluate assesses current metrics and scales the worker pool accordingly
+func (as *AdaptiveScalerRegulator) evaluate() {
+	if as.metrics == nil || time.Since(as.lastScale) < as.cooldown {
+		return
+	}
+
+	// Ensure at least one worker for load calculation
+	if as.metrics.WorkerCount == 0 {
+		as.metrics.WorkerCount = 1
+	}
+
+	currentLoad := float64(as.metrics.JobQueueSize) / float64(as.metrics.WorkerCount)
+
+	switch {
+	case currentLoad > as.scaleUpThreshold && as.metrics.WorkerCount < as.maxWorkers:
+		needed := int(math.Ceil(float64(as.metrics.JobQueueSize) / as.targetLoad))
+		toAdd := Min(as.maxWorkers-as.metrics.WorkerCount, needed)
+		if toAdd > 0 {
+			as.scaleUp(toAdd)
+			as.lastScale = time.Now()
+		}
+
+	case currentLoad < as.scaleDownThreshold && as.metrics.WorkerCount > as.minWorkers:
+		needed := Max(int(math.Ceil(float64(as.metrics.JobQueueSize)/as.targetLoad)), as.minWorkers)
+		toRemove := Min(as.metrics.WorkerCount-as.minWorkers, Max(1, (as.metrics.WorkerCount-needed)/2))
+		if toRemove > 0 {
+			as.scaleDown(toRemove)
+			as.lastScale = time.Now()
+		}
+	}
+}
+
+// scaleUp adds workers to the pool
+func (as *AdaptiveScalerRegulator) scaleUp(count int) {
+	toAdd := Min(as.maxWorkers-as.metrics.WorkerCount, Max(1, count))
+	for i := 0; i < toAdd; i++ {
+		as.pool.startWorker()
+	}
+}
+
+// scaleDown removes workers from the pool
+func (as *AdaptiveScalerRegulator) scaleDown(count int) {
+	as.pool.workerMu.Lock()
+	defer as.pool.workerMu.Unlock()
+
+	for i := 0; i < count; i++ {
+		if len(as.pool.workerList) == 0 {
+			break
+		}
+
+		// Remove the last worker from the list
+		w := as.pool.workerList[len(as.pool.workerList)-1]
+		as.pool.workerList = as.pool.workerList[:len(as.pool.workerList)-1]
+
+		// Cancel the worker's context outside the lock to avoid holding it during cleanup
+		cancelFunc := w.cancel
+
+		as.metrics.WorkerCount--
+
+		// Release the lock before cleanup operations
+		as.pool.workerMu.Unlock()
+
+		// Cancel the worker's context
+		if cancelFunc != nil {
+			cancelFunc()
+		}
+
+		// Add a small delay between worker removals
+		time.Sleep(time.Millisecond * 50)
+
+		// Re-acquire the lock for the next iteration
+		as.pool.workerMu.Lock()
+	}
+} 
+
+
+// File: backpressure.go
+
+package qpool
+
+import (
+	"sync"
+	"time"
+)
+
+// MinFloat returns the smaller of two float64 values
+func MinFloat(a, b float64) float64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// MaxFloat returns the larger of two float64 values
+func MaxFloat(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+/*
+BackPressureRegulator implements the Regulator interface to prevent system overload.
+It monitors queue depth and processing times to regulate job intake, similar to how
+pressure regulators in plumbing systems prevent pipe damage by limiting flow when
+pressure builds up.
+
+Key features:
+  - Queue depth monitoring
+  - Processing time tracking
+  - Adaptive pressure thresholds
+  - Gradual flow control
+*/
+type BackPressureRegulator struct {
+	mu sync.RWMutex
+
+	maxQueueSize      int           // Maximum allowed queue size
+	targetProcessTime time.Duration // Target job processing time
+	pressureWindow    time.Duration // Time window for pressure calculation
+	currentPressure   float64       // Current system pressure (0.0-1.0)
+	metrics          *Metrics      // System metrics
+	lastCheck        time.Time     // Last pressure check time
+}
+
+/*
+NewBackPressureRegulator creates a new back pressure regulator.
+
+Parameters:
+  - maxQueueSize: Maximum allowed queue size before applying back pressure
+  - targetProcessTime: Target job processing time
+  - pressureWindow: Time window for pressure calculations
+
+Returns:
+  - *BackPressureRegulator: A new back pressure regulator instance
+
+Example:
+    regulator := NewBackPressureRegulator(1000, time.Second, time.Minute)
+*/
+func NewBackPressureRegulator(maxQueueSize int, targetProcessTime, pressureWindow time.Duration) *BackPressureRegulator {
+	return &BackPressureRegulator{
+		maxQueueSize:      maxQueueSize,
+		targetProcessTime: targetProcessTime,
+		pressureWindow:    pressureWindow,
+		currentPressure:   0.0,
+		lastCheck:         time.Now(),
+	}
+}
+
+/*
+Observe implements the Regulator interface by monitoring system metrics.
+This method updates the regulator's view of system pressure based on queue size
+and processing times.
+
+Parameters:
+  - metrics: Current system metrics including queue and timing data
+*/
+func (bp *BackPressureRegulator) Observe(metrics *Metrics) {
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+
+	bp.metrics = metrics
+	bp.updatePressure()
+}
+
+/*
+Limit implements the Regulator interface by determining if job intake should be limited.
+Returns true when system pressure exceeds acceptable levels.
+
+Returns:
+  - bool: true if job intake should be limited, false if it can proceed
+*/
+func (bp *BackPressureRegulator) Limit() bool {
+	bp.mu.RLock()
+	defer bp.mu.RUnlock()
+
+	// Apply back pressure based on current pressure level
+	return bp.currentPressure >= 0.8 // Limit at 80% pressure
+}
+
+/*
+Renormalize implements the Regulator interface by attempting to restore normal operation.
+This method gradually reduces system pressure if conditions allow.
+*/
+func (bp *BackPressureRegulator) Renormalize() {
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+
+	// Gradually reduce pressure if queue size and processing times are improving
+	if bp.metrics != nil && 
+	   bp.metrics.JobQueueSize < bp.maxQueueSize/2 && 
+	   bp.metrics.AverageJobLatency < bp.targetProcessTime {
+		bp.currentPressure = MaxFloat(0.0, bp.currentPressure-0.1)
+	}
+}
+
+// updatePressure calculates current system pressure based on metrics
+func (bp *BackPressureRegulator) updatePressure() {
+	if bp.metrics == nil {
+		return
+	}
+
+	// Calculate queue pressure (0.0-1.0)
+	queuePressure := float64(bp.metrics.JobQueueSize) / float64(bp.maxQueueSize)
+
+	// Calculate timing pressure (0.0-1.0)
+	timingPressure := 0.0
+	if bp.metrics.AverageJobLatency > 0 {
+		timingPressure = float64(bp.metrics.AverageJobLatency) / float64(bp.targetProcessTime)
+	}
+
+	// Combine pressures with weights
+	bp.currentPressure = (queuePressure*0.6 + timingPressure*0.4)
+
+	// Ensure pressure stays in valid range
+	bp.currentPressure = MinFloat(1.0, MaxFloat(0.0, bp.currentPressure))
+}
+
+// GetPressure returns the current system pressure level
+func (bp *BackPressureRegulator) GetPressure() float64 {
+	bp.mu.RLock()
+	defer bp.mu.RUnlock()
+	return bp.currentPressure
+} 
+
+
+// File: broadcastgroup.go
+
+// broadcastgroup.go
+package qpool
+
+import (
+	"math"
+	"sync"
+	"time"
+)
+
+/*
+	FilterFunc defines a function type for filtering quantum values.
+
+This function type is used to determine whether a quantum value should be
+processed or ignored in the broadcast system.
+
+Parameters:
+  - *QValue: The quantum value to be filtered
+
+Returns:
+  - bool: True if the value should be processed, false if it should be filtered out
+*/
+type FilterFunc func(*QValue) bool
+
+/*
+	RoutingRule defines how messages should be routed to specific subscribers.
+
+It combines subscriber identification with filtering logic and priority levels
+to enable sophisticated message routing in the broadcast system.
+*/
+type RoutingRule struct {
+	SubscriberID string
+	Filter       FilterFunc
+	Priority     int
+}
+
+/*
+	BroadcastGroup implements a quantum-aware pub/sub system.
+
+It provides a quantum-inspired broadcast mechanism that maintains quantum properties
+such as entanglement and uncertainty while distributing messages to subscribers.
+
+Key features:
+  - Quantum state preservation
+  - Filtered message routing
+  - Subscriber management
+  - Metrics collection
+  - Entanglement support
+*/
+type BroadcastGroup struct {
+	mu sync.RWMutex
+
+	ID           string
+	channels     []chan *QValue
+	subscribers  map[string]chan *QValue
+	filters      []FilterFunc
+	routingRules map[string][]RoutingRule
+	metrics      *BroadcastMetrics
+
+	// Quantum properties
+	entanglement *Entanglement
+	uncertainty  UncertaintyLevel
+
+	// Management
+	TTL          time.Duration
+	LastUsed     time.Time
+	maxQueueSize int
+}
+
+/*
+	BroadcastMetrics tracks performance and behavior of the broadcast group.
+
+Collects and maintains statistical information about the broadcast group's
+operation, including message counts, latency, and quantum uncertainty levels.
+*/
+type BroadcastMetrics struct {
+	MessagesSent      int64
+	MessagesDropped   int64
+	AverageLatency    time.Duration
+	ActiveSubscribers int
+	UncertaintyLevel  UncertaintyLevel
+	LastBroadcastTime time.Time
+}
+
+/*
+	NewBroadcastGroup creates a new broadcast group with quantum properties.
+
+Initializes a new broadcast group with specified parameters and default
+quantum properties such as minimum uncertainty.
+
+Parameters:
+  - id: Unique identifier for the broadcast group
+  - ttl: Time-to-live duration for the group
+  - maxQueue: Maximum queue size for message buffering
+
+Returns:
+  - *BroadcastGroup: A new broadcast group instance
+*/
+func NewBroadcastGroup(id string, ttl time.Duration, maxQueue int) *BroadcastGroup {
+	return &BroadcastGroup{
+		ID:           id,
+		subscribers:  make(map[string]chan *QValue),
+		routingRules: make(map[string][]RoutingRule),
+		TTL:          ttl,
+		LastUsed:     time.Now(),
+		maxQueueSize: maxQueue,
+		metrics:      &BroadcastMetrics{},
+		uncertainty:  MinUncertainty,
+	}
+}
+
+/*
+	Subscribe adds a new subscriber with optional filtering and routing rules.
+
+Creates and registers a new subscriber channel with specified buffer size and
+optional routing rules for message filtering.
+
+Parameters:
+  - subscriberID: Unique identifier for the subscriber
+  - bufferSize: Size of the subscriber's message buffer
+  - rules: Optional routing rules for message filtering
+
+Returns:
+  - chan *QValue: Channel for receiving broadcast messages
+
+Thread-safe: This method uses mutual exclusion to ensure safe concurrent access.
+*/
+func (bg *BroadcastGroup) Subscribe(subscriberID string, bufferSize int, rules ...RoutingRule) chan *QValue {
+	bg.mu.Lock()
+	defer bg.mu.Unlock()
+
+	ch := make(chan *QValue, bufferSize)
+	bg.subscribers[subscriberID] = ch
+
+	if len(rules) > 0 {
+		bg.routingRules[subscriberID] = rules
+	}
+
+	bg.metrics.ActiveSubscribers++
+	return ch
+}
+
+/*
+	Unsubscribe removes a subscriber and cleans up associated resources.
+
+Safely removes a subscriber from the broadcast group, closing their channel
+and cleaning up any associated routing rules.
+
+Parameters:
+  - subscriberID: ID of the subscriber to remove
+
+Thread-safe: This method uses mutual exclusion to ensure safe concurrent access.
+*/
+func (bg *BroadcastGroup) Unsubscribe(subscriberID string) {
+	bg.mu.Lock()
+	defer bg.mu.Unlock()
+
+	if ch, exists := bg.subscribers[subscriberID]; exists {
+		close(ch)
+		delete(bg.subscribers, subscriberID)
+		delete(bg.routingRules, subscriberID)
+		bg.metrics.ActiveSubscribers--
+	}
+}
+
+/*
+	Send broadcasts a quantum value to all applicable subscribers.
+
+Distributes a quantum value to subscribers according to routing rules while
+maintaining quantum properties and updating metrics.
+
+Parameters:
+  - qv: The quantum value to broadcast
+
+Thread-safe: This method uses mutual exclusion to ensure safe concurrent access.
+*/
+func (bg *BroadcastGroup) Send(qv *QValue) {
+	bg.mu.Lock()
+	defer bg.mu.Unlock()
+
+	startTime := time.Now()
+	bg.LastUsed = startTime
+
+	// Apply global filters
+	for _, filter := range bg.filters {
+		if !filter(qv) {
+			bg.metrics.MessagesDropped++
+			return
+		}
+	}
+
+	// Track message through entanglement if configured
+	if bg.entanglement != nil {
+		bg.entanglement.UpdateState("broadcast", qv)
+	}
+
+	// Apply routing rules and send to subscribers
+	for subID, ch := range bg.subscribers {
+		if rules, hasRules := bg.routingRules[subID]; hasRules {
+			// Check if message passes any routing rules
+			shouldSend := false
+			for _, rule := range rules {
+				if rule.Filter(qv) {
+					shouldSend = true
+					break
+				}
+			}
+			if !shouldSend {
+				continue
+			}
+		}
+
+		// Attempt to send with non-blocking write
+		select {
+		case ch <- qv:
+			bg.metrics.MessagesSent++
+		default:
+			// Channel full - message dropped
+			bg.metrics.MessagesDropped++
+		}
+	}
+
+	// Update metrics
+	bg.metrics.LastBroadcastTime = startTime
+	bg.metrics.AverageLatency = time.Since(startTime)
+	bg.updateUncertainty()
+}
+
+/*
+	AddFilter adds a global filter to the broadcast group.
+
+Registers a new filter function that will be applied to all messages
+before broadcasting.
+
+Parameters:
+  - filter: The filter function to add
+
+Thread-safe: This method uses mutual exclusion to ensure safe concurrent access.
+*/
+func (bg *BroadcastGroup) AddFilter(filter FilterFunc) {
+	bg.mu.Lock()
+	defer bg.mu.Unlock()
+	bg.filters = append(bg.filters, filter)
+}
+
+/*
+	AddRoutingRule adds a routing rule for a specific subscriber.
+
+Adds a new routing rule that determines how messages should be filtered
+for a specific subscriber.
+
+Parameters:
+  - subscriberID: ID of the subscriber to add the rule for
+  - rule: The routing rule to add
+
+Thread-safe: This method uses mutual exclusion to ensure safe concurrent access.
+*/
+func (bg *BroadcastGroup) AddRoutingRule(subscriberID string, rule RoutingRule) {
+	bg.mu.Lock()
+	defer bg.mu.Unlock()
+	bg.routingRules[subscriberID] = append(bg.routingRules[subscriberID], rule)
+}
+
+/*
+	SetEntanglement connects the broadcast group to an entanglement.
+
+Associates the broadcast group with a quantum entanglement, allowing it to
+participate in quantum-like state synchronization.
+
+Parameters:
+  - e: The entanglement to connect to
+
+Thread-safe: This method uses mutual exclusion to ensure safe concurrent access.
+*/
+func (bg *BroadcastGroup) SetEntanglement(e *Entanglement) {
+	bg.mu.Lock()
+	defer bg.mu.Unlock()
+	bg.entanglement = e
+}
+
+/*
+	updateUncertainty adjusts uncertainty based on broadcast patterns.
+
+Updates the uncertainty level of the broadcast group based on the time
+elapsed since the last broadcast, implementing quantum-inspired uncertainty
+principles.
+
+Thread-safe: Called within Send which provides mutex protection.
+*/
+func (bg *BroadcastGroup) updateUncertainty() {
+	timeSinceLastBroadcast := time.Since(bg.metrics.LastBroadcastTime)
+
+	// Uncertainty increases with time since last broadcast
+	uncertaintyFactor := float64(timeSinceLastBroadcast) / float64(time.Second)
+	newUncertainty := UncertaintyLevel(math.Min(
+		float64(bg.uncertainty)+(uncertaintyFactor*0.01),
+		float64(MaxUncertainty),
+	))
+
+	bg.uncertainty = newUncertainty
+	bg.metrics.UncertaintyLevel = newUncertainty
+}
+
+/*
+	GetMetrics returns current broadcast metrics.
+
+Provides access to the current operational metrics of the broadcast group.
+
+Returns:
+  - BroadcastMetrics: Copy of the current metrics
+
+Thread-safe: This method uses read-lock to ensure safe concurrent access.
+*/
+func (bg *BroadcastGroup) GetMetrics() BroadcastMetrics {
+	bg.mu.RLock()
+	defer bg.mu.RUnlock()
+	return *bg.metrics
+}
+
+/*
+	Close shuts down the broadcast group and cleans up resources.
+
+Performs graceful shutdown of the broadcast group, closing all subscriber
+channels and cleaning up internal resources.
+
+Thread-safe: This method uses mutual exclusion to ensure safe concurrent access.
+*/
+func (bg *BroadcastGroup) Close() {
+	bg.mu.Lock()
+	defer bg.mu.Unlock()
+
+	// Close all subscriber channels
+	for _, ch := range bg.subscribers {
+		close(ch)
+	}
+
+	// Clear maps and slices
+	bg.subscribers = nil
+	bg.routingRules = nil
+	bg.filters = nil
+	bg.entanglement = nil
+}
+
+
+
+// File: circuitbreaker.go
+
+package qpool
+
+import (
+	"log"
+	"sync"
+	"time"
+)
+
+/*
+CircuitState represents the state of the circuit breaker.
+This is used to track the current operational mode of the circuit breaker
+as it transitions between different states based on system health.
+*/
+type CircuitState int
+
+const (
+	CircuitClosed CircuitState = iota // Normal operation state
+	CircuitOpen                       // Failure state, rejecting requests
+	CircuitHalfOpen                   // Probationary state, allowing limited requests
+)
+
+/*
+CircuitBreaker implements both the circuit breaker pattern and Regulator interface.
+It provides a way to automatically degrade service when the system is under stress
+by temporarily stopping operations when a failure threshold is reached.
+
+The circuit breaker operates in three states:
+  - Closed: Normal operation, all requests are allowed
+  - Open: Failure threshold exceeded, all requests are rejected
+  - Half-Open: Probationary state allowing limited requests to test system health
+
+This pattern helps prevent cascading failures and allows the system to recover
+from failure states without overwhelming potentially unstable dependencies.
+*/
+type CircuitBreaker struct {
+	mu               sync.RWMutex
+	maxFailures      int           // Maximum failures before opening circuit
+	resetTimeout     time.Duration // Time to wait before attempting recovery
+	halfOpenMax      int          // Maximum requests allowed in half-open state
+	failureCount     int          // Current count of consecutive failures
+	state            CircuitState // Current state of the circuit breaker
+	openTime         time.Time    // Time when circuit was opened
+	halfOpenAttempts int          // Number of attempts made in half-open state
+	metrics          *Metrics     // Current system metrics
+}
+
+/*
+NewCircuitBreaker creates a new circuit breaker instance with specified parameters.
+
+Parameters:
+  - maxFailures: Number of failures allowed before opening the circuit
+  - resetTimeout: Duration to wait before attempting to close an open circuit
+  - halfOpenMax: Maximum number of requests allowed in half-open state
+
+Returns:
+  - *CircuitBreaker: A new circuit breaker instance initialized in closed state
+*/
+func NewCircuitBreaker(maxFailures int, resetTimeout time.Duration, halfOpenMax int) *CircuitBreaker {
+	return &CircuitBreaker{
+		maxFailures:  maxFailures,
+		resetTimeout: resetTimeout,
+		halfOpenMax:  halfOpenMax,
+		state:        CircuitClosed,
+	}
+}
+
+/*
+Observe implements the Regulator interface by accepting system metrics.
+This method allows the circuit breaker to monitor system health and adjust
+its behavior based on current conditions.
+
+Parameters:
+  - metrics: Current system metrics including performance and health indicators
+*/
+func (cb *CircuitBreaker) Observe(metrics *Metrics) {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.metrics = metrics
+}
+
+/*
+Limit implements the Regulator interface by determining if requests should be limited.
+This method provides a standardized way to check if the circuit breaker is
+currently preventing operations.
+
+Returns:
+  - bool: true if requests should be limited, false if they should proceed
+*/
+func (cb *CircuitBreaker) Limit() bool {
+	return !cb.Allow()
+}
+
+/*
+Renormalize implements the Regulator interface by attempting to restore normal operation.
+This method checks if enough time has passed since the circuit was opened and
+transitions to half-open state if appropriate, allowing for system recovery.
+*/
+func (cb *CircuitBreaker) Renormalize() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	
+	if cb.state == CircuitOpen && time.Since(cb.openTime) > cb.resetTimeout {
+		cb.state = CircuitHalfOpen
+		cb.halfOpenAttempts = 0
+		log.Printf("Circuit breaker renormalized to half-open state")
+	}
+}
+
+/*
+RecordFailure records a failure and updates the circuit state.
+This method tracks the number of failures and opens the circuit if
+the failure threshold is exceeded. It handles state transitions
+differently based on the current circuit state.
+*/
+func (cb *CircuitBreaker) RecordFailure() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	cb.failureCount++
+	if cb.failureCount >= cb.maxFailures {
+		if cb.state == CircuitHalfOpen {
+			// If we fail in half-open state, go back to open
+			cb.state = CircuitOpen
+			cb.openTime = time.Now()
+			log.Printf("Circuit breaker reopened from half-open state")
+		} else if cb.state == CircuitClosed {
+			// Only open the circuit if we were closed
+			cb.state = CircuitOpen
+			cb.openTime = time.Now()
+			log.Printf("Circuit breaker opened")
+		}
+	}
+}
+
+/*
+RecordSuccess records a successful attempt and updates the circuit state.
+This method handles the transition from half-open to closed state after
+successful operations, and resets failure counts in closed state.
+*/
+func (cb *CircuitBreaker) RecordSuccess() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	if cb.state == CircuitHalfOpen {
+			cb.halfOpenAttempts++
+			if cb.halfOpenAttempts >= cb.halfOpenMax {
+				cb.state = CircuitClosed
+				cb.failureCount = 0
+				cb.halfOpenAttempts = 0
+				log.Printf("Circuit breaker closed from half-open")
+			}
+	} else if cb.state == CircuitClosed {
+		// Reset failure count on success in closed state
+		cb.failureCount = 0
+	}
+}
+
+/*
+Allow determines if a request is allowed based on the circuit state.
+This method implements the core circuit breaker logic, determining whether
+to allow requests based on the current state and timing conditions.
+
+Returns:
+  - bool: true if the request should be allowed, false if it should be rejected
+*/
+func (cb *CircuitBreaker) Allow() bool {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	switch cb.state {
+	case CircuitClosed:
+		return true
+	case CircuitOpen:
+		if time.Since(cb.openTime) > cb.resetTimeout {
+			cb.state = CircuitHalfOpen
+			cb.halfOpenAttempts = 0
+			return true
+		}
+		return false
+	case CircuitHalfOpen:
+		return cb.halfOpenAttempts < cb.halfOpenMax
+	default:
+		return false
+	}
+}
+
+
+
+// File: config.go
+
+package qpool
+
+import "time"
+
+type Config struct {
+	SchedulingTimeout time.Duration
+}
+
+func NewConfig() *Config {
+	return &Config{
+		SchedulingTimeout: 10 * time.Second,
+	}
+}
+
+
+
+// File: entanglement.go
+
+package qpool
+
+import (
+	"sync"
+	"time"
+)
+
+/*
+Entanglement wraps a selection of jobs into a shared space.
+Meant for jobs that each describe part of a larger task.
+When one job in the entanglement changes state, it affects all others.
+
+Inspired by quantum entanglement, this type provides a way to create groups of jobs
+that share state and react to changes in that state simultaneously. Just as quantum
+particles can be entangled such that the state of one instantly affects the other,
+jobs in an Entanglement share a common state that, when changed, affects all jobs
+in the group.
+
+The shared state in an Entanglement is immutable and persistent. State changes are
+recorded in a ledger and replayed for any job that joins or starts processing later,
+ensuring that the quantum-like property of entanglement is maintained across time.
+This means that even if jobs process at different times, they all see the complete
+history of state changes, preserving the causal relationship between entangled jobs.
+
+Use cases include:
+  - Distributed data processing where multiple jobs need to share intermediate results
+  - Coordinated tasks where jobs need to react to each other's progress
+  - State synchronization across a set of related operations
+  - Fan-out/fan-in patterns where multiple jobs contribute to a shared outcome
+*/
+type Entanglement struct {
+	ID            string
+	Jobs          []Job
+	SharedState   map[string]any
+	CreatedAt     time.Time
+	LastModified  time.Time
+	mu            sync.RWMutex
+	Dependencies  []string
+	TTL           time.Duration
+	OnStateChange func(oldState, newState map[string]any)
+	
+	// StateChangeLedger maintains an ordered history of all state changes
+	// This ensures that even jobs that start processing later will see
+	// the complete history of state changes in the correct order
+	stateLedger []StateChange
+}
+
+/*
+StateChange represents an immutable record of a change to the shared state.
+Each change is timestamped and contains both the key and value that was changed,
+allowing for precise replay of state evolution.
+*/
+type StateChange struct {
+	Timestamp time.Time
+	Key       string
+	Value     any
+	Sequence  uint64 // Monotonically increasing sequence number
+}
+
+/*
+NewEntanglement creates a new entanglement of jobs with the specified ID and TTL.
+
+The entanglement acts as a quantum-inspired container that maintains shared state
+across multiple jobs. Like quantum entangled particles that remain connected regardless
+of distance, jobs in the entanglement remain connected through their shared state.
+
+The state history is preserved and replayed for any job that starts processing later,
+ensuring that the quantum-like property of entanglement is maintained across time.
+
+Parameters:
+  - id: A unique identifier for the entanglement
+  - jobs: Initial set of jobs to be entangled
+  - ttl: Time-to-live duration after which the entanglement expires
+
+Example:
+    jobs := []Job{job1, job2, job3}
+    entanglement := NewEntanglement("data-processing", jobs, 1*time.Hour)
+*/
+func NewEntanglement(id string, jobs []Job, ttl time.Duration) *Entanglement {
+	return &Entanglement{
+		ID:           id,
+		Jobs:         jobs,
+		SharedState:  make(map[string]any),
+		CreatedAt:    time.Now(),
+		LastModified: time.Now(),
+		TTL:          ttl,
+		stateLedger:  make([]StateChange, 0),
+	}
+}
+
+/*
+UpdateState updates the shared state and notifies all entangled jobs of the change.
+
+Similar to how measuring one quantum particle instantly affects its entangled partner,
+updating state through this method instantly affects all jobs in the entanglement.
+The state change is recorded in an immutable ledger, ensuring that even jobs that
+haven't started processing yet will see this change when they begin.
+
+The OnStateChange callback (if set) is triggered with both the old and new state,
+allowing jobs to react to the change. For jobs that start later, these changes
+are replayed in order during their initialization.
+
+Parameters:
+  - key: The state key to update
+  - value: The new value for the state key
+
+Thread-safe: This method uses mutual exclusion to ensure safe concurrent access.
+*/
+func (e *Entanglement) UpdateState(key string, value any) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	oldState := make(map[string]any)
+	for k, v := range e.SharedState {
+		oldState[k] = v
+	}
+
+	// Record the state change in the ledger
+	change := StateChange{
+		Timestamp: time.Now(),
+		Key:       key,
+		Value:     value,
+		Sequence:  uint64(len(e.stateLedger)),
+	}
+	e.stateLedger = append(e.stateLedger, change)
+
+	// Update the current state
+	e.SharedState[key] = value
+	e.LastModified = change.Timestamp
+
+	if e.OnStateChange != nil {
+		e.OnStateChange(oldState, e.SharedState)
+	}
+}
+
+/*
+GetStateHistory returns all state changes that have occurred since a given sequence number.
+This allows jobs that start processing later to catch up on all state changes they missed.
+
+Parameters:
+  - sinceSequence: The sequence number to start from (0 for all history)
+
+Returns:
+  - []StateChange: Ordered list of state changes since the specified sequence
+*/
+func (e *Entanglement) GetStateHistory(sinceSequence uint64) []StateChange {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	if sinceSequence >= uint64(len(e.stateLedger)) {
+		return []StateChange{}
+	}
+
+	return e.stateLedger[sinceSequence:]
+}
+
+/*
+ReplayStateChanges applies all historical state changes to a newly starting job.
+This ensures that jobs starting later still see the complete history of state
+changes in the correct order.
+
+Parameters:
+  - job: The job to replay state changes for
+*/
+func (e *Entanglement) ReplayStateChanges(job Job) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	history := e.GetStateHistory(0)
+	currentState := make(map[string]any)
+
+	for _, change := range history {
+		oldState := make(map[string]any)
+		for k, v := range currentState {
+			oldState[k] = v
+		}
+
+		// Create a new map for the new state
+		newState := make(map[string]any)
+		for k, v := range currentState {
+			newState[k] = v
+		}
+		newState[change.Key] = change.Value
+
+		currentState = newState
+		if e.OnStateChange != nil {
+			e.OnStateChange(oldState, newState)
+		}
+	}
+}
+
+/*
+GetState retrieves a value from the shared state.
+
+This method provides a way to observe the current state of the entanglement.
+Like quantum measurement, it provides a snapshot of the current state at the
+time of observation.
+
+Parameters:
+  - key: The state key to retrieve
+
+Returns:
+  - value: The value associated with the key
+  - exists: Boolean indicating whether the key exists in the state
+
+Thread-safe: This method uses a read lock to ensure safe concurrent access.
+*/
+func (e *Entanglement) GetState(key string) (any, bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	value, exists := e.SharedState[key]
+	return value, exists
+}
+
+/*
+AddJob adds a job to the entanglement.
+
+This method expands the entanglement to include a new job, similar to how
+quantum systems can be expanded to include more entangled particles. The newly
+added job becomes part of the shared state system and will be affected by
+state changes.
+
+Parameters:
+  - job: The job to add to the entanglement
+
+Thread-safe: This method uses mutual exclusion to ensure safe concurrent access.
+*/
+func (e *Entanglement) AddJob(job Job) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	e.Jobs = append(e.Jobs, job)
+	e.LastModified = time.Now()
+}
+
+/*
+RemoveJob removes a job from the entanglement.
+
+This method removes a job from the entanglement, effectively "disentangling" it
+from the shared state system. The removed job will no longer be affected by or
+contribute to state changes in the entanglement.
+
+Parameters:
+  - jobID: The ID of the job to remove
+
+Returns:
+  - bool: True if the job was found and removed, false otherwise
+
+Thread-safe: This method uses mutual exclusion to ensure safe concurrent access.
+*/
+func (e *Entanglement) RemoveJob(jobID string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	for i, job := range e.Jobs {
+		if job.ID == jobID {
+			e.Jobs = append(e.Jobs[:i], e.Jobs[i+1:]...)
+			e.LastModified = time.Now()
+			return true
+		}
+	}
+	return false
+}
+
+/*
+IsExpired checks if the entanglement has exceeded its TTL.
+
+This method determines if the entanglement should be considered expired based on
+its Time-To-Live (TTL) duration and the time since its last modification. An
+expired entanglement might be cleaned up by the system, similar to how quantum
+entanglement can be lost due to decoherence.
+
+Returns:
+  - bool: True if the entanglement has expired, false otherwise
+
+Note: A TTL of 0 or less means the entanglement never expires.
+*/
+func (e *Entanglement) IsExpired() bool {
+	if e.TTL <= 0 {
+		return false
+	}
+	return time.Since(e.LastModified) > e.TTL
+}
+
+
+
+
+// File: job.go
+
+package qpool
+
+import "time"
+
+// Job represents work to be done
+type Job struct {
+	ID                    string
+	Fn                    func() (any, error)
+	RetryPolicy           *RetryPolicy
+	CircuitID             string
+	CircuitConfig         *CircuitBreakerConfig
+	Dependencies          []string
+	TTL                   time.Duration
+	Attempt               int
+	LastError             error
+	DependencyRetryPolicy *RetryPolicy
+	StartTime             time.Time
+}
+
+// JobOption is a function type for configuring jobs
+type JobOption func(*Job)
+
+// CircuitBreakerConfig defines configuration for a circuit breaker
+type CircuitBreakerConfig struct {
+	MaxFailures  int
+	ResetTimeout time.Duration
+	HalfOpenMax  int
+}
+
+// WithDependencyRetry configures retry behavior for dependencies
+func WithDependencyRetry(attempts int, strategy RetryStrategy) JobOption {
+	return func(j *Job) {
+		j.DependencyRetryPolicy = &RetryPolicy{
+			MaxAttempts: attempts,
+			Strategy:    strategy,
+		}
+	}
+}
+
+// WithDependencies configures job dependencies
+func WithDependencies(dependencies []string) JobOption {
+	return func(j *Job) {
+		j.Dependencies = dependencies
+	}
+}
+
+
+
+// File: loadbalancer.go
+
+package qpool
+
+import (
+	"errors"
+	"log"
+	"sync"
+	"time"
+)
+
+// ErrNoAvailableWorkers is returned when no workers are available to process a job
+var ErrNoAvailableWorkers = errors.New("no workers available to process job")
+
+/*
+LoadBalancer implements the Regulator interface to provide intelligent work distribution.
+It ensures even distribution of work across workers while considering system metrics
+like worker load, processing speed, and resource utilization.
+
+Like a traffic controller directing vehicles to different lanes based on congestion,
+the load balancer directs work to workers based on their current capacity and
+performance characteristics.
+
+Key features:
+  - Even work distribution
+  - Metric-based routing decisions
+  - Automatic worker selection
+  - Adaptive load management
+*/
+type LoadBalancer struct {
+	mu sync.RWMutex
+
+	workerLoads    map[int]float64 // Current load per worker
+	workerLatency  map[int]time.Duration // Average processing time per worker
+	workerCapacity map[int]int     // Maximum concurrent jobs per worker
+	activeWorkers  int            // Number of available workers
+	metrics        *Metrics       // System metrics for adaptive behavior
+}
+
+/*
+NewLoadBalancer creates a new load balancer regulator with specified parameters.
+
+Parameters:
+  - workerCount: Initial number of workers to balance between
+  - workerCapacity: Maximum concurrent jobs per worker
+
+Returns:
+  - *LoadBalancer: A new load balancer instance
+
+Example:
+    balancer := NewLoadBalancer(5, 10) // 5 workers, 10 jobs each
+*/
+func NewLoadBalancer(workerCount, workerCapacity int) *LoadBalancer {
+	lb := &LoadBalancer{
+		workerLoads:    make(map[int]float64),
+		workerLatency:  make(map[int]time.Duration),
+		workerCapacity: make(map[int]int),
+		activeWorkers:  workerCount,
+	}
+
+	// Initialize worker capacities
+	for i := 0; i < workerCount; i++ {
+		lb.workerCapacity[i] = workerCapacity
+		lb.workerLoads[i] = 0.0
+		lb.workerLatency[i] = 0
+	}
+
+	return lb
+}
+
+/*
+Observe implements the Regulator interface by monitoring system metrics.
+This method updates the load balancer's view of worker performance and system state,
+allowing it to make informed routing decisions.
+
+Parameters:
+  - metrics: Current system metrics including worker performance data
+*/
+func (lb *LoadBalancer) Observe(metrics *Metrics) {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+
+	lb.metrics = metrics
+	lb.updateWorkerStats()
+}
+
+/*
+Limit implements the Regulator interface by determining if work should be limited.
+Returns true if all workers are at capacity and no more work should be accepted.
+
+Returns:
+  - bool: true if work should be limited, false if it can proceed
+
+Thread-safety: This method is thread-safe through mutex protection.
+*/
+func (lb *LoadBalancer) Limit() bool {
+	lb.mu.RLock()
+	defer lb.mu.RUnlock()
+
+	// Check if any worker has capacity
+	for i := 0; i < lb.activeWorkers; i++ {
+		if lb.workerLoads[i] < float64(lb.workerCapacity[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+/*
+Renormalize implements the Regulator interface by attempting to restore normal operation.
+This method resets worker statistics and redistributes load if necessary.
+*/
+func (lb *LoadBalancer) Renormalize() {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+
+	// Reset worker loads if they seem incorrect
+	for i := 0; i < lb.activeWorkers; i++ {
+		if lb.workerLoads[i] > float64(lb.workerCapacity[i]) {
+			lb.workerLoads[i] = float64(lb.workerCapacity[i])
+		}
+	}
+}
+
+/*
+SelectWorker chooses the most appropriate worker for the next job based on
+current load distribution and worker performance metrics.
+
+Returns:
+  - int: The selected worker ID
+  - error: Error if no suitable worker is available
+*/
+func (lb *LoadBalancer) SelectWorker() (int, error) {
+	lb.mu.RLock()
+	defer lb.mu.RUnlock()
+
+	selectedWorker := -1
+
+	for i := 0; i < lb.activeWorkers; i++ {
+		// Skip workers at capacity
+		if lb.workerLoads[i] >= float64(lb.workerCapacity[i]) {
+			log.Printf("Worker %d at capacity: load=%v, capacity=%v", i, lb.workerLoads[i], lb.workerCapacity[i])
+			continue
+		}
+
+		// If no worker selected yet, select this one
+		if selectedWorker == -1 {
+			log.Printf("First worker %d: load=%v, latency=%v", i, lb.workerLoads[i], lb.workerLatency[i])
+			selectedWorker = i
+			continue
+		}
+
+		log.Printf("Comparing worker %d (load=%v, latency=%v) with selected worker %d (load=%v, latency=%v)",
+			i, lb.workerLoads[i], lb.workerLatency[i],
+			selectedWorker, lb.workerLoads[selectedWorker], lb.workerLatency[selectedWorker])
+
+		// Compare loads first
+		if lb.workerLoads[i] < lb.workerLoads[selectedWorker] {
+			log.Printf("Selected worker %d due to lower load", i)
+			selectedWorker = i
+		} else if lb.workerLoads[i] == lb.workerLoads[selectedWorker] {
+			// If loads are equal, compare latencies
+			// Only consider latency if both workers have non-zero latency
+			if lb.workerLatency[selectedWorker] == 0 || 
+				(lb.workerLatency[i] > 0 && lb.workerLatency[i] < lb.workerLatency[selectedWorker]) {
+				log.Printf("Selected worker %d due to better latency", i)
+				selectedWorker = i
+			}
+		}
+	}
+
+	if selectedWorker == -1 {
+		return -1, ErrNoAvailableWorkers
+	}
+
+	log.Printf("Final selection: worker %d", selectedWorker)
+	return selectedWorker, nil
+}
+
+/*
+RecordJobStart updates worker statistics when a job starts processing.
+This helps maintain accurate load information for future routing decisions.
+
+Parameters:
+  - workerID: The ID of the worker that started the job
+*/
+func (lb *LoadBalancer) RecordJobStart(workerID int) {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+
+	if workerID >= 0 && workerID < lb.activeWorkers {
+		lb.workerLoads[workerID]++
+	}
+}
+
+/*
+RecordJobComplete updates worker statistics when a job completes processing.
+This helps maintain accurate load and performance information.
+
+Parameters:
+  - workerID: The ID of the worker that completed the job
+  - duration: How long the job took to process
+*/
+func (lb *LoadBalancer) RecordJobComplete(workerID int, duration time.Duration) {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+
+	if workerID >= 0 && workerID < lb.activeWorkers {
+		lb.workerLoads[workerID]--
+		if lb.workerLoads[workerID] < 0 {
+			lb.workerLoads[workerID] = 0
+		}
+
+		// Update moving average of worker latency
+		if lb.workerLatency[workerID] == 0 {
+			lb.workerLatency[workerID] = duration
+		} else {
+			lb.workerLatency[workerID] = (lb.workerLatency[workerID] * 4 + duration) / 5
+		}
+	}
+}
+
+// updateWorkerStats updates internal statistics based on observed metrics
+func (lb *LoadBalancer) updateWorkerStats() {
+	if lb.metrics == nil {
+		return
+	}
+
+	// Update active workers count if it has changed
+	if lb.metrics.WorkerCount != lb.activeWorkers {
+		// Adjust capacity maps for new worker count
+		newCount := lb.metrics.WorkerCount
+		if newCount > lb.activeWorkers {
+			// Initialize new workers
+			for i := lb.activeWorkers; i < newCount; i++ {
+				lb.workerCapacity[i] = lb.workerCapacity[0] // Use same capacity as first worker
+				lb.workerLoads[i] = 0.0
+				lb.workerLatency[i] = 0
+			}
+		}
+		lb.activeWorkers = newCount
+	}
+} 
+
+
+// File: metrics.go
+
+package qpool
+
+import (
+	"math"
+	"sort"
+	"sync"
+	"time"
+)
+
+// tDigestCentroid represents a centroid in the t-digest
+type tDigestCentroid struct {
+	mean  float64
+	count int64
+}
+
+// Metrics tracks and stores various performance metrics for the worker pool.
+type Metrics struct {
+	mu                   sync.RWMutex
+	WorkerCount          int
+	JobQueueSize         int
+	ActiveWorkers        int
+	LastScale            time.Time
+	ErrorRates           map[string]float64
+	TotalJobTime         time.Duration
+	JobCount             int64
+	CircuitBreakerStates map[string]CircuitState
+
+	// Additional suggested metrics
+	AverageJobLatency   time.Duration
+	P95JobLatency       time.Duration
+	P99JobLatency       time.Duration
+	JobSuccessRate      float64
+	QueueWaitTime       time.Duration
+	ResourceUtilization float64
+
+	// Rate limiting metrics
+	RateLimitHits int64
+	ThrottledJobs int64
+
+	// t-digest fields for percentile calculation
+	centroids    []tDigestCentroid
+	compression  float64
+	totalWeight  int64
+	maxCentroids int
+
+	// SchedulingFailures field to track scheduling timeouts
+	SchedulingFailures int64
+
+	// Additional metrics
+	FailureCount int64
+}
+
+// NewMetrics creates and initializes a new Metrics instance.
+func NewMetrics() *Metrics {
+	return &Metrics{
+		ErrorRates:           make(map[string]float64),
+		CircuitBreakerStates: make(map[string]CircuitState),
+		SchedulingFailures:   0,
+		compression:          100,
+		maxCentroids:         100,
+		centroids:            make([]tDigestCentroid, 0, 100),
+		totalWeight:          0,
+		JobSuccessRate:       1.0,
+	}
+}
+
+// RecordJobExecution records the execution time and success status of a job.
+func (m *Metrics) RecordJobExecution(startTime time.Time, success bool) {
+	m.mu.RLock()
+	oldTime := m.TotalJobTime
+	m.mu.RUnlock()
+
+	duration := time.Since(startTime)
+
+	m.mu.Lock()
+	m.TotalJobTime = oldTime + duration
+	m.JobCount++
+	if success {
+		m.JobSuccessRate = float64(m.JobCount-m.FailureCount) / float64(m.JobCount)
+	}
+	m.mu.Unlock()
+
+	// Update latency percentiles in a separate lock to reduce contention
+	m.updateLatencyPercentiles(duration)
+}
+
+// Add updateLatencyPercentiles method
+func (m *Metrics) updateLatencyPercentiles(duration time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Update average using existing calculation
+	m.AverageJobLatency = (m.AverageJobLatency*time.Duration(m.JobCount-1) + duration) / time.Duration(m.JobCount)
+
+	// Convert duration to float64 milliseconds for t-digest
+	value := float64(duration.Milliseconds())
+
+	// Find the closest centroid or create a new one
+	inserted := false
+	m.totalWeight++
+
+	if len(m.centroids) == 0 {
+		m.centroids = append(m.centroids, tDigestCentroid{mean: value, count: 1})
+		return
+	}
+
+	// Find insertion point
+	idx := sort.Search(len(m.centroids), func(i int) bool {
+		return m.centroids[i].mean >= value
+	})
+
+	// Calculate maximum weight for this point
+	q := m.calculateQuantile(value)
+	maxWeight := int64(4 * m.compression * math.Min(q, 1-q))
+
+	// Try to merge with existing centroid
+	if idx < len(m.centroids) && m.centroids[idx].count < maxWeight {
+		c := &m.centroids[idx]
+		c.mean = (c.mean*float64(c.count) + value) / float64(c.count+1)
+		c.count++
+		inserted = true
+	} else if idx > 0 && m.centroids[idx-1].count < maxWeight {
+		c := &m.centroids[idx-1]
+		c.mean = (c.mean*float64(c.count) + value) / float64(c.count+1)
+		c.count++
+		inserted = true
+	}
+
+	// If we couldn't merge, insert new centroid
+	if !inserted {
+		newCentroid := tDigestCentroid{mean: value, count: 1}
+		m.centroids = append(m.centroids, tDigestCentroid{})
+		copy(m.centroids[idx+1:], m.centroids[idx:])
+		m.centroids[idx] = newCentroid
+	}
+
+	// Compress if we have too many centroids
+	if len(m.centroids) > m.maxCentroids {
+		m.compress()
+	}
+
+	// Update P95 and P99
+	m.P95JobLatency = time.Duration(m.estimatePercentile(0.95)) * time.Millisecond
+	m.P99JobLatency = time.Duration(m.estimatePercentile(0.99)) * time.Millisecond
+}
+
+func (m *Metrics) calculateQuantile(value float64) float64 {
+	// Guard against division by zero
+	if m.totalWeight == 0 {
+		return 0.0
+	}
+
+	rank := 0.0
+	for _, c := range m.centroids {
+		if c.mean < value {
+			rank += float64(c.count)
+		}
+	}
+	return rank / float64(m.totalWeight)
+}
+
+func (m *Metrics) estimatePercentile(p float64) float64 {
+	if len(m.centroids) == 0 {
+		return 0
+	}
+
+	targetRank := p * float64(m.totalWeight)
+	cumulative := 0.0
+
+	for i, c := range m.centroids {
+		cumulative += float64(c.count)
+		if cumulative >= targetRank {
+			// Linear interpolation between centroids
+			if i > 0 {
+				prev := m.centroids[i-1]
+				prevCumulative := cumulative - float64(c.count)
+
+				// Guard against division by zero
+				if c.count == 0 {
+					return prev.mean
+				}
+
+				t := (targetRank - prevCumulative) / float64(c.count)
+				return prev.mean + t*(c.mean-prev.mean)
+			}
+			return c.mean
+		}
+	}
+	return m.centroids[len(m.centroids)-1].mean
+}
+
+func (m *Metrics) compress() {
+	if len(m.centroids) <= 1 {
+		return
+	}
+
+	// Sort centroids by mean if needed
+	sort.Slice(m.centroids, func(i, j int) bool {
+		return m.centroids[i].mean < m.centroids[j].mean
+	})
+
+	// Merge adjacent centroids while respecting size constraints
+	newCentroids := make([]tDigestCentroid, 0, m.maxCentroids)
+	current := m.centroids[0]
+
+	for i := 1; i < len(m.centroids); i++ {
+		if current.count+m.centroids[i].count <= int64(m.compression) {
+			// Merge centroids
+			totalCount := current.count + m.centroids[i].count
+			current.mean = (current.mean*float64(current.count) +
+				m.centroids[i].mean*float64(m.centroids[i].count)) /
+				float64(totalCount)
+			current.count = totalCount
+		} else {
+			newCentroids = append(newCentroids, current)
+			current = m.centroids[i]
+		}
+	}
+	newCentroids = append(newCentroids, current)
+	m.centroids = newCentroids
+}
+
+// Add metrics export functionality
+func (m *Metrics) ExportMetrics() map[string]interface{} {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return map[string]interface{}{
+		"worker_count":         m.WorkerCount,
+		"queue_size":           m.JobQueueSize,
+		"success_rate":         m.JobSuccessRate,
+		"avg_latency":          m.AverageJobLatency.Milliseconds(),
+		"p95_latency":          m.P95JobLatency.Milliseconds(),
+		"p99_latency":          m.P99JobLatency.Milliseconds(),
+		"resource_utilization": m.ResourceUtilization,
+	}
+}
+
+func (m *Metrics) RecordJobSuccess(latency time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.JobCount++
+	m.TotalJobTime += latency
+
+	// Guard against division by zero
+	if m.JobCount > 0 {
+		m.AverageJobLatency = time.Duration(int64(m.TotalJobTime) / m.JobCount)
+		m.JobSuccessRate = float64(m.JobCount-m.FailureCount) / float64(m.JobCount)
+	}
+
+	// Update t-digest for percentiles
+	m.updateLatencyMetrics(latency)
+}
+
+// RecordJobFailure records the failure of a job and updates metrics
+func (m *Metrics) RecordJobFailure() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.FailureCount++
+
+	// Guard against division by zero
+	if m.JobCount > 0 {
+		m.JobSuccessRate = float64(m.JobCount-m.FailureCount) / float64(m.JobCount)
+	} else {
+		m.JobSuccessRate = 0.0
+	}
+}
+
+// updateLatencyMetrics updates latency percentiles
+func (m *Metrics) updateLatencyMetrics(latency time.Duration) {
+	// Simple implementation: update P95 and P99 if current latency exceeds them
+	if latency > m.P99JobLatency {
+		m.P99JobLatency = latency
+	} else if latency > m.P95JobLatency {
+		m.P95JobLatency = latency
+	}
+}
+
+
+
+// File: pool.go
+
+package qpool
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/theapemachine/errnie"
+)
+
+/*
+	Q is our hybrid worker pool/message queue implementation.
+
+It combines traditional worker pool functionality with quantum-inspired state management.
+The pool maintains a balance between worker availability and job scheduling while
+providing quantum-like properties such as state superposition and entanglement through
+its integration with QSpace.
+
+Key features:
+  - Dynamic worker scaling
+  - Circuit breaker pattern support
+  - Quantum-inspired state management
+  - Metrics collection and monitoring
+*/
+type Q struct {
+	ctx        context.Context
+	cancel     context.CancelFunc
+	quit       chan struct{}
+	wg         sync.WaitGroup
+	workers    chan chan Job
+	jobs       chan Job
+	space      *QSpace
+	scaler     *Scaler
+	metrics    *Metrics
+	breakers   map[string]*CircuitBreaker
+	workerMu   sync.Mutex
+	workerList []*Worker
+	breakersMu sync.RWMutex
+	config     *Config
+}
+
+/*
+	NewQ creates a new quantum pool with the specified worker constraints and configuration.
+
+The pool initializes with the minimum number of workers and scales dynamically based on load.
+
+Parameters:
+  - ctx: Parent context for lifecycle management
+  - minWorkers: Minimum number of workers to maintain
+  - maxWorkers: Maximum number of workers allowed
+  - config: Pool configuration parameters
+
+Returns:
+  - *Q: A new quantum pool instance
+*/
+func NewQ(ctx context.Context, minWorkers, maxWorkers int, config *Config) *Q {
+	ctx, cancel := context.WithCancel(ctx)
+	q := &Q{
+		ctx:        ctx,
+		cancel:     cancel,
+		breakers:   make(map[string]*CircuitBreaker),
+		workerList: make([]*Worker, 0),
+		quit:       make(chan struct{}),
+		jobs:       make(chan Job, maxWorkers*10),
+		workers:    make(chan chan Job, maxWorkers),
+		space:      NewQSpace(),
+		metrics:    NewMetrics(),
+		config:     config,
+	}
+
+	// Start initial workers
+	for i := 0; i < minWorkers; i++ {
+		q.startWorker()
+	}
+
+	// Start the manager goroutine
+	q.wg.Add(1)
+	go func() {
+		defer q.wg.Done()
+		q.manage()
+	}()
+
+	// Start metrics collection
+	q.wg.Add(1)
+	go func() {
+		defer q.wg.Done()
+		q.collectMetrics()
+	}()
+
+	// Start scaler with appropriate configuration
+	scalerConfig := &ScalerConfig{
+		TargetLoad:         2.0,                    // Reasonable target load
+		ScaleUpThreshold:   4.0,                    // Scale up when load is high
+		ScaleDownThreshold: 1.0,                    // Scale down when load is low
+		Cooldown:           time.Millisecond * 500, // Reasonable cooldown
+	}
+	q.scaler = NewScaler(q, minWorkers, maxWorkers, scalerConfig)
+
+	return q
+}
+
+/*
+	manage handles the core job scheduling loop of the quantum pool.
+
+It distributes jobs to available workers while respecting timeouts and
+maintaining quantum state consistency through QSpace integration.
+
+This method runs as a goroutine and continues until the pool's context is cancelled.
+*/
+func (q *Q) manage() {
+	for {
+		select {
+		case <-q.ctx.Done():
+			return
+		case job := <-q.jobs:
+			// Wait for a worker with timeout
+			select {
+			case <-q.ctx.Done():
+				return
+			case workerChan := <-q.workers:
+				// Send job to worker
+				select {
+				case workerChan <- job:
+					// Job successfully sent to worker
+				case <-q.ctx.Done():
+					return
+				}
+			case <-time.After(q.getSchedulingTimeout()):
+				errnie.Warn("No available workers for job: %s, timeout occurred", job.ID)
+				// Store error result since we couldn't process the job
+				q.space.Store(job.ID, nil, []State{{
+					Value:       fmt.Errorf("no available workers"),
+					Probability: 1.0,
+				}}, job.TTL)
+			}
+		}
+	}
+}
+
+/*
+	collectMetrics collects and updates metrics for the quantum pool.
+
+It periodically updates metrics such as job queue size, active workers, and
+other relevant statistics. This method runs as a goroutine and continues until
+the pool's context is cancelled.
+*/
+func (q *Q) collectMetrics() {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-q.ctx.Done():
+			return
+		case <-ticker.C:
+			q.metrics.mu.Lock()
+			q.metrics.JobQueueSize = len(q.jobs)
+			q.metrics.ActiveWorkers = len(q.workers)
+			q.metrics.mu.Unlock()
+		}
+	}
+}
+
+/*
+	Schedule submits a job to the quantum pool for execution.
+
+The job is processed according to quantum-inspired principles, maintaining
+state history and uncertainty levels through QSpace integration.
+
+Parameters:
+  - id: Unique identifier for the job
+  - fn: The function to execute
+  - opts: Optional job configuration parameters
+
+Returns:
+  - chan *QValue: Channel that will receive the job's result
+*/
+func (q *Q) Schedule(id string, fn func() (any, error), opts ...JobOption) chan *QValue {
+	// Create context with configured timeout
+	ctx, cancel := context.WithTimeout(q.ctx, q.getSchedulingTimeout())
+	defer cancel()
+
+	startTime := time.Now()
+
+	job := Job{
+		ID: id,
+		Fn: fn,
+		RetryPolicy: &RetryPolicy{
+			MaxAttempts: 3,
+			Strategy:    &ExponentialBackoff{Initial: time.Second},
+		},
+		StartTime: startTime,
+	}
+
+	// Apply options
+	for _, opt := range opts {
+		opt(&job)
+	}
+
+	// Check circuit breaker if configured
+	if job.CircuitID != "" {
+		breaker := q.getCircuitBreaker(job)
+		if breaker != nil && !breaker.Allow() {
+			ch := make(chan *QValue, 1)
+			ch <- &QValue{
+				Error:     errnie.Error(fmt.Errorf("circuit breaker %s is open", job.CircuitID)),
+				CreatedAt: time.Now(),
+			}
+			close(ch)
+			return ch
+		}
+	}
+
+	// Try to schedule job with context timeout
+	select {
+	case q.jobs <- job:
+		// Use the pointer channel directly from QSpace
+		return q.space.Await(id)
+	case <-ctx.Done():
+		ch := make(chan *QValue, 1)
+		ch <- &QValue{
+			Error:     errnie.Error(fmt.Errorf("job scheduling timeout: %w", ctx.Err())),
+			CreatedAt: time.Now(),
+		}
+		close(ch)
+
+		// Update metrics for scheduling failure
+		q.metrics.mu.Lock()
+		q.metrics.SchedulingFailures++
+		q.metrics.mu.Unlock()
+
+		return ch
+	}
+}
+
+/*
+	CreateBroadcastGroup creates a new broadcast group.
+
+Initializes a new broadcast group with specified parameters and default
+quantum properties such as minimum uncertainty.
+*/
+func (q *Q) CreateBroadcastGroup(id string, ttl time.Duration) *BroadcastGroup {
+	return q.space.CreateBroadcastGroup(id, ttl)
+}
+
+/*
+	Subscribe returns a channel for receiving values from a broadcast group.
+
+Provides a channel for receiving quantum values from a specific broadcast group.
+*/
+func (q *Q) Subscribe(groupID string) chan QValue {
+	qvChan := q.space.Subscribe(groupID)
+	if qvChan == nil {
+		return nil
+	}
+
+	resultChan := make(chan QValue, 10)
+	go func() {
+		defer close(resultChan)
+		for qv := range qvChan {
+			if qv != nil {
+				resultChan <- QValue{
+					Value:     qv.Value,
+					Error:     qv.Error,
+					CreatedAt: qv.CreatedAt,
+				}
+			}
+		}
+	}()
+	return resultChan
+}
+
+/*
+	startWorker starts a new worker.
+
+Initializes a new worker and adds it to the pool's worker list.
+*/
+func (q *Q) startWorker() {
+	worker := &Worker{
+		pool:   q,
+		jobs:   make(chan Job),
+		cancel: nil,
+	}
+	q.workerMu.Lock()
+	q.workerList = append(q.workerList, worker)
+	q.workerMu.Unlock()
+
+	q.metrics.mu.Lock()
+	q.metrics.WorkerCount++
+	q.metrics.mu.Unlock()
+
+	q.wg.Add(1)
+	go func() {
+		defer q.wg.Done()
+		worker.run()
+	}()
+	errnie.Info("Started worker, total workers: %d", q.metrics.WorkerCount)
+}
+
+/*
+	WithTTL configures TTL for a job.
+
+Sets the time-to-live (TTL) for a job, which determines how long the job will
+remain in the system before being discarded.
+*/
+func WithTTL(ttl time.Duration) JobOption {
+	return func(j *Job) {
+		j.TTL = ttl
+	}
+}
+
+/*
+	getCircuitBreaker returns the circuit breaker for a job.
+
+If the job does not have a circuit ID or configuration, it returns nil.
+*/
+func (q *Q) getCircuitBreaker(job Job) *CircuitBreaker {
+	if job.CircuitID == "" || job.CircuitConfig == nil {
+		return nil
+	}
+
+	q.breakersMu.Lock()
+	defer q.breakersMu.Unlock()
+
+	breaker, exists := q.breakers[job.CircuitID]
+	if !exists {
+		breaker = &CircuitBreaker{
+			maxFailures:  job.CircuitConfig.MaxFailures,
+			resetTimeout: job.CircuitConfig.ResetTimeout,
+			halfOpenMax:  job.CircuitConfig.HalfOpenMax,
+			state:        CircuitClosed,
+		}
+		q.breakers[job.CircuitID] = breaker
+	}
+
+	return breaker
+}
+
+/*
+	getSchedulingTimeout returns the scheduling timeout from the configuration or
+
+uses a default value if not specified.
+*/
+func (q *Q) getSchedulingTimeout() time.Duration {
+	if q.config != nil && q.config.SchedulingTimeout > 0 {
+		return q.config.SchedulingTimeout
+	}
+	return 5 * time.Second // Default timeout
+}
+
+/*
+	Close gracefully shuts down the quantum pool.
+
+It ensures all workers complete their current jobs and cleans up resources.
+The shutdown process:
+ 1. Cancels the pool's context
+ 2. Waits for all goroutines to complete
+ 3. Closes all channels safely
+ 4. Cleans up worker resources
+*/
+func (q *Q) Close() {
+	if q == nil {
+		return
+	}
+
+	errnie.Info("Closing Quantum Pool")
+
+	// Cancel context first to stop all operations
+	if q.cancel != nil {
+		errnie.Info("Cancelling context")
+		q.cancel()
+	}
+
+	// Wait for all goroutines to finish before closing channels
+	q.wg.Wait()
+
+	// Now it's safe to close channels as no goroutines are using them
+	q.workerMu.Lock()
+	for _, worker := range q.workerList {
+		close(worker.jobs)
+	}
+	q.workerList = nil
+	q.workerMu.Unlock()
+
+	close(q.quit)
+	close(q.jobs)
+	close(q.workers)
+
+	errnie.Info("Quantum Pool closed")
+}
+
+
+
+// File: qspace.go
+
+// qspace.go
+package qpool
+
+import (
+	"fmt"
+	"math"
+	"sync"
+	"time"
+)
+
+/*
+StateTransition represents a change in quantum state.
+
+It records the complete history of state changes, including the previous and new states,
+timing information, and the cause of the transition. This maintains a quantum-like
+state history that can be used to understand the evolution of values over time.
+*/
+type StateTransition struct {
+	ValueID   string
+	FromState State
+	ToState   State
+	Timestamp time.Time
+	Cause     string
+}
+
+/*
+UncertaintyPrinciple enforces quantum-like uncertainty rules.
+
+It implements Heisenberg-inspired uncertainty principles where observation and
+time affect the certainty of quantum values. The principle ensures that values
+become more uncertain over time and that frequent observations impact the
+system's state.
+
+Key concepts:
+  - Minimum time between observations to limit measurement impact
+  - Maximum time before reaching maximum uncertainty
+  - Base uncertainty level for all measurements
+*/
+type UncertaintyPrinciple struct {
+	MinDeltaTime    time.Duration // Minimum time between observations
+	MaxDeltaTime    time.Duration // Maximum time before max uncertainty
+	BaseUncertainty UncertaintyLevel
+}
+
+/*
+QSpace represents a quantum-like state space.
+
+It provides a managed environment for quantum-inspired values, maintaining their
+states, relationships, and uncertainties. The space implements concepts from
+quantum mechanics such as entanglement, state superposition, and the uncertainty
+principle.
+
+Key features:
+  - Quantum value storage and retrieval
+  - State transition history
+  - Entanglement management
+  - Relationship tracking
+  - Automatic resource cleanup
+*/
+type QSpace struct {
+	mu sync.RWMutex
+
+	// Core storage
+	values  map[string]*QValue
+	waiting map[string][]chan *QValue
+	groups  map[string]*BroadcastGroup
+
+	// Quantum properties
+	entanglements map[string]*Entanglement
+	stateHistory  []StateTransition
+	uncertainty   *UncertaintyPrinciple
+
+	// Relationship tracking
+	children map[string][]string
+	parents  map[string][]string
+
+	// Cleanup and maintenance
+	cleanupInterval time.Duration
+	wg              sync.WaitGroup
+	done            chan struct{}
+}
+
+/*
+NewQSpace creates a new quantum space.
+
+Initializes a new space with default uncertainty principles and starts
+maintenance goroutines for cleanup and uncertainty monitoring.
+
+Returns:
+  - *QSpace: A new quantum space instance ready for use
+*/
+func NewQSpace() *QSpace {
+	qs := &QSpace{
+		values:        make(map[string]*QValue),
+		waiting:       make(map[string][]chan *QValue),
+		groups:        make(map[string]*BroadcastGroup),
+		entanglements: make(map[string]*Entanglement),
+		children:      make(map[string][]string),
+		parents:       make(map[string][]string),
+		uncertainty: &UncertaintyPrinciple{
+			MinDeltaTime:    time.Millisecond * 100,
+			MaxDeltaTime:    time.Second * 10,
+			BaseUncertainty: UncertaintyLevel(0.1),
+		},
+		cleanupInterval: time.Minute,
+		done:            make(chan struct{}),
+	}
+
+	// Start maintenance goroutines
+	qs.wg.Add(2)
+	go qs.runCleanup()
+	go qs.monitorUncertainty()
+
+	return qs
+}
+
+/*
+Store stores a quantum value with proper uncertainty handling.
+
+Values are stored with their associated states and TTL, maintaining
+quantum-inspired properties such as superposition and uncertainty.
+
+Parameters:
+  - id: Unique identifier for the value
+  - value: The actual value to store
+  - states: Possible states with their probabilities
+  - ttl: Time-to-live duration for the value
+
+Thread-safe: This method uses mutual exclusion to ensure safe concurrent access.
+*/
+func (qs *QSpace) Store(id string, value interface{}, states []State, ttl time.Duration) {
+	qs.mu.Lock()
+	defer qs.mu.Unlock()
+
+	// Create new quantum value
+	qv := NewQValue(value, states)
+	qv.TTL = ttl
+
+	// Record state transition
+	if oldQV, exists := qs.values[id]; exists {
+		qs.recordTransition(id, oldQV.States[0], states[0], "store")
+	}
+
+	qs.values[id] = qv
+
+	// Handle entanglements
+	if entangled := qs.entanglements[id]; entangled != nil {
+		entangled.UpdateState("value", qv.Value)
+	}
+
+	// Notify waiting observers
+	if channels, ok := qs.waiting[id]; ok {
+		for _, ch := range channels {
+			select {
+			case ch <- qv:
+				// Value successfully sent
+			default:
+				// Channel full or closed, remove it
+				qs.removeWaitingChannel(id, ch)
+			}
+		}
+		delete(qs.waiting, id)
+	}
+}
+
+/*
+Await returns a channel that will receive the quantum value.
+
+Implements quantum-inspired delayed observation, where values may be uncertain
+or not yet collapsed to a definite state.
+
+Parameters:
+  - id: The identifier of the value to await
+
+Returns:
+  - chan *QValue: Channel that will receive the value when available
+
+Thread-safe: This method uses mutual exclusion to ensure safe concurrent access.
+*/
+func (qs *QSpace) Await(id string) chan *QValue {
+	qs.mu.Lock()
+	defer qs.mu.Unlock()
+
+	ch := make(chan *QValue, 1)
+
+	// Check if value exists
+	if qv, ok := qs.values[id]; ok {
+		// Value exists but might be uncertain
+		uncertainty := qv.Uncertainty
+		if uncertainty < MaxUncertainty {
+			ch <- qv
+			close(ch)
+			return ch
+		}
+	}
+
+	// Add to waiting list
+	qs.waiting[id] = append(qs.waiting[id], ch)
+	return ch
+}
+
+/*
+CreateEntanglement establishes quantum entanglement between values.
+
+Creates and manages relationships between quantum values that should maintain
+synchronized states. Like quantum entanglement in physics, changes to one value
+affect all entangled values.
+
+Parameters:
+  - ids: Slice of value IDs to entangle together
+
+Returns:
+  - *Entanglement: A new entanglement instance managing the relationship
+
+Thread-safe: This method uses mutual exclusion to ensure safe concurrent access.
+*/
+func (qs *QSpace) CreateEntanglement(ids []string) *Entanglement {
+	qs.mu.Lock()
+	defer qs.mu.Unlock()
+
+	// Create jobs from IDs
+	jobs := make([]Job, len(ids))
+	for i, id := range ids {
+		jobs[i] = Job{ID: id}
+	}
+
+	// Create new entanglement with default 1 hour TTL
+	ent := NewEntanglement(ids[0], jobs, time.Hour)
+
+	// Link values to entanglement
+	for _, id := range ids {
+		if qv, exists := qs.values[id]; exists {
+			ent.UpdateState(id, qv.Value)
+		}
+		qs.entanglements[id] = ent
+	}
+
+	return ent
+}
+
+/*
+recordTransition records a state transition in history.
+
+Maintains an immutable record of state changes for quantum values, allowing
+for analysis of state evolution over time.
+
+Parameters:
+  - valueID: ID of the value that changed state
+  - from: Previous state
+  - to: New state
+  - cause: Reason for the state transition
+
+Thread-safe: Called within Store which provides mutex protection.
+*/
+func (qs *QSpace) recordTransition(valueID string, from, to State, cause string) {
+	transition := StateTransition{
+		ValueID:   valueID,
+		FromState: from,
+		ToState:   to,
+		Timestamp: time.Now(),
+		Cause:     cause,
+	}
+	qs.stateHistory = append(qs.stateHistory, transition)
+}
+
+/*
+runCleanup periodically cleans up expired values.
+
+Runs as a background goroutine to maintain the quantum space by removing
+expired values and relationships, preventing resource leaks.
+
+Thread-safe: Uses internal mutex protection for cleanup operations.
+*/
+func (qs *QSpace) runCleanup() {
+	defer qs.wg.Done()
+	ticker := time.NewTicker(qs.cleanupInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-qs.done:
+			return
+		case <-ticker.C:
+			qs.cleanup()
+		}
+	}
+}
+
+/*
+monitorUncertainty updates uncertainty levels based on time.
+
+Implements quantum-inspired uncertainty principles by adjusting uncertainty
+levels of values based on time elapsed since last observation.
+
+Thread-safe: Uses internal mutex protection for uncertainty updates.
+*/
+func (qs *QSpace) monitorUncertainty() {
+	defer qs.wg.Done()
+	ticker := time.NewTicker(qs.uncertainty.MinDeltaTime)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-qs.done:
+			return
+		case <-ticker.C:
+			qs.updateUncertainties()
+		}
+	}
+}
+
+/*
+cleanup removes expired values and updates relationships.
+
+Performs the actual cleanup operations, removing expired values and updating
+relationship mappings to maintain consistency.
+
+Thread-safe: This method uses mutual exclusion to ensure safe concurrent access.
+*/
+func (qs *QSpace) cleanup() {
+	qs.mu.Lock()
+	defer qs.mu.Unlock()
+
+	now := time.Now()
+	for id, qv := range qs.values {
+		if qv.TTL > 0 && now.Sub(qv.CreatedAt) > qv.TTL {
+			// Clean up relationships
+			delete(qs.values, id)
+			delete(qs.entanglements, id)
+			delete(qs.children, id)
+
+			// Remove from parent relationships
+			for parentID, children := range qs.children {
+				qs.children[parentID] = removeString(children, id)
+			}
+		}
+	}
+
+	// Cleanup broadcast groups
+	for id, group := range qs.groups {
+		if group.TTL > 0 && now.Sub(group.LastUsed) > group.TTL {
+			for _, ch := range group.channels {
+				close(ch)
+			}
+			delete(qs.groups, id)
+		}
+	}
+}
+
+/*
+updateUncertainties updates uncertainty for all quantum values.
+
+Implements the time-based uncertainty principle where values become more
+uncertain as time passes since their last observation.
+
+Thread-safe: This method uses mutual exclusion to ensure safe concurrent access.
+*/
+func (qs *QSpace) updateUncertainties() {
+	qs.mu.Lock()
+	defer qs.mu.Unlock()
+
+	for _, qv := range qs.values {
+		if !qv.isCollapsed {
+			continue
+		}
+
+		// Calculate time-based uncertainty increase
+		timeSinceCollapse := time.Since(qv.collapseTime)
+		if timeSinceCollapse > qs.uncertainty.MaxDeltaTime {
+			qv.Uncertainty = MaxUncertainty
+			continue
+		}
+
+		// Progressive uncertainty increase
+		progressFactor := float64(timeSinceCollapse) / float64(qs.uncertainty.MaxDeltaTime)
+		uncertaintyIncrease := UncertaintyLevel(progressFactor * float64(qs.uncertainty.BaseUncertainty))
+		qv.Uncertainty = UncertaintyLevel(math.Min(
+			float64(qv.Uncertainty+uncertaintyIncrease),
+			float64(MaxUncertainty),
+		))
+	}
+}
+
+/*
+removeWaitingChannel removes a channel from the waiting list.
+
+Maintains the waiting channel list by safely removing closed or unneeded channels.
+
+Parameters:
+  - id: The value ID associated with the channel
+  - ch: The channel to remove
+
+Thread-safe: Called within Store which provides mutex protection.
+*/
+func (qs *QSpace) removeWaitingChannel(id string, ch chan *QValue) {
+	channels := qs.waiting[id]
+	for i, waitingCh := range channels {
+		if waitingCh == ch {
+			qs.waiting[id] = append(channels[:i], channels[i+1:]...)
+			return
+		}
+	}
+}
+
+/*
+GetStateHistory returns the state transition history for a value.
+
+Provides access to the complete history of state transitions for analysis
+and debugging purposes.
+
+Parameters:
+  - valueID: ID of the value to get history for
+
+Returns:
+  - []StateTransition: Ordered list of state transitions for the value
+
+Thread-safe: This method uses read-lock to ensure safe concurrent access.
+*/
+func (qs *QSpace) GetStateHistory(valueID string) []StateTransition {
+	qs.mu.RLock()
+	defer qs.mu.RUnlock()
+
+	var history []StateTransition
+	for _, transition := range qs.stateHistory {
+		if transition.ValueID == valueID {
+			history = append(history, transition)
+		}
+	}
+	return history
+}
+
+/*
+AddRelationship establishes a parent-child relationship between values.
+
+Creates directed relationships between values while preventing circular
+dependencies that could cause deadlocks or infinite loops.
+
+Parameters:
+  - parentID: ID of the parent value
+  - childID: ID of the child value
+
+Returns:
+  - error: Error if the relationship would create a circular dependency
+
+Thread-safe: This method uses mutual exclusion to ensure safe concurrent access.
+*/
+func (qs *QSpace) AddRelationship(parentID, childID string) error {
+	qs.mu.Lock()
+	defer qs.mu.Unlock()
+
+	// Check for circular dependencies
+	if qs.wouldCreateCircle(parentID, childID) {
+		return fmt.Errorf("circular dependency detected")
+	}
+
+	qs.children[parentID] = append(qs.children[parentID], childID)
+	qs.parents[childID] = append(qs.parents[childID], parentID)
+	return nil
+}
+
+/*
+wouldCreateCircle checks if adding a relationship would create a circular dependency.
+
+Performs depth-first search to detect potential circular dependencies before
+they are created.
+
+Parameters:
+  - parentID: Proposed parent ID
+  - childID: Proposed child ID
+
+Returns:
+  - bool: True if adding the relationship would create a circle
+
+Thread-safe: Called within AddRelationship which provides mutex protection.
+*/
+func (qs *QSpace) wouldCreateCircle(parentID, childID string) bool {
+	visited := make(map[string]bool)
+	var checkCircular func(string) bool
+
+	checkCircular = func(current string) bool {
+		if current == parentID {
+			return true
+		}
+		if visited[current] {
+			return false
+		}
+		visited[current] = true
+
+		for _, parent := range qs.parents[current] {
+			if checkCircular(parent) {
+				return true
+			}
+		}
+		return false
+	}
+
+	return checkCircular(childID)
+}
+
+/*
+Close shuts down the quantum space.
+
+Performs graceful shutdown of the quantum space, cleaning up resources
+and closing all channels safely.
+
+Thread-safe: This method uses mutual exclusion to ensure safe concurrent access.
+*/
+func (qs *QSpace) Close() {
+	close(qs.done)
+	qs.wg.Wait()
+
+	qs.mu.Lock()
+	defer qs.mu.Unlock()
+
+	// Close all waiting channels
+	for _, channels := range qs.waiting {
+		for _, ch := range channels {
+			close(ch)
+		}
+	}
+
+	// Close all broadcast group channels
+	for _, group := range qs.groups {
+		for _, ch := range group.channels {
+			close(ch)
+		}
+	}
+
+	// Clear maps
+	qs.values = nil
+	qs.waiting = nil
+	qs.groups = nil
+	qs.entanglements = nil
+	qs.children = nil
+	qs.parents = nil
+}
+
+/*
+removeString removes a string from a slice.
+
+Helper function to remove a string from a slice.
+*/
+func removeString(slice []string, s string) []string {
+	for i, v := range slice {
+		if v == s {
+			return append(slice[:i], slice[i+1:]...)
+		}
+	}
+	return slice
+}
+
+/*
+CreateBroadcastGroup creates a new broadcast group.
+
+Initializes a new broadcast group with specified parameters and default
+quantum properties such as minimum uncertainty.
+*/
+func (qs *QSpace) CreateBroadcastGroup(id string, ttl time.Duration) *BroadcastGroup {
+	qs.mu.Lock()
+	defer qs.mu.Unlock()
+
+	group := NewBroadcastGroup(id, ttl, 100) // Default max queue size of 100
+	qs.groups[id] = group
+	return group
+}
+
+/*
+Subscribe returns a channel for receiving values from a broadcast group.
+
+Provides a channel for receiving quantum values from a specific broadcast group.
+*/
+func (qs *QSpace) Subscribe(groupID string) chan *QValue {
+	qs.mu.RLock()
+	defer qs.mu.RUnlock()
+
+	if group, exists := qs.groups[groupID]; exists {
+		return group.Subscribe("", 10) // Default buffer size of 10
+	}
+	return nil
+}
+
+/*
+Exists checks if a value exists in the space
+*/
+func (qs *QSpace) Exists(id string) bool {
+	qs.mu.RLock()
+	defer qs.mu.RUnlock()
+	_, exists := qs.values[id]
+	return exists
+}
+
+/*
+StoreError stores an error result in the quantum space
+*/
+func (qs *QSpace) StoreError(id string, err error, ttl time.Duration) {
+	qs.mu.Lock()
+	defer qs.mu.Unlock()
+
+	// Create new quantum value with error
+	qv := NewQValue(nil, []State{{Value: nil, Probability: 1.0}})
+	qv.Error = err
+	qv.TTL = ttl
+
+	// Record state transition if value existed
+	if oldQV, exists := qs.values[id]; exists {
+		qs.recordTransition(id, oldQV.States[0], qv.States[0], "error")
+	}
+
+	qs.values[id] = qv
+
+	// Notify waiting observers
+	if channels, ok := qs.waiting[id]; ok {
+		for _, ch := range channels {
+			select {
+			case ch <- qv:
+				// Value successfully sent
+			default:
+				// Channel full or closed, remove it
+				qs.removeWaitingChannel(id, ch)
+			}
+		}
+		delete(qs.waiting, id)
+	}
+}
+
+
+
+// File: qvalue.go
+
+// qvalue.go
+package qpool
+
+import (
+	"fmt"
+	"math"
+	"math/rand/v2"
+	"sync"
+	"time"
+)
+
+// Probability represents a quantum state probability
+type Probability float64
+
+// UncertaintyLevel defines how uncertain we are about a value
+type UncertaintyLevel float64
+
+const (
+	MinUncertainty UncertaintyLevel = 0.0
+	MaxUncertainty UncertaintyLevel = 1.0
+)
+
+// ObservationEffect represents how observation affects the quantum state
+type ObservationEffect struct {
+	ObserverID    string
+	ObservedAt    time.Time
+	StateCollapse bool
+	Uncertainty   UncertaintyLevel
+}
+
+// QValue represents a value with quantum-like properties
+type QValue struct {
+	mu sync.RWMutex
+
+	// Core value and metadata
+	Value     interface{}
+	Error     error
+	CreatedAt time.Time
+	TTL       time.Duration
+
+	// Quantum properties
+	States       []State          // Possible superposition states
+	Uncertainty  UncertaintyLevel // Heisenberg-inspired uncertainty
+	Observations []ObservationEffect
+	Entangled    []string // IDs of entangled values
+
+	// Wave function collapse tracking
+	isCollapsed  bool
+	collapseTime time.Time
+}
+
+// NewQValue creates a new quantum value with initial states
+func NewQValue(initialValue interface{}, states []State) *QValue {
+	qv := &QValue{
+		Value:       initialValue,
+		CreatedAt:   time.Now(),
+		States:      states,
+		Uncertainty: calculateInitialUncertainty(states),
+		isCollapsed: false,
+	}
+	return qv
+}
+
+// Observe triggers wave function collapse based on quantum rules
+func (qv *QValue) Observe(observerID string) interface{} {
+	qv.mu.Lock()
+	defer qv.mu.Unlock()
+
+	observation := ObservationEffect{
+		ObserverID:    observerID,
+		ObservedAt:    time.Now(),
+		Uncertainty:   qv.Uncertainty,
+		StateCollapse: !qv.isCollapsed,
+	}
+	qv.Observations = append(qv.Observations, observation)
+
+	// First observation collapses the wave function
+	if !qv.isCollapsed {
+		qv.collapse()
+	}
+
+	// Increase uncertainty based on Heisenberg principle
+	qv.updateUncertainty()
+
+	return qv.Value
+}
+
+// collapse performs wave function collapse, choosing a state based on probabilities
+func (qv *QValue) collapse() {
+	if len(qv.States) == 0 {
+		return
+	}
+
+	// Calculate cumulative probabilities
+	cumProb := 0.0
+	probs := make([]float64, len(qv.States))
+	for i, state := range qv.States {
+		cumProb += float64(state.Probability)
+		probs[i] = cumProb
+	}
+
+	// Normalize probabilities
+	for i := range probs {
+		probs[i] /= cumProb
+	}
+
+	// Random selection based on probabilities
+	r := rand.Float64()
+	for i, threshold := range probs {
+		if r <= threshold {
+			qv.Value = qv.States[i].Value
+			break
+		}
+	}
+
+	qv.isCollapsed = true
+	qv.collapseTime = time.Now()
+}
+
+// updateUncertainty increases uncertainty based on time since collapse
+func (qv *QValue) updateUncertainty() {
+	if !qv.isCollapsed {
+		qv.Uncertainty = MaxUncertainty
+		return
+	}
+
+	timeSinceCollapse := time.Since(qv.collapseTime)
+	uncertaintyIncrease := UncertaintyLevel(math.Log1p(float64(timeSinceCollapse.Nanoseconds())))
+	qv.Uncertainty = UncertaintyLevel(math.Min(
+		float64(qv.Uncertainty+uncertaintyIncrease),
+		float64(MaxUncertainty),
+	))
+}
+
+// calculateInitialUncertainty determines starting uncertainty based on state count
+func calculateInitialUncertainty(states []State) UncertaintyLevel {
+	if len(states) <= 1 {
+		return MinUncertainty
+	}
+	// More states = more initial uncertainty
+	return UncertaintyLevel(math.Log2(float64(len(states))) / 10.0)
+}
+
+// Entangle connects this value with another quantum value
+func (qv *QValue) Entangle(other *QValue) {
+	qv.mu.Lock()
+	other.mu.Lock()
+	defer qv.mu.Unlock()
+	defer other.mu.Unlock()
+
+	// Add bidirectional entanglement
+	qv.Entangled = append(qv.Entangled, other.ID())
+	other.Entangled = append(other.Entangled, qv.ID())
+
+	// Share states between entangled values
+	qv.States = mergeSates(qv.States, other.States)
+	other.States = qv.States
+
+	// Increase uncertainty due to entanglement
+	entanglementUncertainty := UncertaintyLevel(0.1)
+	qv.Uncertainty += entanglementUncertainty
+	other.Uncertainty += entanglementUncertainty
+}
+
+// mergeSates combines states from two quantum values
+func mergeSates(a, b []State) []State {
+	seen := make(map[interface{}]bool)
+	merged := make([]State, 0)
+
+	// Helper to add unique states
+	addState := func(s State) {
+		if !seen[s.Value] {
+			seen[s.Value] = true
+			merged = append(merged, s)
+		}
+	}
+
+	// Add all states, avoiding duplicates
+	for _, s := range a {
+		addState(s)
+	}
+	for _, s := range b {
+		addState(s)
+	}
+
+	// Normalize probabilities
+	totalProb := Probability(0)
+	for _, s := range merged {
+		totalProb += Probability(s.Probability)
+	}
+	for i := range merged {
+		merged[i].Probability /= float64(totalProb)
+	}
+
+	return merged
+}
+
+// ID generates a unique identifier for this quantum value
+func (qv *QValue) ID() string {
+	return fmt.Sprintf("qv_%v_%d", qv.Value, qv.CreatedAt.UnixNano())
+}
+
+
+
+// File: ratelimiter.go
+
+package qpool
+
+import (
+	"sync"
+	"time"
+)
+
+/*
+RateLimiter implements the Regulator interface using a token bucket algorithm.
+It controls the rate of operations by maintaining a bucket of tokens that are consumed
+by each operation and replenished at a fixed rate.
+
+Like a water tank with a steady inflow and controlled outflow, this regulator ensures
+that operations occur at a sustainable rate, preventing system overload while allowing
+for brief bursts of activity when the token bucket is full.
+
+Key features:
+  - Smooth rate limiting with burst capacity
+  - Configurable token replenishment rate
+  - Thread-safe operation
+  - Metric-aware for adaptive rate limiting
+*/
+type RateLimiter struct {
+	tokens     int           // Current number of available tokens
+	maxTokens  int           // Maximum token capacity
+	refillRate time.Duration // Time between token replenishments
+	lastRefill time.Time     // Last time tokens were added
+	mu         sync.Mutex    // Ensures thread-safe access to tokens
+	metrics    *Metrics      // System metrics for adaptive behavior
+}
+
+/*
+NewRateLimiter creates a new rate limit regulator with specified parameters.
+
+Parameters:
+  - maxTokens: Maximum number of tokens (burst capacity)
+  - refillRate: Duration between token replenishments
+
+Returns:
+  - *RateLimiter: A new rate limit regulator instance
+
+Example:
+    limiter := NewRateLimiter(100, time.Second) // 100 ops/second with burst capacity
+*/
+func NewRateLimiter(maxTokens int, refillRate time.Duration) *RateLimiter {
+	now := time.Now()
+	return &RateLimiter{
+		tokens:     maxTokens,
+		maxTokens:  maxTokens,
+		refillRate: refillRate,
+		lastRefill: now.Add(-refillRate), // Start with a full refill period elapsed
+	}
+}
+
+/*
+Observe implements the Regulator interface by monitoring system metrics.
+The rate limiter can use these metrics to dynamically adjust its rate limits
+based on system conditions.
+
+For example, it might:
+  - Reduce rates during high system load
+  - Increase limits when resources are abundant
+  - Adjust burst capacity based on queue length
+
+Parameters:
+  - metrics: Current system metrics including performance and health indicators
+*/
+func (rl *RateLimiter) Observe(metrics *Metrics) {
+	rl.metrics = metrics
+}
+
+/*
+Limit implements the Regulator interface by determining if an operation should be limited.
+It consumes a token if available, allowing the operation to proceed. If no tokens
+are available, the operation is limited.
+
+Returns:
+  - bool: true if the operation should be limited, false if it can proceed
+
+Thread-safety: This method is thread-safe through mutex protection.
+*/
+func (rl *RateLimiter) Limit() bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	rl.refill()
+	if rl.tokens > 0 {
+		rl.tokens--
+		return false // Don't limit
+	}
+	return true // Limit
+}
+
+/*
+Renormalize implements the Regulator interface by attempting to restore normal operation.
+This method triggers a token refill, potentially allowing more operations to proceed
+if enough time has passed since the last refill.
+
+The rate limiter uses this method to maintain a steady flow of operations while
+adhering to the configured rate limits.
+*/
+func (rl *RateLimiter) Renormalize() {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	rl.refill()
+}
+
+/*
+refill adds tokens to the bucket based on elapsed time.
+This is an internal method that implements the token bucket algorithm's
+replenishment logic.
+
+The number of tokens added is proportional to the time elapsed since the last
+refill, up to the maximum capacity of the bucket.
+
+Thread-safety: This method assumes the caller holds the mutex lock.
+*/
+func (rl *RateLimiter) refill() {
+	now := time.Now()
+	elapsed := now.Sub(rl.lastRefill)
+	
+	// Convert to nanoseconds for integer division
+	elapsedNs := elapsed.Nanoseconds()
+	refillRateNs := rl.refillRate.Nanoseconds()
+
+	// Calculate tokens to add - only round up if we're at least halfway through a period
+	tokensToAdd := (elapsedNs + (refillRateNs / 2)) / refillRateNs
+	
+	if tokensToAdd > 0 {
+		rl.tokens = Min(rl.maxTokens, rl.tokens+int(tokensToAdd))
+		// Only move lastRefill forward by the number of complete periods
+		rl.lastRefill = rl.lastRefill.Add(time.Duration(tokensToAdd) * rl.refillRate)
+	}
+} 
+
+
+// File: regulator.go
+
+package qpool
+
+/*
+Regulator defines an interface for types that regulate the flow and behavior of the pool.
+Inspired by biological and mechanical regulators that maintain system homeostasis,
+this interface provides a common pattern for implementing various regulation mechanisms.
+
+Each regulator acts as a control system component, monitoring and adjusting the pool's
+behavior to maintain optimal performance and stability. Like a thermostat or pressure
+regulator in physical systems, these regulators help maintain the system within
+desired operational parameters.
+
+Examples of regulators include:
+  - CircuitBreaker: Prevents cascading failures by stopping operations when error rates are high
+  - RateLimit: Controls the flow rate of jobs to prevent system overload
+  - LoadBalancer: Distributes work evenly across available resources
+  - BackPressure: Prevents system overload by controlling input rates
+  - ResourceGovernor: Manages resource consumption within defined limits
+*/
+type Regulator interface {
+	// Observe allows the regulator to monitor system metrics and state.
+	// This is analogous to a sensor in a mechanical regulator, providing
+	// the feedback necessary for making control decisions.
+	//
+	// Parameters:
+	//   - metrics: Current system metrics including performance and health indicators
+	Observe(metrics *Metrics)
+
+	// Limit determines if the regulated action should be restricted.
+	// Returns true if the action should be limited, false if it should proceed.
+	// This is the main control point where the regulator decides whether to
+	// allow or restrict operations based on observed conditions.
+	//
+	// Returns:
+	//   - bool: true if the action should be limited, false if it should proceed
+	Limit() bool
+
+	// Renormalize attempts to return the system to a normal operating state.
+	// This is similar to a feedback loop in control systems, where the regulator
+	// takes active steps to restore normal operations after a period of restriction.
+	// The exact meaning of "normal" depends on the specific regulator implementation.
+	Renormalize()
+}
+
+/*
+NewRegulator creates a new regulator of the specified type.
+This factory function allows for flexible creation of different regulator types
+while maintaining a consistent interface for the pool to interact with.
+
+Parameters:
+  - regulatorType: A concrete implementation of the Regulator interface
+
+Returns:
+  - Regulator: The initialized regulator instance
+
+Example:
+    circuitBreaker := NewCircuitBreakerRegulator(5, time.Minute, 3)
+    regulator := NewRegulator(circuitBreaker)
+*/
+func NewRegulator(regulatorType Regulator) Regulator {
+	return regulatorType
+}
+
+
+// File: resourcegovernor.go
+
+package qpool
+
+import (
+	"runtime"
+	"sync"
+	"time"
+)
+
+/*
+ResourceGovernorRegulator implements the Regulator interface to manage system resources.
+It monitors and controls resource usage (CPU, memory, etc.) to prevent system
+exhaustion, similar to how a power governor prevents engine damage by limiting
+power consumption under heavy load.
+
+Key features:
+  - CPU usage monitoring
+  - Memory usage tracking
+  - Resource thresholds
+  - Adaptive limiting
+*/
+type ResourceGovernorRegulator struct {
+	mu sync.RWMutex
+
+	maxCPUPercent    float64       // Maximum allowed CPU usage (0.0-1.0)
+	maxMemoryPercent float64       // Maximum allowed memory usage (0.0-1.0)
+	checkInterval    time.Duration // How often to check resource usage
+	metrics          *Metrics     // System metrics
+	lastCheck        time.Time    // Last resource check time
+
+	// Current resource usage
+	currentCPU    float64
+	currentMemory float64
+}
+
+/*
+NewResourceGovernorRegulator creates a new resource governor regulator.
+
+Parameters:
+  - maxCPUPercent: Maximum allowed CPU usage (0.0-1.0)
+  - maxMemoryPercent: Maximum allowed memory usage (0.0-1.0)
+  - checkInterval: How often to check resource usage
+
+Returns:
+  - *ResourceGovernorRegulator: A new resource governor instance
+
+Example:
+    governor := NewResourceGovernorRegulator(0.8, 0.9, time.Second)
+*/
+func NewResourceGovernorRegulator(maxCPUPercent, maxMemoryPercent float64, checkInterval time.Duration) *ResourceGovernorRegulator {
+	return &ResourceGovernorRegulator{
+		maxCPUPercent:    maxCPUPercent,
+		maxMemoryPercent: maxMemoryPercent,
+		checkInterval:    checkInterval,
+		lastCheck:        time.Now(),
+	}
+}
+
+/*
+Observe implements the Regulator interface by monitoring system metrics.
+This method updates the governor's view of resource utilization based on
+current system metrics.
+
+Parameters:
+  - metrics: Current system metrics including resource utilization data
+*/
+func (rg *ResourceGovernorRegulator) Observe(metrics *Metrics) {
+	rg.mu.Lock()
+	defer rg.mu.Unlock()
+
+	rg.metrics = metrics
+	rg.updateResourceUsage()
+}
+
+/*
+Limit implements the Regulator interface by determining if resource usage
+should be limited. Returns true when resource usage exceeds thresholds.
+
+Returns:
+  - bool: true if resource usage should be limited, false if it can proceed
+*/
+func (rg *ResourceGovernorRegulator) Limit() bool {
+	rg.mu.RLock()
+	defer rg.mu.RUnlock()
+
+	// Check if either CPU or memory usage exceeds thresholds
+	return rg.currentCPU >= rg.maxCPUPercent || rg.currentMemory >= rg.maxMemoryPercent
+}
+
+/*
+Renormalize implements the Regulator interface by attempting to restore normal operation.
+This method updates resource usage measurements and adjusts thresholds if necessary.
+*/
+func (rg *ResourceGovernorRegulator) Renormalize() {
+	rg.mu.Lock()
+	defer rg.mu.Unlock()
+
+	// Update resource measurements
+	rg.updateResourceUsage()
+}
+
+// updateResourceUsage updates current resource utilization measurements
+func (rg *ResourceGovernorRegulator) updateResourceUsage() {
+	if rg.metrics == nil {
+		return
+	}
+
+	// Update CPU usage from metrics
+	if rg.metrics.ResourceUtilization > 0 {
+		rg.currentCPU = rg.metrics.ResourceUtilization
+	}
+
+	// Get current memory stats
+	var memStats runtime.MemStats
+	runtime.ReadMemStats(&memStats)
+
+	// Calculate memory usage as percentage of total available
+	totalMemory := float64(memStats.Sys)
+	usedMemory := float64(memStats.Alloc)
+	rg.currentMemory = usedMemory / totalMemory
+}
+
+// GetResourceUsage returns current resource utilization levels
+func (rg *ResourceGovernorRegulator) GetResourceUsage() (cpu, memory float64) {
+	rg.mu.RLock()
+	defer rg.mu.RUnlock()
+	return rg.currentCPU, rg.currentMemory
+}
+
+// GetThresholds returns the current resource usage thresholds
+func (rg *ResourceGovernorRegulator) GetThresholds() (cpu, memory float64) {
+	rg.mu.RLock()
+	defer rg.mu.RUnlock()
+	return rg.maxCPUPercent, rg.maxMemoryPercent
+} 
+
+
+// File: retry.go
+
+package qpool
+
+import (
+	"math"
+	"time"
+)
+
+// RetryPolicy defines retry behavior
+type RetryPolicy struct {
+	MaxAttempts int
+	Strategy    RetryStrategy
+	BackoffFunc func(attempt int) time.Duration
+	Filter      func(error) bool
+}
+
+// RetryStrategy defines the interface for retry behavior
+type RetryStrategy interface {
+	NextDelay(attempt int) time.Duration
+}
+
+// ExponentialBackoff implements RetryStrategy
+type ExponentialBackoff struct {
+	Initial time.Duration
+}
+
+func (eb *ExponentialBackoff) NextDelay(attempt int) time.Duration {
+	return eb.Initial * time.Duration(math.Pow(2, float64(attempt-1)))
+}
+
+// WithCircuitBreaker configures circuit breaker for a job
+func WithCircuitBreaker(id string, maxFailures int, resetTimeout time.Duration) JobOption {
+	return func(j *Job) {
+		j.CircuitID = id
+		j.CircuitConfig = &CircuitBreakerConfig{
+			MaxFailures:  maxFailures,
+			ResetTimeout: resetTimeout,
+			HalfOpenMax:  2, // Default value, could be made configurable
+		}
+	}
+}
+
+// WithRetry configures retry behavior for a job
+func WithRetry(attempts int, strategy RetryStrategy) JobOption {
+	return func(j *Job) {
+		j.RetryPolicy = &RetryPolicy{
+			MaxAttempts: attempts,
+			Strategy:    strategy,
+		}
+	}
+}
+
+
+
+// File: scaler.go
+
+package qpool
+
+import (
+	"math"
+	"time"
+
+	"github.com/theapemachine/errnie"
+)
+
+// Scaler manages pool size based on current load
+type Scaler struct {
+	pool               *Q
+	minWorkers         int
+	maxWorkers         int
+	targetLoad         float64
+	scaleUpThreshold   float64
+	scaleDownThreshold float64
+	cooldown           time.Duration
+	lastScale          time.Time
+}
+
+// ScalerConfig defines configuration for the Scaler
+type ScalerConfig struct {
+	TargetLoad         float64
+	ScaleUpThreshold   float64
+	ScaleDownThreshold float64
+	Cooldown           time.Duration
+}
+
+// evaluate assesses the current load and scales the worker pool accordingly
+func (s *Scaler) evaluate() {
+	s.pool.metrics.mu.Lock()
+	defer s.pool.metrics.mu.Unlock()
+
+	if time.Since(s.lastScale) < s.cooldown {
+		return
+	}
+
+	// Ensure at least one worker for load calculation
+	if s.pool.metrics.WorkerCount == 0 {
+		s.pool.metrics.WorkerCount = 1
+	}
+
+	currentLoad := float64(s.pool.metrics.JobQueueSize) / float64(s.pool.metrics.WorkerCount)
+	errnie.Log("Current load: %.2f, Workers: %d, Queue: %d",
+		currentLoad, s.pool.metrics.WorkerCount, s.pool.metrics.JobQueueSize)
+
+	switch {
+	case currentLoad > s.scaleUpThreshold && s.pool.metrics.WorkerCount < s.maxWorkers:
+		needed := int(math.Ceil(float64(s.pool.metrics.JobQueueSize) / s.targetLoad))
+		toAdd := Min(s.maxWorkers-s.pool.metrics.WorkerCount, needed)
+		if toAdd > 0 {
+			s.scaleUp(toAdd)
+			s.lastScale = time.Now()
+		}
+
+	case currentLoad < s.scaleDownThreshold && s.pool.metrics.WorkerCount > s.minWorkers:
+		needed := Max(int(math.Ceil(float64(s.pool.metrics.JobQueueSize)/s.targetLoad)), s.minWorkers)
+		toRemove := Min(s.pool.metrics.WorkerCount-s.minWorkers, Max(1, (s.pool.metrics.WorkerCount-needed)/2))
+		if toRemove > 0 {
+			s.scaleDown(toRemove)
+			s.lastScale = time.Now()
+		}
+	}
+}
+
+// scaleUp adds 'count' number of workers to the pool
+func (s *Scaler) scaleUp(count int) {
+	toAdd := Min(s.maxWorkers-s.pool.metrics.WorkerCount, Max(1, count))
+
+	for i := 0; i < toAdd; i++ {
+		s.pool.startWorker()
+	}
+	errnie.Info("Scaled up by %d workers, total workers: %d", toAdd, s.pool.metrics.WorkerCount)
+}
+
+// scaleDown removes 'count' number of workers from the pool
+func (s *Scaler) scaleDown(count int) {
+	s.pool.workerMu.Lock()
+	defer s.pool.workerMu.Unlock()
+
+	for i := 0; i < count; i++ {
+		if len(s.pool.workerList) == 0 {
+			break
+		}
+
+		// Remove the last worker from the list
+		w := s.pool.workerList[len(s.pool.workerList)-1]
+		s.pool.workerList = s.pool.workerList[:len(s.pool.workerList)-1]
+
+		// Cancel the worker's context outside the lock to avoid holding it during cleanup
+		cancelFunc := w.cancel
+
+		s.pool.metrics.WorkerCount--
+
+		// Release the lock before cleanup operations
+		s.pool.workerMu.Unlock()
+
+		// Cancel the worker's context
+		if cancelFunc != nil {
+			cancelFunc()
+		}
+
+		errnie.Info("Scaled down worker, total workers: %d", s.pool.metrics.WorkerCount)
+
+		// Add a small delay between worker removals
+		time.Sleep(time.Millisecond * 50)
+
+		// Re-acquire the lock for the next iteration
+		s.pool.workerMu.Lock()
+	}
+}
+
+// run starts the scaler's evaluation loop
+func (s *Scaler) run() {
+	ticker := time.NewTicker(time.Second * 1)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.pool.ctx.Done():
+			return
+		case <-ticker.C:
+			s.evaluate()
+		}
+	}
+}
+
+// NewScaler initializes and starts a new Scaler
+func NewScaler(q *Q, minWorkers, maxWorkers int, config *ScalerConfig) *Scaler {
+	scaler := &Scaler{
+		pool:               q,
+		minWorkers:         minWorkers,
+		maxWorkers:         maxWorkers,
+		targetLoad:         config.TargetLoad,
+		scaleUpThreshold:   config.ScaleUpThreshold,
+		scaleDownThreshold: config.ScaleDownThreshold,
+		cooldown:           config.Cooldown,
+		lastScale:          time.Now(),
+	}
+
+	q.wg.Add(1)
+	go func() {
+		defer q.wg.Done()
+		scaler.run()
+	}()
+
+	return scaler
+}
+
+
+
+// File: state.go
+
+package qpool
+
+/*
+State represents a possible quantum state with its probability amplitude
+and associated verification information.
+*/
+type State struct {
+	Value       interface{}
+	Probability float64
+	Amplitude   complex128 // For future quantum computing features
+	Evidence    []Evidence // Supporting evidence for this state
+}
+
+
+
+// File: utils.go
+
+package qpool
+
+// Min returns the minimum of two integers
+func Min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// Max returns the maximum of two integers
+func Max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+
+
+// File: wavefunction.go
+
+// wavefunction.go
+package qpool
+
+import (
+	"math"
+	"math/rand"
+
+	"github.com/theapemachine/errnie"
+)
+
+/*
+WaveFunction represents a quantum state that can exist in multiple possible
+states simultaneously until observation or verification forces a collapse
+into a definite state.
+*/
+type WaveFunction struct {
+	States      []State
+	Uncertainty UncertaintyLevel
+	isCollapsed bool
+
+	// New fields for verification-aware collapse
+	methodDiversity float64
+	evidenceQuality float64
+}
+
+/*
+Evidence represents verification data supporting a particular state.
+*/
+type Evidence struct {
+	Method     string      // Verification method used
+	Confidence float64     // Confidence in this evidence
+	Data       interface{} // The actual evidence data
+}
+
+func NewWaveFunction(
+	states []State,
+	uncertainty UncertaintyLevel,
+	methodDiversity float64,
+) *WaveFunction {
+	errnie.Info(
+		"NewWaveFunction - states %v, uncertainty %v, methodDiversity %v",
+		states,
+		uncertainty,
+		methodDiversity,
+	)
+	return &WaveFunction{
+		States:          states,
+		Uncertainty:     uncertainty,
+		isCollapsed:     false,
+		methodDiversity: methodDiversity,
+	}
+}
+
+/*
+Collapse forces the wave function to choose a definite state based on both
+probabilities and verification evidence. The collapse mechanism considers:
+1. State probabilities
+2. Method diversity
+3. Evidence quality
+4. Uncertainty level
+*/
+func (wf *WaveFunction) Collapse() interface{} {
+	if wf.isCollapsed {
+		if len(wf.States) > 0 {
+			return wf.States[0].Value
+		}
+		return nil
+	}
+
+	if len(wf.States) == 0 {
+		return nil
+	}
+
+	// Calculate adjusted probabilities based on evidence
+	adjustedStates := wf.calculateAdjustedProbabilities()
+
+	// Generate a random number between 0 and 1
+	r := rand.Float64()
+
+	// Collapse based on adjusted probabilities
+	var cumulativeProb float64
+	for _, state := range adjustedStates {
+		cumulativeProb += state.Probability
+		if r <= cumulativeProb {
+			// Collapse to this state
+			wf.States = []State{state}
+			wf.isCollapsed = true
+
+			// Uncertainty reduces after collapse
+			wf.Uncertainty = UncertaintyLevel(
+				math.Max(0.1, float64(wf.Uncertainty)*(1.0-wf.methodDiversity)),
+			)
+
+			return state.Value
+		}
+	}
+
+	// Fallback collapse
+	lastState := adjustedStates[len(adjustedStates)-1]
+	wf.States = []State{lastState}
+	wf.isCollapsed = true
+	return lastState.Value
+}
+
+/*
+calculateAdjustedProbabilities modifies state probabilities based on
+verification evidence and method diversity.
+*/
+func (wf *WaveFunction) calculateAdjustedProbabilities() []State {
+	adjustedStates := make([]State, len(wf.States))
+	copy(adjustedStates, wf.States)
+
+	// Calculate evidence-based adjustments
+	for i := range adjustedStates {
+		evidenceWeight := wf.calculateEvidenceWeight(adjustedStates[i].Evidence)
+
+		// Adjust probability based on evidence and method diversity
+		adjustedStates[i].Probability *= (1 + evidenceWeight*wf.methodDiversity)
+	}
+
+	// Normalize probabilities
+	wf.normalizeStateProbabilities(adjustedStates)
+
+	return adjustedStates
+}
+
+/*
+calculateEvidenceWeight determines how much evidence should influence
+the collapse probability.
+*/
+func (wf *WaveFunction) calculateEvidenceWeight(evidence []Evidence) float64 {
+	if len(evidence) == 0 {
+		return 0
+	}
+
+	var totalWeight float64
+	for _, e := range evidence {
+		totalWeight += e.Confidence
+	}
+
+	return totalWeight / float64(len(evidence))
+}
+
+/*
+normalizeStateProbabilities ensures probabilities sum to 1.0
+*/
+func (wf *WaveFunction) normalizeStateProbabilities(states []State) {
+	var total float64
+	for _, s := range states {
+		total += s.Probability
+	}
+
+	if total > 0 {
+		for i := range states {
+			states[i].Probability /= total
+		}
+	}
+}
+
+/*
+AddEvidence allows adding new evidence to a state after creation.
+*/
+func (wf *WaveFunction) AddEvidence(stateValue interface{}, evidence Evidence) {
+	for i, state := range wf.States {
+		if state.Value == stateValue {
+			wf.States[i].Evidence = append(wf.States[i].Evidence, evidence)
+			return
+		}
+	}
+}
+
+/*
+UpdateMethodDiversity allows updating the method diversity score as new
+verification methods are added.
+*/
+func (wf *WaveFunction) UpdateMethodDiversity(diversity float64) {
+	wf.methodDiversity = diversity
+	// Higher diversity reduces uncertainty
+	wf.Uncertainty = UncertaintyLevel(
+		math.Max(0.1, float64(wf.Uncertainty)*(1.0-diversity)),
+	)
+}
+
+
+
+// File: worker.go
+
+package qpool
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/theapemachine/errnie"
+)
+
+// Worker processes jobs
+type Worker struct {
+	pool       *Q
+	jobs       chan Job
+	cancel     context.CancelFunc
+	currentJob *Job // Added Field to Track Current Job
+}
+
+// run starts the worker's job processing loop
+func (w *Worker) run() {
+	jobChan := w.jobs // Store the job channel locally for clarity
+
+	for {
+		// First check if we should exit
+		select {
+		case <-w.pool.ctx.Done():
+			errnie.Info("Worker exiting due to context cancellation")
+			return
+		default:
+		}
+
+		// Register ourselves as available
+		errnie.Info("Worker registering as available")
+		w.pool.workers <- jobChan
+
+		// Wait for a job
+		select {
+		case <-w.pool.ctx.Done():
+			errnie.Info("Worker exiting while waiting for job")
+			return
+		case job, ok := <-jobChan:
+			if !ok {
+				errnie.Warn("Worker job channel closed")
+				return
+			}
+
+			errnie.Info("Worker received job: %s", job.ID)
+			w.currentJob = &job
+			result, err := w.processJobWithTimeout(w.pool.ctx, job)
+			w.currentJob = nil
+			errnie.Info("Worker completed job: %s, err: %v", job.ID, err)
+
+			// Handle result
+			if err != nil {
+				w.pool.metrics.RecordJobFailure()
+				errnie.Error(fmt.Errorf("Job %s failed: %v", job.ID, err))
+				// Store error result
+				w.pool.space.StoreError(job.ID, err, job.TTL)
+			} else {
+				w.pool.metrics.RecordJobSuccess(time.Since(job.StartTime))
+				errnie.Info("Job %s succeeded", job.ID)
+				// Store successful result
+				w.pool.space.Store(job.ID, result, []State{{Value: result, Probability: 1.0}}, job.TTL)
+			}
+			errnie.Info("Stored result for job: %s", job.ID)
+
+			// Notify dependents
+			if len(job.Dependencies) > 0 {
+				for _, depID := range job.Dependencies {
+					if children := w.pool.space.children[depID]; len(children) > 0 {
+						for _, childID := range children {
+							errnie.Info("Notifying dependent job %s", childID)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// processJobWithTimeout processes a job with a timeout
+func (w *Worker) processJobWithTimeout(ctx context.Context, job Job) (any, error) {
+	startTime := time.Now()
+
+	// Check dependencies before job execution
+	for _, depID := range job.Dependencies {
+		if err := w.checkSingleDependency(depID, job.DependencyRetryPolicy); err != nil {
+			w.pool.metrics.RecordJobExecution(startTime, false)
+			if job.CircuitID != "" {
+				w.recordFailure(job.CircuitID)
+			}
+			return nil, err
+		}
+	}
+
+	done := make(chan struct{})
+	var result any
+	var err error
+
+	go func() {
+		defer close(done)
+		result, err = job.Fn()
+		errnie.Info("Job %s completed", job.ID)
+	}()
+
+	select {
+	case <-ctx.Done():
+		w.pool.metrics.RecordJobFailure()
+		return nil, errnie.Error(fmt.Errorf("job %s timed out", job.ID))
+	case <-done:
+		w.pool.metrics.RecordJobExecution(startTime, err == nil)
+		return result, err
+	}
+}
+
+// checkSingleDependency checks a single job dependency with retries
+func (w *Worker) checkSingleDependency(depID string, retryPolicy *RetryPolicy) error {
+	maxAttempts := 1
+	var strategy RetryStrategy = &ExponentialBackoff{Initial: time.Second}
+
+	if retryPolicy != nil {
+		maxAttempts = retryPolicy.MaxAttempts
+		strategy = retryPolicy.Strategy
+	}
+
+	circuitID := ""
+	if w.currentJob != nil {
+		circuitID = w.currentJob.CircuitID
+	}
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		// First check if the dependency exists
+		if !w.pool.space.Exists(depID) {
+			if attempt < maxAttempts-1 {
+				time.Sleep(strategy.NextDelay(attempt + 1))
+				continue
+			}
+			break
+		}
+
+		ch := w.pool.space.Await(depID)
+		select {
+		case result := <-ch:
+			if result.Error == nil {
+				return nil
+			}
+		case <-time.After(time.Second): // Add timeout for each attempt
+			// Continue to next attempt or break
+		}
+
+		if attempt < maxAttempts-1 {
+			time.Sleep(strategy.NextDelay(attempt + 1))
+			continue
+		}
+	}
+
+	w.pool.breakersMu.RLock()
+	breaker, exists := w.pool.breakers[circuitID]
+	w.pool.breakersMu.RUnlock()
+
+	if exists {
+		breaker.RecordFailure()
+	}
+
+	w.pool.space.mu.Lock()
+	if w.pool.space.children == nil {
+		w.pool.space.children = make(map[string][]string)
+	}
+	if w.currentJob != nil {
+		w.pool.space.children[depID] = append(w.pool.space.children[depID], w.currentJob.ID)
+	}
+	w.pool.space.mu.Unlock()
+
+	return errnie.Error(fmt.Errorf("dependency %s failed after %d attempts", depID, maxAttempts))
+}
+
+// recordFailure records a failure for a specific circuit breaker
+func (w *Worker) recordFailure(circuitID string) {
+	if circuitID == "" {
+		return
+	}
+
+	w.pool.breakersMu.RLock()
+	breaker, exists := w.pool.breakers[circuitID]
+	w.pool.breakersMu.RUnlock()
+
+	if exists {
+		breaker.RecordFailure()
+	}
+}
+
+// Add this method to the Worker struct
+func (w *Worker) handleJobTimeout(job Job) error {
+	w.pool.metrics.RecordJobFailure()
+	return errnie.Error(fmt.Errorf("job %s timed out", job.ID))
+}
+
+

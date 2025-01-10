@@ -18,46 +18,43 @@ QPool is a high-performance, feature-rich worker pool implementation in Go that 
 
 ## 🌟 Key Features
 
--   **Dynamic Worker Pool**
+- **Dynamic Worker Pool**
+  - Auto-scaling based on workload
+  - Configurable min/max worker counts
+  - Efficient worker management
+  - Smart job distribution
 
-    -   Auto-scaling based on workload
-    -   Configurable min/max worker counts
-    -   Efficient worker management
-    -   Smart job distribution
+- **Advanced Job Dependencies**
+  - Support for future dependencies
+  - Dependency chain resolution
+  - Circular dependency detection
+  - Parent-child relationship tracking
 
--   **Advanced Job Dependencies**
+- **Robust Error Handling**
+  - Circuit breaker pattern
+  - Configurable retry policies
+  - Exponential backoff
+  - Timeout management
 
-    -   Support for future dependencies
-    -   Dependency chain resolution
-    -   Circular dependency detection
-    -   Parent-child relationship tracking
+- **Performance Features**
+  - Non-blocking job scheduling
+  - Efficient memory usage
+  - Resource utilization tracking
+  - Load-based auto-scaling
 
--   **Robust Error Handling**
-
-    -   Circuit breaker pattern
-    -   Configurable retry policies
-    -   Exponential backoff
-    -   Timeout management
-
--   **Performance Features**
-
-    -   Non-blocking job scheduling
-    -   Efficient memory usage
-    -   Resource utilization tracking
-    -   Load-based auto-scaling
-
--   **Monitoring & Metrics**
-    -   Comprehensive metrics collection
-    -   Latency percentiles (p95, p99)
-    -   Success/failure rates
-    -   Resource utilization stats
-    -   Dependency resolution tracking
+- **Monitoring & Metrics**
+  - Comprehensive metrics collection
+  - Latency percentiles (p95, p99)
+  - Success/failure rates
+  - Resource utilization stats
+  - Dependency resolution tracking
 
 ## ⚛️ Quantum Entanglement
 
 QPool introduces the concept of Entanglement, inspired by quantum mechanics. Just as quantum particles can be entangled so that the state of one instantly affects the other, jobs in an Entanglement share state that persists across time and space. When one job updates the shared state, all other jobs in the entanglement—even those not yet processed—will see these changes.
 
-This powerful feature enables:
+**This powerful feature enables:**
+
 - Shared state between related jobs that persists even across job completion
 - Automatic state synchronization for jobs processed at different times
 - Immutable history of all state changes
@@ -67,7 +64,7 @@ This powerful feature enables:
 
 ## 📦️ Regulators
 
-QPool implements a sophisticated regulation system inspired by biological and mechanical control systems. Like a thermostat regulating temperature or a governor controlling engine speed, Regulators maintain system stability and prevent resource exhaustion through adaptive control mechanisms.
+QPool implements a biological-inspired regulation system that helps maintain system stability and optimal performance under varying loads. Like a living organism that regulates its internal state through multiple coordinated mechanisms, QPool uses a set of regulators to control different aspects of the worker pool.
 
 The regulation system includes:
 
@@ -103,6 +100,26 @@ Like a traffic controller directing vehicles to different lanes based on congest
 - Perfect for optimizing resource utilization
 
 [Learn more about Load Balancing →](docs/loadbalancer.md)
+
+### 🔙 BackPressureRegulator
+
+Manages system pressure by controlling job intake based on queue size and processing times, preventing system overload.
+
+[Learn more about Backpressure →](docs/backpressure.md)
+
+### 👮🏽 ResourceGovernorRegulator
+
+Monitors and manages system resource usage (CPU, memory) to prevent resource exhaustion and maintain system stability.
+
+[Learn more about Resource Governor →](docs/resourcegovernor.md)
+
+### 🔃 AdaptiveScalerRegulator
+
+Dynamically adjusts the worker pool size based on load metrics and performance data to optimize resource utilization.
+
+[Learn more about Adaptive Scaling →](docs/adaptivescaler.md)
+
+All regulators implement the `Regulator` interface, allowing them to be composed and combined to create sophisticated control systems.
 
 [Learn more about the Regulation System →](docs/regulator.md)
 
@@ -187,7 +204,8 @@ for result := range job4Result {
 }
 ```
 
-Key features of the dependency system:
+**Key features of the dependency system:**
+
 - Jobs wait for all dependencies to complete successfully before starting
 - If any dependency fails, dependent jobs fail automatically
 - Configurable retry policies for dependency resolution
@@ -258,22 +276,22 @@ pool := qpool.NewQ(ctx, minWorkers, maxWorkers, config)
 
 QPool consists of several key components:
 
--   **Q (Pool)**: Main orchestrator managing workers and job scheduling
--   **Worker**: Handles job execution and resource management
--   **QuantumSpace**: Manages job results and dependencies
--   **CircuitBreaker**: Provides fault tolerance
--   **Scaler**: Handles dynamic worker pool sizing
--   **Metrics**: Collects and exposes performance data
+- **Q (Pool)**: Main orchestrator managing workers and job scheduling
+- **Worker**: Handles job execution and resource management
+- **QuantumSpace**: Manages job results and dependencies
+- **CircuitBreaker**: Provides fault tolerance
+- **Scaler**: Handles dynamic worker pool sizing
+- **Metrics**: Collects and exposes performance data
 
 ## 📈 Performance
 
 QPool is designed for high performance:
 
--   Non-blocking job scheduling
--   Efficient memory usage
--   Smart resource allocation
--   Automatic scaling based on load
--   Optimized dependency resolution
+- Non-blocking job scheduling
+- Efficient memory usage
+- Smart resource allocation
+- Automatic scaling based on load
+- Optimized dependency resolution
 
 ## 🧪 Testing
 
@@ -305,9 +323,9 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 🙏 Acknowledgments
 
--   Inspired by a conversation with Clause AI
--   Built with modern concurrency patterns and best practices
--   Designed for real-world production use cases
+- Inspired by a conversation with Claude AI, with ChatGPT, O1, and Gemini action as reviewers, and providing critique on progress.
+- Built with modern concurrency patterns and best practices.
+- Designed for real-world production use cases.
 
 ## 📚 Documentation
 
@@ -315,28 +333,10 @@ For detailed documentation, please visit our [Go Docs](https://pkg.go.dev/github
 
 ## 📞 Support
 
--   Create an issue for bug reports
--   Start a discussion for feature requests
--   Check existing issues before creating new ones
+- Create an issue for bug reports.
+- Start a discussion for feature requests.
+- Check existing issues before creating new ones.
 
 ---
 
 Made with ❤️ by Daniel Owen van Dommelen
-
-## Regulators
-
-QPool implements a biological-inspired regulation system that helps maintain system stability and optimal performance under varying loads. Like a living organism that regulates its internal state through multiple coordinated mechanisms, QPool uses a set of regulators to control different aspects of the worker pool:
-
-- **RateLimiter**: Implements the token bucket algorithm to provide smooth, predictable rate limiting with burst capacity. Perfect for API rate limiting or controlling resource consumption rates. [Learn more](docs/ratelimiter.md)
-
-- **CircuitBreaker**: Prevents system failures by stopping operations when error rates exceed acceptable thresholds. Features self-healing capabilities through gradual recovery mechanisms. [Learn more](docs/circuitbreaker.md)
-
-- **LoadBalancer**: Distributes work evenly across workers while making intelligent routing decisions based on worker performance metrics and current load. [Learn more](docs/loadbalancer.md)
-
-- **BackPressureRegulator**: Manages system pressure by controlling job intake based on queue size and processing times, preventing system overload. [Learn more](docs/backpressure.md)
-
-- **ResourceGovernorRegulator**: Monitors and manages system resource usage (CPU, memory) to prevent resource exhaustion and maintain system stability. [Learn more](docs/resourcegovernor.md)
-
-- **AdaptiveScalerRegulator**: Dynamically adjusts the worker pool size based on load metrics and performance data to optimize resource utilization. [Learn more](docs/adaptivescaler.md)
-
-All regulators implement the `Regulator` interface, allowing them to be composed and combined to create sophisticated control systems. [Learn more about the Regulator interface](docs/regulator.md)

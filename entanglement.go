@@ -43,8 +43,27 @@ type Entanglement struct {
 	// This ensures that even jobs that start processing later will see
 	// the complete history of state changes in the correct order
 	stateLedger []StateChange
+
+	quantumStates map[string]*State
 }
 
+func (e *Entanglement) UpdateQuantumState(key string, state *State) {
+    e.mu.Lock()
+    defer e.mu.Unlock()
+    
+    e.quantumStates[key] = state
+    e.recordStateChangeQuantum(key, state)
+}
+
+func (e *Entanglement) recordStateChangeQuantum(key string, state *State) {
+    change := StateChange{
+        Timestamp: time.Now(),
+        Key:       key,
+        Value:     state,
+        Sequence:  uint64(len(e.stateLedger)),
+    }
+    e.stateLedger = append(e.stateLedger, change)
+}
 /*
 StateChange represents an immutable record of a change to the shared state.
 Each change is timestamped and contains both the key and value that was changed,

@@ -1,6 +1,6 @@
 module github.com/theapemachine/qpool
 
-go 1.23.4
+go 1.23.0
 
 require (
 	github.com/smartystreets/goconvey v1.8.1

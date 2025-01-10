@@ -622,3 +622,10 @@ func (qs *QSpace) StoreError(id string, err error, ttl time.Duration) {
 		delete(qs.waiting, id)
 	}
 }
+
+// Enhance existing QSpace
+func (qs *QSpace) CreateQuantumEntanglement(id string) *Entanglement {
+    ent := NewEntanglement(id, nil, 24*time.Hour)
+    ent.quantumStates = make(map[string]*State)
+    return ent
+}

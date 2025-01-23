@@ -4,8 +4,6 @@ package qpool
 import (
 	"math"
 	"math/rand"
-
-	"github.com/theapemachine/errnie"
 )
 
 /*
@@ -37,12 +35,6 @@ func NewWaveFunction(
 	uncertainty UncertaintyLevel,
 	methodDiversity float64,
 ) *WaveFunction {
-	errnie.Info(
-		"NewWaveFunction - states %v, uncertainty %v, methodDiversity %v",
-		states,
-		uncertainty,
-		methodDiversity,
-	)
 	return &WaveFunction{
 		States:          states,
 		Uncertainty:     uncertainty,

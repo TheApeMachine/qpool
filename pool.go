@@ -204,7 +204,7 @@ func (q *Q) Schedule(id string, fn func() (any, error), opts ...JobOption) chan 
 		if breaker != nil && !breaker.Allow() {
 			ch := make(chan *QValue, 1)
 			ch <- &QValue{
-				Error:     errnie.Error(fmt.Errorf("circuit breaker %s is open", job.CircuitID)),
+				Error:     fmt.Errorf("circuit breaker %s is open", job.CircuitID),
 				CreatedAt: time.Now(),
 			}
 			close(ch)
@@ -220,7 +220,7 @@ func (q *Q) Schedule(id string, fn func() (any, error), opts ...JobOption) chan 
 	case <-ctx.Done():
 		ch := make(chan *QValue, 1)
 		ch <- &QValue{
-			Error:     errnie.Error(fmt.Errorf("job scheduling timeout: %w", ctx.Err())),
+			Error:     fmt.Errorf("job scheduling timeout: %w", ctx.Err()),
 			CreatedAt: time.Now(),
 		}
 		close(ch)

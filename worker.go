@@ -53,7 +53,6 @@ func (w *Worker) run() {
 			// Handle result
 			if err != nil {
 				w.pool.metrics.RecordJobFailure()
-				errnie.Error(fmt.Errorf("Job %s failed: %v", job.ID, err))
 				// Store error result
 				w.pool.space.StoreError(job.ID, err, job.TTL)
 			} else {
@@ -106,7 +105,7 @@ func (w *Worker) processJobWithTimeout(ctx context.Context, job Job) (any, error
 	select {
 	case <-ctx.Done():
 		w.pool.metrics.RecordJobFailure()
-		return nil, errnie.Error(fmt.Errorf("job %s timed out", job.ID))
+		return nil, fmt.Errorf("job %s timed out", job.ID)
 	case <-done:
 		w.pool.metrics.RecordJobExecution(startTime, err == nil)
 		return result, err
@@ -171,7 +170,7 @@ func (w *Worker) checkSingleDependency(depID string, retryPolicy *RetryPolicy) e
 	}
 	w.pool.space.mu.Unlock()
 
-	return errnie.Error(fmt.Errorf("dependency %s failed after %d attempts", depID, maxAttempts))
+	return fmt.Errorf("dependency %s failed after %d attempts", depID, maxAttempts)
 }
 
 // recordFailure records a failure for a specific circuit breaker
@@ -192,5 +191,5 @@ func (w *Worker) recordFailure(circuitID string) {
 // Add this method to the Worker struct
 func (w *Worker) handleJobTimeout(job Job) error {
 	w.pool.metrics.RecordJobFailure()
-	return errnie.Error(fmt.Errorf("job %s timed out", job.ID))
+	return fmt.Errorf("job %s timed out", job.ID)
 }

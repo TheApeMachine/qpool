@@ -32,6 +32,6 @@ func (event Event) log() {
 	case log.DebugLevel:
 		errnie.Debug(event.Message, keyValues...)
 	case log.TraceLevel:
-		errnie.Trace(append([]any{event.Message}, keyValues...)...)
+		errnie.Trace(event.Message, keyValues...)
 	}
 }

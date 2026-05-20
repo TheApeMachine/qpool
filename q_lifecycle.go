@@ -176,9 +176,7 @@ func (pool *Q) Close() {
 		pool.cancel()
 	}
 
-	// Wait until schedules already inside the enqueue select release RLock.
-	pool.shutdownMu.Lock()
-	pool.shutdownMu.Unlock()
+	pool.waitForScheduleLockDrain()
 	pool.wg.Wait()
 	pool.shutdownMu.Lock()
 
@@ -199,4 +197,10 @@ func (pool *Q) Close() {
 		Time:      time.Now(),
 		Level:     log.DebugLevel,
 	})
+}
+
+func (pool *Q) waitForScheduleLockDrain() {
+	// Taking the write lock blocks until schedules already inside RLock exit.
+	pool.shutdownMu.Lock()
+	defer pool.shutdownMu.Unlock()
 }

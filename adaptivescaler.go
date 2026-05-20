@@ -2,52 +2,32 @@ package qpool
 
 import (
 	"math"
-	"sync"
+	"sync/atomic"
 	"time"
 )
 
 /*
-AdaptiveScalerRegulator implements the Regulator interface to dynamically adjust worker pool size.
-It combines the functionality of the existing Scaler with additional adaptive behaviors,
-similar to how an adaptive cruise control system adjusts speed based on traffic conditions.
-
-Key features:
-  - Dynamic worker pool sizing
-  - Load-based scaling
-  - Resource-aware adjustments
-  - Performance optimization
+AdaptiveScalerRegulator implements Regulator by scaling the pool when Observed readings cross thresholds.
 */
 type AdaptiveScalerRegulator struct {
-	mu sync.RWMutex
-
 	pool               *Q
 	minWorkers         int
 	maxWorkers         int
-	targetLoad         float64       // Target jobs per worker
-	scaleUpThreshold   float64       // Load threshold for scaling up
-	scaleDownThreshold float64       // Load threshold for scaling down
-	cooldown           time.Duration // Time between scaling operations
-	lastScale          time.Time     // Last scaling operation time
-	metrics           *Metrics      // System metrics
+	targetLoad         float64
+	scaleUpThreshold   float64
+	scaleDownThreshold float64
+	cooldown           time.Duration
+	lastScaleUnixNano  atomic.Int64
+	reading            atomic.Pointer[MetricReading]
 }
 
 /*
-NewAdaptiveScalerRegulator creates a new adaptive scaler regulator.
-
-Parameters:
-  - pool: The worker pool to manage
-  - minWorkers: Minimum number of workers
-  - maxWorkers: Maximum number of workers
-  - config: Scaling configuration parameters
-
-Returns:
-  - *AdaptiveScalerRegulator: A new adaptive scaler instance
-
-Example:
-    scaler := NewAdaptiveScalerRegulator(pool, 2, 10, &ScalerConfig{...})
+NewAdaptiveScalerRegulator constructs an adaptive scaler regulator.
 */
-func NewAdaptiveScalerRegulator(pool *Q, minWorkers, maxWorkers int, config *ScalerConfig) *AdaptiveScalerRegulator {
-	return &AdaptiveScalerRegulator{
+func NewAdaptiveScalerRegulator(
+	pool *Q, minWorkers, maxWorkers int, config *ScalerConfig,
+) *AdaptiveScalerRegulator {
+	as := &AdaptiveScalerRegulator{
 		pool:               pool,
 		minWorkers:         minWorkers,
 		maxWorkers:         maxWorkers,
@@ -55,133 +35,114 @@ func NewAdaptiveScalerRegulator(pool *Q, minWorkers, maxWorkers int, config *Sca
 		scaleUpThreshold:   config.ScaleUpThreshold,
 		scaleDownThreshold: config.ScaleDownThreshold,
 		cooldown:           config.Cooldown,
-		lastScale:          time.Now(),
 	}
+
+	as.lastScaleUnixNano.Store(time.Now().UnixNano())
+
+	return as
 }
 
 /*
-Observe implements the Regulator interface by monitoring system metrics.
-This method updates the scaler's view of system load and performance.
-
-Parameters:
-  - metrics: Current system metrics including worker and queue statistics
+Observe refreshes metrics and may scale the worker count.
 */
-func (as *AdaptiveScalerRegulator) Observe(metrics *Metrics) {
-	as.mu.Lock()
-	defer as.mu.Unlock()
+func (as *AdaptiveScalerRegulator) Observe(reading *MetricReading) {
+	if reading != nil {
+		as.reading.Store(reading)
+	}
 
-	as.metrics = metrics
 	as.evaluate()
 }
 
 /*
-Limit implements the Regulator interface by determining if scaling operations
-should be limited. Returns true during cooldown periods or at worker limits.
-
-Returns:
-  - bool: true if scaling should be limited, false if it can proceed
+Limit mirrors scaler saturation semantics when already at max workers under extreme load.
 */
 func (as *AdaptiveScalerRegulator) Limit() bool {
-	as.mu.RLock()
-	defer as.mu.RUnlock()
-
-	if as.metrics == nil {
+	read := as.reading.Load()
+	if read == nil {
 		return false
 	}
 
-	// Limit if we're at max workers and load is high
-	if as.metrics.WorkerCount >= as.maxWorkers {
-		currentLoad := float64(as.metrics.JobQueueSize) / float64(as.metrics.WorkerCount)
-		return currentLoad > as.scaleUpThreshold
+	if read.WorkerCount >= as.maxWorkers {
+		load := float64(read.JobQueueSize) / float64(max(1, read.WorkerCount))
+
+		return load > as.scaleUpThreshold
 	}
 
 	return false
 }
 
 /*
-Renormalize implements the Regulator interface by attempting to restore normal operation.
-This method triggers a scaling evaluation if enough time has passed since the last scale.
+Renormalize retries scaling evaluation after the cooldown window.
 */
 func (as *AdaptiveScalerRegulator) Renormalize() {
-	as.mu.Lock()
-	defer as.mu.Unlock()
-
-	if time.Since(as.lastScale) >= as.cooldown {
+	last := as.lastScaleUnixNano.Load()
+	if time.Since(time.Unix(0, last)) >= as.cooldown {
 		as.evaluate()
 	}
 }
 
-// evaluate assesses current metrics and scales the worker pool accordingly
 func (as *AdaptiveScalerRegulator) evaluate() {
-	if as.metrics == nil || time.Since(as.lastScale) < as.cooldown {
+	read := as.reading.Load()
+	if read == nil {
 		return
 	}
 
-	// Ensure at least one worker for load calculation
-	if as.metrics.WorkerCount == 0 {
-		as.metrics.WorkerCount = 1
+	last := time.Unix(0, as.lastScaleUnixNano.Load())
+	if time.Since(last) < as.cooldown {
+		return
 	}
 
-	currentLoad := float64(as.metrics.JobQueueSize) / float64(as.metrics.WorkerCount)
+	workers := read.WorkerCount
+	if workers <= 0 {
+		workers = 1
+	}
+
+	tl := as.targetLoad
+
+	if tl <= 0 {
+		tl = 1
+	}
+
+	currentLoad := float64(read.JobQueueSize) / float64(workers)
 
 	switch {
-	case currentLoad > as.scaleUpThreshold && as.metrics.WorkerCount < as.maxWorkers:
-		needed := int(math.Ceil(float64(as.metrics.JobQueueSize) / as.targetLoad))
-		toAdd := Min(as.maxWorkers-as.metrics.WorkerCount, needed)
+	case currentLoad > as.scaleUpThreshold && read.WorkerCount < as.maxWorkers:
+		needed := int(math.Ceil(float64(read.JobQueueSize) / tl))
+		delta := max(0, needed-read.WorkerCount)
+		toAdd := min(as.maxWorkers-read.WorkerCount, delta)
+
 		if toAdd > 0 {
 			as.scaleUp(toAdd)
-			as.lastScale = time.Now()
+			as.lastScaleUnixNano.Store(time.Now().UnixNano())
+			as.pool.metrics.NoteLastScale(time.Now())
 		}
 
-	case currentLoad < as.scaleDownThreshold && as.metrics.WorkerCount > as.minWorkers:
-		needed := Max(int(math.Ceil(float64(as.metrics.JobQueueSize)/as.targetLoad)), as.minWorkers)
-		toRemove := Min(as.metrics.WorkerCount-as.minWorkers, Max(1, (as.metrics.WorkerCount-needed)/2))
+	case currentLoad < as.scaleDownThreshold && read.WorkerCount > as.minWorkers:
+		needed := max(int(math.Ceil(float64(read.JobQueueSize)/tl)), as.minWorkers)
+
+		toRemove := min(
+			read.WorkerCount-as.minWorkers,
+			max(1, (read.WorkerCount-needed)/2),
+		)
+
 		if toRemove > 0 {
-			as.scaleDown(toRemove)
-			as.lastScale = time.Now()
+			as.pool.scaleDownWorkers(toRemove)
+			as.lastScaleUnixNano.Store(time.Now().UnixNano())
+			as.pool.metrics.NoteLastScale(time.Now())
 		}
 	}
 }
 
-// scaleUp adds workers to the pool
 func (as *AdaptiveScalerRegulator) scaleUp(count int) {
-	toAdd := Min(as.maxWorkers-as.metrics.WorkerCount, Max(1, count))
-	for i := 0; i < toAdd; i++ {
+	if count <= 0 {
+		return
+	}
+
+	curWorkers := int(as.pool.metrics.workerCount.Load())
+
+	toAdd := min(as.maxWorkers-curWorkers, count)
+
+	for range toAdd {
 		as.pool.startWorker()
 	}
 }
-
-// scaleDown removes workers from the pool
-func (as *AdaptiveScalerRegulator) scaleDown(count int) {
-	as.pool.workerMu.Lock()
-	defer as.pool.workerMu.Unlock()
-
-	for i := 0; i < count; i++ {
-		if len(as.pool.workerList) == 0 {
-			break
-		}
-
-		// Remove the last worker from the list
-		w := as.pool.workerList[len(as.pool.workerList)-1]
-		as.pool.workerList = as.pool.workerList[:len(as.pool.workerList)-1]
-
-		// Cancel the worker's context outside the lock to avoid holding it during cleanup
-		cancelFunc := w.cancel
-
-		as.metrics.WorkerCount--
-
-		// Release the lock before cleanup operations
-		as.pool.workerMu.Unlock()
-
-		// Cancel the worker's context
-		if cancelFunc != nil {
-			cancelFunc()
-		}
-
-		// Add a small delay between worker removals
-		time.Sleep(time.Millisecond * 50)
-
-		// Re-acquire the lock for the next iteration
-		as.pool.workerMu.Lock()
-	}
-} 

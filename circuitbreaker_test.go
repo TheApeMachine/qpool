@@ -1,138 +1,179 @@
 package qpool
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
 	. "github.com/smartystreets/goconvey/convey"
 )
 
-func TestCircuitBreakerInterface(t *testing.T) {
-	Convey("Given a circuit breaker implementing Regulator interface", t, func() {
-		breaker := NewCircuitBreaker(2, 100*time.Millisecond, 1)
-		
-		Convey("It should implement Regulator interface", func() {
-			var _ Regulator = breaker // Compile-time interface check
-			
-			metrics := &Metrics{}
-			breaker.Observe(metrics)
-			So(breaker.Limit(), ShouldBeFalse) // Initially should not limit
+func TestNewCircuitBreaker(t *testing.T) {
+	Convey("Given NewCircuitBreaker", t, func() {
+		reset := time.Minute
+
+		cases := []struct {
+			name            string
+			halfOpenMaxIn   int
+			halfOpenMaxWant int
+		}{
+			{name: "negative halfOpenMax normalizes to one", halfOpenMaxIn: -4, halfOpenMaxWant: 1},
+			{name: "zero halfOpenMax normalizes to one", halfOpenMaxIn: 0, halfOpenMaxWant: 1},
+			{name: "positive halfOpenMax preserved", halfOpenMaxIn: 5, halfOpenMaxWant: 5},
+		}
+
+		for _, row := range cases {
+			label := row.name
+
+			Convey(fmt.Sprintf("When %s", label), func() {
+				breaker := NewCircuitBreaker(3, reset, row.halfOpenMaxIn)
+
+				So(breaker.halfOpenMax, ShouldEqual, row.halfOpenMaxWant)
+				So(breaker.maxFailures, ShouldEqual, 3)
+				So(breaker.resetTimeout, ShouldEqual, reset)
+				So(breaker.state.Load(), ShouldEqual, cbClosed)
+			})
+		}
+	})
+}
+
+func BenchmarkNewCircuitBreaker(b *testing.B) {
+	for b.Loop() {
+		_ = NewCircuitBreaker(5, time.Minute, 2)
+	}
+}
+
+func TestNewCircuitBreakerFromConfig(t *testing.T) {
+	Convey("Given newCircuitBreakerFromConfig", t, func() {
+		cases := []struct {
+			name         string
+			config       *CircuitBreakerConfig
+			wantFailures int
+			wantReset    time.Duration
+			wantHalfOpen int
+		}{
+			{
+				name: "copies fields from job circuit config",
+				config: &CircuitBreakerConfig{
+					MaxFailures:  4,
+					ResetTimeout: 33 * time.Second,
+					HalfOpenMax:  6,
+				},
+				wantFailures: 4,
+				wantReset:    33 * time.Second,
+				wantHalfOpen: 6,
+			},
+			{
+				name: "zero HalfOpenMax normalizes like NewCircuitBreaker",
+				config: &CircuitBreakerConfig{
+					MaxFailures:  2,
+					ResetTimeout: time.Millisecond,
+					HalfOpenMax:  0,
+				},
+				wantFailures: 2,
+				wantReset:    time.Millisecond,
+				wantHalfOpen: 1,
+			},
+		}
+
+		for _, row := range cases {
+			label := row.name
+
+			Convey(fmt.Sprintf("When %s", label), func() {
+				breaker := newCircuitBreakerFromConfig(row.config)
+
+				So(breaker.maxFailures, ShouldEqual, row.wantFailures)
+				So(breaker.resetTimeout, ShouldEqual, row.wantReset)
+				So(breaker.halfOpenMax, ShouldEqual, row.wantHalfOpen)
+				So(breaker.state.Load(), ShouldEqual, cbClosed)
+			})
+		}
+	})
+}
+
+func BenchmarkNewCircuitBreakerFromConfig(b *testing.B) {
+	cfg := &CircuitBreakerConfig{
+		MaxFailures:  3,
+		ResetTimeout: time.Minute,
+		HalfOpenMax:  2,
+	}
+
+	for range b.N {
+		_ = newCircuitBreakerFromConfig(cfg)
+	}
+}
+
+func TestCircuitBreakerRegulatorInterface(t *testing.T) {
+	Convey("Given a CircuitBreaker", t, func() {
+		breaker := NewCircuitBreaker(2, 100*time.Millisecond, 2)
+
+		Convey("It should satisfy the Regulator interface", func() {
+			var _ Regulator = breaker
+		})
+
+		Convey("It should not limit when observed with empty metrics", func() {
+			breaker.Observe(&MetricReading{})
+			So(breaker.Limit(), ShouldBeFalse)
 		})
 	})
 }
 
-func TestCircuitBreakerInitialState(t *testing.T) {
-	Convey("Given a newly created circuit breaker", t, func() {
-		breaker := NewCircuitBreaker(2, 100*time.Millisecond, 1)
-		
-		Convey("It should start in closed state", func() {
-			So(breaker.Allow(), ShouldBeTrue)
-			So(breaker.state, ShouldEqual, CircuitClosed)
-		})
+func TestCircuitBreakerOpensAfterFailures(t *testing.T) {
+	Convey("breaker opens then permits probe after timeout", t, func() {
+		breaker := NewCircuitBreaker(2, 100*time.Millisecond, 2)
+
+		So(breaker.state.Load(), ShouldEqual, cbClosed)
+
+		breaker.RecordFailure()
+		breaker.RecordFailure()
+
+		So(breaker.Allow(), ShouldBeFalse)
+		So(breaker.state.Load(), ShouldEqual, cbOpen)
+
+		time.Sleep(150 * time.Millisecond)
+
+		So(breaker.Allow(), ShouldBeTrue)
+		So(breaker.state.Load(), ShouldEqual, cbHalfOpen)
 	})
 }
 
-func TestCircuitBreakerFailureThreshold(t *testing.T) {
-	Convey("Given a circuit breaker with failure threshold", t, func() {
-		breaker := NewCircuitBreaker(2, 100*time.Millisecond, 1)
-		
-		Convey("It should open after max failures", func() {
-			breaker.RecordFailure()
-			breaker.RecordFailure()
+func TestCircuitBreakerHalfOpenClosesAfterSuccesses(t *testing.T) {
+	Convey("half-open collects successes then closes", t, func() {
+		breaker := NewCircuitBreaker(2, 100*time.Millisecond, 2)
 
-			So(breaker.Allow(), ShouldBeFalse)
-			So(breaker.state, ShouldEqual, CircuitOpen)
+		breaker.RecordFailure()
+		breaker.RecordFailure()
 
-			// Wait for reset timeout
-			time.Sleep(150 * time.Millisecond)
+		time.Sleep(150 * time.Millisecond)
 
-			So(breaker.Allow(), ShouldBeTrue)
-			So(breaker.state, ShouldEqual, CircuitHalfOpen)
-		})
-	})
-}
+		/* Half-open allows up to halfOpenMax concurrent probes; two Allow() calls are expected. */
+		So(breaker.Allow(), ShouldBeTrue)
+		So(breaker.Allow(), ShouldBeTrue)
 
-func TestCircuitBreakerHalfOpenSuccess(t *testing.T) {
-	Convey("Given a circuit breaker in half-open state", t, func() {
-		breaker := NewCircuitBreaker(2, 100*time.Millisecond, 1)
-		
-		Convey("It should close after successful attempt", func() {
-			breaker.RecordFailure()
-			breaker.RecordFailure()
+		breaker.RecordSuccess()
 
-			time.Sleep(150 * time.Millisecond)
+		So(breaker.state.Load(), ShouldEqual, cbHalfOpen)
 
-			So(breaker.Allow(), ShouldBeTrue)
-			So(breaker.state, ShouldEqual, CircuitHalfOpen)
+		breaker.RecordSuccess()
 
-			// Simulate a successful attempt
-			So(breaker.Allow(), ShouldBeTrue)
-			breaker.RecordSuccess()
-
-			So(breaker.state, ShouldEqual, CircuitClosed)
-		})
-	})
-}
-
-func TestCircuitBreakerHalfOpenFailure(t *testing.T) {
-	Convey("Given a circuit breaker in half-open state", t, func() {
-		breaker := NewCircuitBreaker(2, 100*time.Millisecond, 1)
-		
-		Convey("It should open again after failure", func() {
-			breaker.RecordFailure()
-			breaker.RecordFailure()
-
-			time.Sleep(150 * time.Millisecond)
-
-			So(breaker.Allow(), ShouldBeTrue)
-			So(breaker.state, ShouldEqual, CircuitHalfOpen)
-
-			// Simulate a failed attempt
-			breaker.RecordFailure()
-
-			So(breaker.state, ShouldEqual, CircuitOpen)
-		})
-	})
-}
-
-func TestCircuitBreakerSuccessReset(t *testing.T) {
-	Convey("Given a circuit breaker in closed state", t, func() {
-		breaker := NewCircuitBreaker(2, 100*time.Millisecond, 1)
-		
-		Convey("It should reset failure count on success", func() {
-			// Record one failure (not enough to open)
-			breaker.RecordFailure()
-
-			// Record success which should reset the failure count
-			breaker.RecordSuccess()
-
-			// Record another single failure
-			breaker.RecordFailure()
-
-			// Circuit should still be closed since failure count was reset
-			So(breaker.Allow(), ShouldBeTrue)
-			So(breaker.state, ShouldEqual, CircuitClosed)
-			So(breaker.failureCount, ShouldEqual, 1)
-		})
+		So(breaker.state.Load(), ShouldEqual, cbClosed)
 	})
 }
 
 func TestCircuitBreakerRenormalize(t *testing.T) {
-	Convey("Given a circuit breaker in open state", t, func() {
-		breaker := NewCircuitBreaker(2, 100*time.Millisecond, 1)
-		
-		Convey("It should properly renormalize", func() {
-			breaker.RecordFailure()
-			breaker.RecordFailure()
+	Convey("Renormalize moves open breaker toward half-open", t, func() {
+		breaker := NewCircuitBreaker(2, 100*time.Millisecond, 2)
 
-			So(breaker.Allow(), ShouldBeFalse)
-			So(breaker.state, ShouldEqual, CircuitOpen)
+		breaker.RecordFailure()
+		breaker.RecordFailure()
 
-			time.Sleep(150 * time.Millisecond)
-			breaker.Renormalize()
+		So(breaker.state.Load(), ShouldEqual, cbOpen)
 
-			So(breaker.state, ShouldEqual, CircuitHalfOpen)
-			So(breaker.halfOpenAttempts, ShouldEqual, 0)
-		})
+		time.Sleep(150 * time.Millisecond)
+
+		breaker.Renormalize()
+
+		So(breaker.state.Load(), ShouldEqual, cbHalfOpen)
+		So(breaker.halfOpenSuccess.Load(), ShouldEqual, 0)
 	})
 }

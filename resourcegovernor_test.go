@@ -1,209 +1,146 @@
 package qpool
 
 import (
+	"math"
+	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	. "github.com/smartystreets/goconvey/convey"
 )
 
-func TestNewResourceGovernorRegulator(t *testing.T) {
-	Convey("Given parameters for a new resource governor", t, func() {
-		maxCPU := 0.8
-		maxMemory := 0.9
-		checkInterval := time.Second
+func TestResourceGovernorObserveAndThresholds(t *testing.T) {
+	Convey("ResourceGovernor reads CPU hint from MetricReading", t, func() {
+		rg := NewResourceGovernorRegulator(0.8, 0.99, time.Second)
 
-		Convey("When creating a new resource governor", func() {
-			governor := NewResourceGovernorRegulator(maxCPU, maxMemory, checkInterval)
+		rg.Observe(&MetricReading{ResourceUtilization: 0.5})
 
-			Convey("It should be properly initialized", func() {
-				So(governor, ShouldNotBeNil)
-				So(governor.maxCPUPercent, ShouldEqual, maxCPU)
-				So(governor.maxMemoryPercent, ShouldEqual, maxMemory)
-				So(governor.checkInterval, ShouldEqual, checkInterval)
-				So(governor.currentCPU, ShouldEqual, 0.0)
-				So(governor.currentMemory, ShouldEqual, 0.0)
-				So(governor.metrics, ShouldBeNil)
-			})
-		})
+		cpu, mem := rg.GetResourceUsage()
+
+		So(cpu, ShouldEqual, 0.5)
+		So(mem, ShouldBeGreaterThanOrEqualTo, 0.0)
+		So(mem, ShouldBeLessThanOrEqualTo, 1.0)
+	})
+
+	Convey("Observe memory tracks runtime heap ratio when interval is zero", t, func() {
+		rg := NewResourceGovernorRegulator(0.99, 0.99, 0)
+
+		var ms runtime.MemStats
+
+		runtime.ReadMemStats(&ms)
+
+		total := float64(ms.Sys)
+
+		if total <= 0 {
+			total = 1
+		}
+
+		expected := float64(ms.Alloc) / total
+
+		rg.Observe(&MetricReading{ResourceUtilization: 0.11})
+
+		_, mem := rg.GetResourceUsage()
+
+		So(math.Abs(mem-expected), ShouldBeLessThan, 0.05)
+	})
+
+	Convey("Observe refreshes CPU while throttling repeated MemStats when interval is set", t, func() {
+		rg := NewResourceGovernorRegulator(0.9, 0.99, 200*time.Millisecond)
+
+		rg.Observe(&MetricReading{ResourceUtilization: 0.2})
+
+		_, mem1 := rg.GetResourceUsage()
+
+		rg.Observe(&MetricReading{ResourceUtilization: 0.35})
+
+		cpu, mem2 := rg.GetResourceUsage()
+
+		So(mem2, ShouldEqual, mem1)
+		So(cpu, ShouldEqual, 0.35)
+	})
+
+	Convey("Observe elects one memory sampler inside the check interval", t, func() {
+		rg := NewResourceGovernorRegulator(0.9, 0.99, time.Second)
+		var calls atomic.Int64
+
+		rg.readMemStats = func(memStats *runtime.MemStats) {
+			calls.Add(1)
+			memStats.Sys = 100
+			memStats.Alloc = 25
+		}
+
+		rg.Observe(&MetricReading{ResourceUtilization: 0.2})
+		rg.Observe(&MetricReading{ResourceUtilization: 0.3})
+
+		cpu, memory := rg.GetResourceUsage()
+
+		So(calls.Load(), ShouldEqual, 1)
+		So(cpu, ShouldEqual, 0.3)
+		So(memory, ShouldEqual, 0.25)
+	})
+
+	Convey("tryStartMemorySample only permits one sampler per timestamp", t, func() {
+		rg := NewResourceGovernorRegulator(0.9, 0.99, time.Second)
+		now := int64(time.Second)
+
+		So(rg.tryStartMemorySample(now), ShouldBeTrue)
+		So(rg.tryStartMemorySample(now), ShouldBeFalse)
+		So(rg.tryStartMemorySample(now+int64(time.Second)), ShouldBeTrue)
+	})
+
+	Convey("GetThresholds returns configured ceilings", t, func() {
+		rg := NewResourceGovernorRegulator(0.72, 0.91, time.Second)
+
+		cpu, mem := rg.GetThresholds()
+
+		So(cpu, ShouldEqual, 0.72)
+		So(mem, ShouldEqual, 0.91)
+	})
+
+	Convey("Limit triggers when CPU exceeds threshold", t, func() {
+		rg := NewResourceGovernorRegulator(0.5, 0.999, 0)
+
+		rg.Observe(&MetricReading{ResourceUtilization: 0.51})
+
+		So(rg.Limit(), ShouldBeTrue)
+	})
+
+	Convey("Limit triggers when memory exceeds threshold", t, func() {
+		rg := NewResourceGovernorRegulator(0.999, 0.0000001, 0)
+
+		rg.Observe(nil)
+
+		So(rg.Limit(), ShouldBeTrue)
+	})
+
+	Convey("Renormalize does not observe twice inside check interval", t, func() {
+		rg := NewResourceGovernorRegulator(0.99, 0.99, 500*time.Millisecond)
+
+		read := &MetricReading{ResourceUtilization: 0.42}
+
+		rg.Observe(read)
+
+		cpu0, mem0 := rg.GetResourceUsage()
+
+		rg.Renormalize()
+		cpu1, mem1 := rg.GetResourceUsage()
+
+		rg.Renormalize()
+		cpu2, mem2 := rg.GetResourceUsage()
+
+		So(cpu1, ShouldEqual, cpu0)
+		So(mem1, ShouldEqual, mem0)
+		So(cpu2, ShouldEqual, cpu0)
+		So(mem2, ShouldEqual, mem0)
+	})
+
+	Convey("NewResourceGovernorRegulator stores negative thresholds as configured", t, func() {
+		rg := NewResourceGovernorRegulator(-1, -1, time.Second)
+
+		cpu, mem := rg.GetThresholds()
+
+		So(cpu, ShouldEqual, -1)
+		So(mem, ShouldEqual, -1)
 	})
 }
-
-func TestResourceGovernorObserve(t *testing.T) {
-	Convey("Given a resource governor", t, func() {
-		governor := NewResourceGovernorRegulator(0.8, 0.9, time.Second)
-
-		Convey("When observing metrics with high resource usage", func() {
-			metrics := &Metrics{
-				ResourceUtilization: 0.85, // 85% CPU
-			}
-			governor.Observe(metrics)
-
-			Convey("It should update resource usage", func() {
-				So(governor.metrics, ShouldEqual, metrics)
-				So(governor.currentCPU, ShouldEqual, 0.85)
-				// Memory is updated via runtime.ReadMemStats, so we don't test the exact value
-				So(governor.currentMemory, ShouldBeLessThan, 1.0)
-			})
-		})
-
-		Convey("When observing metrics with low resource usage", func() {
-			metrics := &Metrics{
-				ResourceUtilization: 0.3, // 30% CPU
-			}
-			governor.Observe(metrics)
-
-			Convey("It should update resource usage", func() {
-				So(governor.currentCPU, ShouldEqual, 0.3)
-				So(governor.currentMemory, ShouldBeLessThan, 1.0)
-			})
-		})
-	})
-}
-
-func TestResourceGovernorLimit(t *testing.T) {
-	Convey("Given a resource governor", t, func() {
-		governor := NewResourceGovernorRegulator(0.8, 0.9, time.Second)
-
-		Convey("When resources are below thresholds", func() {
-			governor.currentCPU = 0.7    // 70% CPU
-			governor.currentMemory = 0.8  // 80% Memory
-
-			Convey("It should not limit", func() {
-				So(governor.Limit(), ShouldBeFalse)
-			})
-		})
-
-		Convey("When CPU is above threshold", func() {
-			governor.currentCPU = 0.85    // 85% CPU
-			governor.currentMemory = 0.8   // 80% Memory
-
-			Convey("It should limit", func() {
-				So(governor.Limit(), ShouldBeTrue)
-			})
-		})
-
-		Convey("When memory is above threshold", func() {
-			governor.currentCPU = 0.7     // 70% CPU
-			governor.currentMemory = 0.95  // 95% Memory
-
-			Convey("It should limit", func() {
-				So(governor.Limit(), ShouldBeTrue)
-			})
-		})
-
-		Convey("When both resources are above thresholds", func() {
-			governor.currentCPU = 0.85    // 85% CPU
-			governor.currentMemory = 0.95  // 95% Memory
-
-			Convey("It should limit", func() {
-				So(governor.Limit(), ShouldBeTrue)
-			})
-		})
-	})
-}
-
-func TestResourceGovernorRenormalize(t *testing.T) {
-	Convey("Given a resource governor", t, func() {
-		governor := NewResourceGovernorRegulator(0.8, 0.9, time.Second)
-
-		Convey("When renormalizing with metrics", func() {
-			metrics := &Metrics{
-				ResourceUtilization: 0.5, // 50% CPU
-			}
-			governor.metrics = metrics
-			governor.currentCPU = 0.85    // Old high value
-			governor.Renormalize()
-
-			Convey("It should update resource measurements", func() {
-				So(governor.currentCPU, ShouldEqual, 0.5)
-			})
-		})
-
-		Convey("When renormalizing without metrics", func() {
-			governor.metrics = nil
-			governor.currentCPU = 0.85
-			governor.Renormalize()
-
-			Convey("It should maintain current values", func() {
-				So(governor.currentCPU, ShouldEqual, 0.85)
-			})
-		})
-	})
-}
-
-func TestResourceGovernorGetResourceUsage(t *testing.T) {
-	Convey("Given a resource governor with known usage", t, func() {
-		governor := NewResourceGovernorRegulator(0.8, 0.9, time.Second)
-		governor.currentCPU = 0.75
-		governor.currentMemory = 0.65
-
-		Convey("When getting resource usage", func() {
-			cpu, memory := governor.GetResourceUsage()
-
-			Convey("It should return correct values", func() {
-				So(cpu, ShouldEqual, 0.75)
-				So(memory, ShouldEqual, 0.65)
-			})
-		})
-	})
-}
-
-func TestResourceGovernorGetThresholds(t *testing.T) {
-	Convey("Given a resource governor with known thresholds", t, func() {
-		maxCPU := 0.8
-		maxMemory := 0.9
-		governor := NewResourceGovernorRegulator(maxCPU, maxMemory, time.Second)
-
-		Convey("When getting thresholds", func() {
-			cpu, memory := governor.GetThresholds()
-
-			Convey("It should return correct values", func() {
-				So(cpu, ShouldEqual, maxCPU)
-				So(memory, ShouldEqual, maxMemory)
-			})
-		})
-	})
-}
-
-func TestResourceGovernorUpdateResourceUsage(t *testing.T) {
-	Convey("Given a resource governor", t, func() {
-		governor := NewResourceGovernorRegulator(0.8, 0.9, time.Second)
-
-		Convey("When updating resource usage with nil metrics", func() {
-			governor.currentCPU = 0.5
-			governor.metrics = nil
-			governor.updateResourceUsage()
-
-			Convey("It should maintain current values", func() {
-				So(governor.currentCPU, ShouldEqual, 0.5)
-			})
-		})
-
-		Convey("When updating resource usage with metrics", func() {
-			metrics := &Metrics{
-				ResourceUtilization: 0.6, // 60% CPU
-			}
-			governor.metrics = metrics
-			governor.updateResourceUsage()
-
-			Convey("It should update CPU usage", func() {
-				So(governor.currentCPU, ShouldEqual, 0.6)
-				So(governor.currentMemory, ShouldBeLessThan, 1.0)
-			})
-		})
-
-		Convey("When updating with zero resource utilization", func() {
-			metrics := &Metrics{
-				ResourceUtilization: 0.0,
-			}
-			governor.currentCPU = 0.5
-			governor.metrics = metrics
-			governor.updateResourceUsage()
-
-			Convey("It should maintain current CPU value", func() {
-				So(governor.currentCPU, ShouldEqual, 0.5)
-			})
-		})
-	})
-} 

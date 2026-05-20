@@ -2,276 +2,228 @@ package qpool
 
 import (
 	"math"
-	"sort"
-	"sync"
+	"sync/atomic"
 	"time"
 )
 
-// tDigestCentroid represents a centroid in the t-digest
-type tDigestCentroid struct {
-	mean  float64
-	count int64
-}
-
-// Metrics tracks and stores various performance metrics for the worker pool.
+/*
+Metrics tracks pool statistics using atomic operations only.
+*/
 type Metrics struct {
-	mu                   sync.RWMutex
-	WorkerCount          int
-	JobQueueSize         int
-	ActiveWorkers        int
-	LastScale            time.Time
-	ErrorRates           map[string]float64
-	TotalJobTime         time.Duration
-	JobCount             int64
-	CircuitBreakerStates map[string]CircuitState
-
-	// Additional suggested metrics
-	AverageJobLatency   time.Duration
-	P95JobLatency       time.Duration
-	P99JobLatency       time.Duration
-	JobSuccessRate      float64
-	QueueWaitTime       time.Duration
-	ResourceUtilization float64
-
-	// Rate limiting metrics
-	RateLimitHits int64
-	ThrottledJobs int64
-
-	// t-digest fields for percentile calculation
-	centroids    []tDigestCentroid
-	compression  float64
-	totalWeight  int64
-	maxCentroids int
-
-	// SchedulingFailures field to track scheduling timeouts
-	SchedulingFailures int64
-
-	// Additional metrics
-	FailureCount int64
+	workerCount        atomic.Int64
+	busyWorkers        atomic.Int64
+	jobQueueDepth      atomic.Int64
+	schedulingFailures atomic.Int64
+	jobCount           atomic.Int64
+	failureCount       atomic.Int64
+	totalLatencyNs     atomic.Uint64
+	maxLatencyNs       atomic.Uint64
+	rateLimitHits      atomic.Int64
+	throttledJobs      atomic.Int64
+	lastScaleUnixNano  atomic.Int64
+	resourceUtilBits   atomic.Uint64
 }
 
-// NewMetrics creates and initializes a new Metrics instance.
+/*
+NewMetrics creates an initialized Metrics holder.
+*/
 func NewMetrics() *Metrics {
-	return &Metrics{
-		ErrorRates:           make(map[string]float64),
-		CircuitBreakerStates: make(map[string]CircuitState),
-		SchedulingFailures:   0,
-		compression:          100,
-		maxCentroids:         100,
-		centroids:            make([]tDigestCentroid, 0, 100),
-		totalWeight:          0,
-		JobSuccessRate:       1.0,
+	return &Metrics{}
+}
+
+/*
+CollectReading builds a regulator-facing snapshot from current atomic counters.
+*/
+func (m *Metrics) CollectReading() *MetricReading {
+	jc := m.jobCount.Load()
+	fc := m.failureCount.Load()
+
+	if fc > jc {
+		fc = jc
+	}
+
+	totalNs := m.totalLatencyNs.Load()
+
+	var avg time.Duration
+
+	if jc > 0 {
+		avg = time.Duration(totalNs / uint64(jc))
+	}
+
+	var successRate float64
+
+	if jc > 0 {
+		successRate = float64(jc-fc) / float64(jc)
+		successRate = math.Max(0, math.Min(1, successRate))
+	}
+
+	/*
+		P95/P99 are not computed from current counters (only max latency is tracked on Metrics).
+		These stay zero until ingestion feeds a quantile structure.
+	*/
+	wc := int(m.workerCount.Load())
+	busy := int(m.busyWorkers.Load())
+
+	if busy > wc {
+		busy = wc
+	}
+
+	if busy < 0 {
+		busy = 0
+	}
+
+	return &MetricReading{
+		WorkerCount:         wc,
+		BusyWorkers:         busy,
+		JobQueueSize:        int(m.jobQueueDepth.Load()),
+		AverageJobLatency:   avg,
+		P95JobLatency:       0,
+		P99JobLatency:       0,
+		JobSuccessRate:      successRate,
+		ResourceUtilization: math.Float64frombits(m.resourceUtilBits.Load()),
+		TotalJobs:           jc,
+		FailedJobs:          fc,
+		SchedulingFailures:  m.schedulingFailures.Load(),
+		RateLimitHits:       m.rateLimitHits.Load(),
+		ThrottledJobs:       m.throttledJobs.Load(),
 	}
 }
 
-// RecordJobExecution records the execution time and success status of a job.
-func (m *Metrics) RecordJobExecution(startTime time.Time, success bool) {
-	m.mu.RLock()
-	oldTime := m.TotalJobTime
-	m.mu.RUnlock()
-
-	duration := time.Since(startTime)
-
-	m.mu.Lock()
-	m.TotalJobTime = oldTime + duration
-	m.JobCount++
-	if success {
-		m.JobSuccessRate = float64(m.JobCount-m.FailureCount) / float64(m.JobCount)
-	}
-	m.mu.Unlock()
-
-	// Update latency percentiles in a separate lock to reduce contention
-	m.updateLatencyPercentiles(duration)
-}
-
-// Add updateLatencyPercentiles method
-func (m *Metrics) updateLatencyPercentiles(duration time.Duration) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// Update average using existing calculation
-	m.AverageJobLatency = (m.AverageJobLatency*time.Duration(m.JobCount-1) + duration) / time.Duration(m.JobCount)
-
-	// Convert duration to float64 milliseconds for t-digest
-	value := float64(duration.Milliseconds())
-
-	// Find the closest centroid or create a new one
-	inserted := false
-	m.totalWeight++
-
-	if len(m.centroids) == 0 {
-		m.centroids = append(m.centroids, tDigestCentroid{mean: value, count: 1})
-		return
-	}
-
-	// Find insertion point
-	idx := sort.Search(len(m.centroids), func(i int) bool {
-		return m.centroids[i].mean >= value
-	})
-
-	// Calculate maximum weight for this point
-	q := m.calculateQuantile(value)
-	maxWeight := int64(4 * m.compression * math.Min(q, 1-q))
-
-	// Try to merge with existing centroid
-	if idx < len(m.centroids) && m.centroids[idx].count < maxWeight {
-		c := &m.centroids[idx]
-		c.mean = (c.mean*float64(c.count) + value) / float64(c.count+1)
-		c.count++
-		inserted = true
-	} else if idx > 0 && m.centroids[idx-1].count < maxWeight {
-		c := &m.centroids[idx-1]
-		c.mean = (c.mean*float64(c.count) + value) / float64(c.count+1)
-		c.count++
-		inserted = true
-	}
-
-	// If we couldn't merge, insert new centroid
-	if !inserted {
-		newCentroid := tDigestCentroid{mean: value, count: 1}
-		m.centroids = append(m.centroids, tDigestCentroid{})
-		copy(m.centroids[idx+1:], m.centroids[idx:])
-		m.centroids[idx] = newCentroid
-	}
-
-	// Compress if we have too many centroids
-	if len(m.centroids) > m.maxCentroids {
-		m.compress()
-	}
-
-	// Update P95 and P99
-	m.P95JobLatency = time.Duration(m.estimatePercentile(0.95)) * time.Millisecond
-	m.P99JobLatency = time.Duration(m.estimatePercentile(0.99)) * time.Millisecond
-}
-
-func (m *Metrics) calculateQuantile(value float64) float64 {
-	// Guard against division by zero
-	if m.totalWeight == 0 {
-		return 0.0
-	}
-
-	rank := 0.0
-	for _, c := range m.centroids {
-		if c.mean < value {
-			rank += float64(c.count)
-		}
-	}
-	return rank / float64(m.totalWeight)
-}
-
-func (m *Metrics) estimatePercentile(p float64) float64 {
-	if len(m.centroids) == 0 {
-		return 0
-	}
-
-	targetRank := p * float64(m.totalWeight)
-	cumulative := 0.0
-
-	for i, c := range m.centroids {
-		cumulative += float64(c.count)
-		if cumulative >= targetRank {
-			// Linear interpolation between centroids
-			if i > 0 {
-				prev := m.centroids[i-1]
-				prevCumulative := cumulative - float64(c.count)
-
-				// Guard against division by zero
-				if c.count == 0 {
-					return prev.mean
-				}
-
-				t := (targetRank - prevCumulative) / float64(c.count)
-				return prev.mean + t*(c.mean-prev.mean)
-			}
-			return c.mean
-		}
-	}
-	return m.centroids[len(m.centroids)-1].mean
-}
-
-func (m *Metrics) compress() {
-	if len(m.centroids) <= 1 {
-		return
-	}
-
-	// Sort centroids by mean if needed
-	sort.Slice(m.centroids, func(i, j int) bool {
-		return m.centroids[i].mean < m.centroids[j].mean
-	})
-
-	// Merge adjacent centroids while respecting size constraints
-	newCentroids := make([]tDigestCentroid, 0, m.maxCentroids)
-	current := m.centroids[0]
-
-	for i := 1; i < len(m.centroids); i++ {
-		if current.count+m.centroids[i].count <= int64(m.compression) {
-			// Merge centroids
-			totalCount := current.count + m.centroids[i].count
-			current.mean = (current.mean*float64(current.count) +
-				m.centroids[i].mean*float64(m.centroids[i].count)) /
-				float64(totalCount)
-			current.count = totalCount
-		} else {
-			newCentroids = append(newCentroids, current)
-			current = m.centroids[i]
-		}
-	}
-	newCentroids = append(newCentroids, current)
-	m.centroids = newCentroids
-}
-
-// Add metrics export functionality
+/*
+ExportMetrics exports counters as a map for observability.
+*/
 func (m *Metrics) ExportMetrics() map[string]interface{} {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	r := m.CollectReading()
 
 	return map[string]interface{}{
-		"worker_count":         m.WorkerCount,
-		"queue_size":           m.JobQueueSize,
-		"success_rate":         m.JobSuccessRate,
-		"avg_latency":          m.AverageJobLatency.Milliseconds(),
-		"p95_latency":          m.P95JobLatency.Milliseconds(),
-		"p99_latency":          m.P99JobLatency.Milliseconds(),
-		"resource_utilization": m.ResourceUtilization,
+		"worker_count":         r.WorkerCount,
+		"busy_workers":         r.BusyWorkers,
+		"queue_size":           r.JobQueueSize,
+		"success_rate":         r.JobSuccessRate,
+		"avg_latency_ms":       r.AverageJobLatency.Milliseconds(),
+		"max_latency_ms":       time.Duration(m.maxLatencyNs.Load()).Milliseconds(),
+		"p95_latency_ms":       r.P95JobLatency.Milliseconds(),
+		"p99_latency_ms":       r.P99JobLatency.Milliseconds(),
+		"resource_utilization": r.ResourceUtilization,
+		"last_scale_unix_nano": m.lastScaleUnixNano.Load(),
 	}
 }
 
+func (m *Metrics) decWorkerCount() {
+	m.workerCount.Add(-1)
+}
+
+func (m *Metrics) incBusyWorker() {
+	m.busyWorkers.Add(1)
+}
+
+func (m *Metrics) decBusyWorker() {
+	m.busyWorkers.Add(-1)
+}
+
+/*
+tryIncWorkerIfBelow increments workerCount when it is strictly less than max; returns whether the increment succeeded.
+*/
+func (m *Metrics) tryIncWorkerIfBelow(max int) bool {
+	for {
+		cur := m.workerCount.Load()
+
+		if int(cur) >= max {
+			return false
+		}
+
+		if m.workerCount.CompareAndSwap(cur, cur+1) {
+			return true
+		}
+	}
+}
+
+func (m *Metrics) incJobQueued() {
+	m.jobQueueDepth.Add(1)
+}
+
+func (m *Metrics) decJobQueued() {
+	m.jobQueueDepth.Add(-1)
+}
+
+func (m *Metrics) incSchedulingFailure() {
+	m.schedulingFailures.Add(1)
+}
+
+func (m *Metrics) incThrottled() {
+	m.throttledJobs.Add(1)
+}
+
+/*
+RecordJobOutcome records one finished attempt (success or failure) with observed latency.
+*/
+func (m *Metrics) RecordJobOutcome(latency time.Duration, success bool) {
+	m.jobCount.Add(1)
+
+	if !success {
+		m.failureCount.Add(1)
+	}
+
+	nsInt := latency.Nanoseconds()
+
+	if nsInt < 0 {
+		nsInt = 0
+	}
+
+	ns := uint64(nsInt)
+	m.totalLatencyNs.Add(ns)
+
+	for {
+		cur := m.maxLatencyNs.Load()
+		if ns <= cur {
+			break
+		}
+
+		if m.maxLatencyNs.CompareAndSwap(cur, ns) {
+			break
+		}
+	}
+}
+
+/*
+RecordJobSuccess records a successfully finished job with latency.
+*/
 func (m *Metrics) RecordJobSuccess(latency time.Duration) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.JobCount++
-	m.TotalJobTime += latency
-
-	// Guard against division by zero
-	if m.JobCount > 0 {
-		m.AverageJobLatency = time.Duration(int64(m.TotalJobTime) / m.JobCount)
-		m.JobSuccessRate = float64(m.JobCount-m.FailureCount) / float64(m.JobCount)
-	}
-
-	// Update t-digest for percentiles
-	m.updateLatencyMetrics(latency)
+	m.RecordJobOutcome(latency, true)
 }
 
-// RecordJobFailure records the failure of a job and updates metrics
+/*
+RecordJobFailure records a failed job without recording a latency sample (does not update totals used for averages).
+*/
 func (m *Metrics) RecordJobFailure() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.FailureCount++
-
-	// Guard against division by zero
-	if m.JobCount > 0 {
-		m.JobSuccessRate = float64(m.JobCount-m.FailureCount) / float64(m.JobCount)
-	} else {
-		m.JobSuccessRate = 0.0
-	}
+	m.jobCount.Add(1)
+	m.failureCount.Add(1)
 }
 
-// updateLatencyMetrics updates latency percentiles
-func (m *Metrics) updateLatencyMetrics(latency time.Duration) {
-	// Simple implementation: update P95 and P99 if current latency exceeds them
-	if latency > m.P99JobLatency {
-		m.P99JobLatency = latency
-	} else if latency > m.P95JobLatency {
-		m.P95JobLatency = latency
+/*
+RecordJobExecution records timing from legacy call sites.
+*/
+func (m *Metrics) RecordJobExecution(startTime time.Time, success bool) {
+	m.RecordJobOutcome(time.Since(startTime), success)
+}
+
+/*
+SetResourceUtilization stores CPU or synthetic utilization for ResourceGovernor (0–1).
+Values are clamped to that range; NaN is stored as 0.
+*/
+func (m *Metrics) SetResourceUtilization(u float64) {
+	if u != u {
+		u = 0
+	} else {
+		u = math.Max(0, math.Min(1, u))
 	}
+
+	m.resourceUtilBits.Store(math.Float64bits(u))
+}
+
+/*
+NoteLastScale records scaler activity time (wall clock).
+*/
+func (m *Metrics) NoteLastScale(t time.Time) {
+	m.lastScaleUnixNano.Store(t.UnixNano())
 }

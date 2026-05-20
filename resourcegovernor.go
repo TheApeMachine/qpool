@@ -1,134 +1,149 @@
 package qpool
 
 import (
+	"math"
 	"runtime"
-	"sync"
+	"sync/atomic"
 	"time"
 )
 
 /*
-ResourceGovernorRegulator implements the Regulator interface to manage system resources.
-It monitors and controls resource usage (CPU, memory, etc.) to prevent system
-exhaustion, similar to how a power governor prevents engine damage by limiting
-power consumption under heavy load.
-
-Key features:
-  - CPU usage monitoring
-  - Memory usage tracking
-  - Resource thresholds
-  - Adaptive limiting
+ResourceGovernorRegulator implements Regulator using atomic gauges updated from MetricReading and runtime memory stats.
 */
 type ResourceGovernorRegulator struct {
-	mu sync.RWMutex
+	maxCPUPercent    float64
+	maxMemoryPercent float64
+	checkIntervalNs  int64
 
-	maxCPUPercent    float64       // Maximum allowed CPU usage (0.0-1.0)
-	maxMemoryPercent float64       // Maximum allowed memory usage (0.0-1.0)
-	checkInterval    time.Duration // How often to check resource usage
-	metrics          *Metrics     // System metrics
-	lastCheck        time.Time    // Last resource check time
-
-	// Current resource usage
-	currentCPU    float64
-	currentMemory float64
+	currentCPU              atomic.Uint64
+	currentMemory           atomic.Uint64
+	lastReading             atomic.Pointer[MetricReading]
+	lastRenormalizeUnixNano atomic.Int64
+	lastMemSampleUnixNano   atomic.Int64
+	readMemStats            func(*runtime.MemStats)
 }
 
 /*
-NewResourceGovernorRegulator creates a new resource governor regulator.
-
-Parameters:
-  - maxCPUPercent: Maximum allowed CPU usage (0.0-1.0)
-  - maxMemoryPercent: Maximum allowed memory usage (0.0-1.0)
-  - checkInterval: How often to check resource usage
-
-Returns:
-  - *ResourceGovernorRegulator: A new resource governor instance
-
-Example:
-    governor := NewResourceGovernorRegulator(0.8, 0.9, time.Second)
+NewResourceGovernorRegulator constructs a resource governor.
 */
 func NewResourceGovernorRegulator(maxCPUPercent, maxMemoryPercent float64, checkInterval time.Duration) *ResourceGovernorRegulator {
 	return &ResourceGovernorRegulator{
 		maxCPUPercent:    maxCPUPercent,
 		maxMemoryPercent: maxMemoryPercent,
-		checkInterval:    checkInterval,
-		lastCheck:        time.Now(),
+		checkIntervalNs:  checkInterval.Nanoseconds(),
+		readMemStats:     runtime.ReadMemStats,
 	}
 }
 
 /*
-Observe implements the Regulator interface by monitoring system metrics.
-This method updates the governor's view of resource utilization based on
-current system metrics.
+Observe refreshes CPU from reading when present and updates the memory ratio from runtime.MemStats.
 
-Parameters:
-  - metrics: Current system metrics including resource utilization data
+When checkInterval is positive, ReadMemStats runs at most once per interval; intervening calls reuse the cached memory fraction while still applying CPU hints from the latest reading.
 */
-func (rg *ResourceGovernorRegulator) Observe(metrics *Metrics) {
-	rg.mu.Lock()
-	defer rg.mu.Unlock()
+func (rg *ResourceGovernorRegulator) Observe(reading *MetricReading) {
+	if reading != nil {
+		rg.lastReading.Store(reading)
 
-	rg.metrics = metrics
-	rg.updateResourceUsage()
-}
+		if reading.ResourceUtilization > 0 {
+			rg.currentCPU.Store(math.Float64bits(reading.ResourceUtilization))
+		}
+	}
 
-/*
-Limit implements the Regulator interface by determining if resource usage
-should be limited. Returns true when resource usage exceeds thresholds.
+	now := time.Now().UnixNano()
 
-Returns:
-  - bool: true if resource usage should be limited, false if it can proceed
-*/
-func (rg *ResourceGovernorRegulator) Limit() bool {
-	rg.mu.RLock()
-	defer rg.mu.RUnlock()
-
-	// Check if either CPU or memory usage exceeds thresholds
-	return rg.currentCPU >= rg.maxCPUPercent || rg.currentMemory >= rg.maxMemoryPercent
-}
-
-/*
-Renormalize implements the Regulator interface by attempting to restore normal operation.
-This method updates resource usage measurements and adjusts thresholds if necessary.
-*/
-func (rg *ResourceGovernorRegulator) Renormalize() {
-	rg.mu.Lock()
-	defer rg.mu.Unlock()
-
-	// Update resource measurements
-	rg.updateResourceUsage()
-}
-
-// updateResourceUsage updates current resource utilization measurements
-func (rg *ResourceGovernorRegulator) updateResourceUsage() {
-	if rg.metrics == nil {
+	if !rg.tryStartMemorySample(now) {
 		return
 	}
 
-	// Update CPU usage from metrics
-	if rg.metrics.ResourceUtilization > 0 {
-		rg.currentCPU = rg.metrics.ResourceUtilization
+	var memStats runtime.MemStats
+
+	rg.readRuntimeMemStats(&memStats)
+
+	totalMemory := float64(memStats.Sys)
+	if totalMemory <= 0 {
+		totalMemory = 1
 	}
 
-	// Get current memory stats
-	var memStats runtime.MemStats
-	runtime.ReadMemStats(&memStats)
-
-	// Calculate memory usage as percentage of total available
-	totalMemory := float64(memStats.Sys)
 	usedMemory := float64(memStats.Alloc)
-	rg.currentMemory = usedMemory / totalMemory
+	rg.currentMemory.Store(math.Float64bits(usedMemory / totalMemory))
 }
 
-// GetResourceUsage returns current resource utilization levels
+func (rg *ResourceGovernorRegulator) tryStartMemorySample(now int64) bool {
+	if rg.checkIntervalNs <= 0 {
+		return true
+	}
+
+	lastMem := rg.lastMemSampleUnixNano.Load()
+
+	if lastMem != 0 && now-lastMem < rg.checkIntervalNs {
+		return false
+	}
+
+	return rg.lastMemSampleUnixNano.CompareAndSwap(lastMem, now)
+}
+
+func (rg *ResourceGovernorRegulator) readRuntimeMemStats(memStats *runtime.MemStats) {
+	if rg.readMemStats == nil {
+		runtime.ReadMemStats(memStats)
+
+		return
+	}
+
+	rg.readMemStats(memStats)
+}
+
+/*
+Limit returns true when CPU or memory exceeds configured thresholds.
+*/
+func (rg *ResourceGovernorRegulator) Limit() bool {
+	cpu := math.Float64frombits(rg.currentCPU.Load())
+	mem := math.Float64frombits(rg.currentMemory.Load())
+
+	return cpu >= rg.maxCPUPercent || mem >= rg.maxMemoryPercent
+}
+
+/*
+Renormalize re-applies Observe using the last reading at most once per check interval.
+
+When checkInterval is zero, Renormalize always observes immediately when a reading exists.
+*/
+func (rg *ResourceGovernorRegulator) Renormalize() {
+	read := rg.lastReading.Load()
+	if read == nil {
+		return
+	}
+
+	if rg.checkIntervalNs <= 0 {
+		rg.Observe(read)
+
+		return
+	}
+
+	now := time.Now().UnixNano()
+	prev := rg.lastRenormalizeUnixNano.Load()
+
+	if prev != 0 && now-prev < rg.checkIntervalNs {
+		return
+	}
+
+	if !rg.lastRenormalizeUnixNano.CompareAndSwap(prev, now) {
+		return
+	}
+
+	rg.Observe(read)
+}
+
+/*
+GetResourceUsage returns the latest CPU and memory ratios.
+*/
 func (rg *ResourceGovernorRegulator) GetResourceUsage() (cpu, memory float64) {
-	rg.mu.RLock()
-	defer rg.mu.RUnlock()
-	return rg.currentCPU, rg.currentMemory
+	return math.Float64frombits(rg.currentCPU.Load()),
+		math.Float64frombits(rg.currentMemory.Load())
 }
 
-// GetThresholds returns the current resource usage thresholds
+/*
+GetThresholds returns configured thresholds.
+*/
 func (rg *ResourceGovernorRegulator) GetThresholds() (cpu, memory float64) {
-	rg.mu.RLock()
-	defer rg.mu.RUnlock()
 	return rg.maxCPUPercent, rg.maxMemoryPercent
-} 
+}

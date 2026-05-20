@@ -1,185 +1,228 @@
 package qpool
 
 import (
-	"log"
-	"sync"
+	"sync/atomic"
 	"time"
 )
 
 /*
 CircuitState represents the state of the circuit breaker.
-This is used to track the current operational mode of the circuit breaker
-as it transitions between different states based on system health.
 */
 type CircuitState int
 
 const (
-	CircuitClosed CircuitState = iota // Normal operation state
-	CircuitOpen                       // Failure state, rejecting requests
-	CircuitHalfOpen                   // Probationary state, allowing limited requests
+	CircuitClosed CircuitState = iota
+	CircuitOpen
+	CircuitHalfOpen
+)
+
+const (
+	cbClosed uint32 = iota
+	cbOpen
+	cbHalfOpen
 )
 
 /*
-CircuitBreaker implements both the circuit breaker pattern and Regulator interface.
-It provides a way to automatically degrade service when the system is under stress
-by temporarily stopping operations when a failure threshold is reached.
-
-The circuit breaker operates in three states:
-  - Closed: Normal operation, all requests are allowed
-  - Open: Failure threshold exceeded, all requests are rejected
-  - Half-Open: Probationary state allowing limited requests to test system health
-
-This pattern helps prevent cascading failures and allows the system to recover
-from failure states without overwhelming potentially unstable dependencies.
+CircuitBreaker implements the circuit breaker pattern and Regulator interface using
+atomic operations only (no mutex in this package).
 */
 type CircuitBreaker struct {
-	mu               sync.RWMutex
-	maxFailures      int           // Maximum failures before opening circuit
-	resetTimeout     time.Duration // Time to wait before attempting recovery
-	halfOpenMax      int          // Maximum requests allowed in half-open state
-	failureCount     int          // Current count of consecutive failures
-	state            CircuitState // Current state of the circuit breaker
-	openTime         time.Time    // Time when circuit was opened
-	halfOpenAttempts int          // Number of attempts made in half-open state
-	metrics          *Metrics     // Current system metrics
+	maxFailures      int
+	resetTimeout     time.Duration
+	halfOpenMax      int
+	state            atomic.Uint32
+	failureCount     atomic.Uint32
+	openSinceNs      atomic.Int64
+	halfOpenSuccess  atomic.Uint32
+	halfOpenInflight atomic.Int32
 }
 
 /*
 NewCircuitBreaker creates a new circuit breaker instance with specified parameters.
-
-Parameters:
-  - maxFailures: Number of failures allowed before opening the circuit
-  - resetTimeout: Duration to wait before attempting to close an open circuit
-  - halfOpenMax: Maximum number of requests allowed in half-open state
-
-Returns:
-  - *CircuitBreaker: A new circuit breaker instance initialized in closed state
 */
-func NewCircuitBreaker(maxFailures int, resetTimeout time.Duration, halfOpenMax int) *CircuitBreaker {
-	return &CircuitBreaker{
+func NewCircuitBreaker(
+	maxFailures int, resetTimeout time.Duration, halfOpenMax int,
+) *CircuitBreaker {
+	if halfOpenMax <= 0 {
+		halfOpenMax = 1
+	}
+
+	cb := &CircuitBreaker{
 		maxFailures:  maxFailures,
 		resetTimeout: resetTimeout,
 		halfOpenMax:  halfOpenMax,
-		state:        CircuitClosed,
 	}
+	cb.state.Store(cbClosed)
+	return cb
 }
 
 /*
-Observe implements the Regulator interface by accepting system metrics.
-This method allows the circuit breaker to monitor system health and adjust
-its behavior based on current conditions.
-
-Parameters:
-  - metrics: Current system metrics including performance and health indicators
+newCircuitBreakerFromConfig builds a breaker from job configuration fields.
 */
-func (cb *CircuitBreaker) Observe(metrics *Metrics) {
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
-	cb.metrics = metrics
+func newCircuitBreakerFromConfig(cfg *CircuitBreakerConfig) *CircuitBreaker {
+	return NewCircuitBreaker(cfg.MaxFailures, cfg.ResetTimeout, cfg.HalfOpenMax)
 }
 
 /*
-Limit implements the Regulator interface by determining if requests should be limited.
-This method provides a standardized way to check if the circuit breaker is
-currently preventing operations.
+Observe implements Regulator (circuit breaker does not currently consume readings).
+*/
+func (cb *CircuitBreaker) Observe(reading *MetricReading) {
+	_ = reading
+}
 
-Returns:
-  - bool: true if requests should be limited, false if they should proceed
+/*
+Limit implements Regulator: true when the breaker disallows traffic.
 */
 func (cb *CircuitBreaker) Limit() bool {
 	return !cb.Allow()
 }
 
 /*
-Renormalize implements the Regulator interface by attempting to restore normal operation.
-This method checks if enough time has passed since the circuit was opened and
-transitions to half-open state if appropriate, allowing for system recovery.
+Renormalize attempts to move from open toward half-open after the reset timeout.
 */
 func (cb *CircuitBreaker) Renormalize() {
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
-	
-	if cb.state == CircuitOpen && time.Since(cb.openTime) > cb.resetTimeout {
-		cb.state = CircuitHalfOpen
-		cb.halfOpenAttempts = 0
-		log.Printf("Circuit breaker renormalized to half-open state")
-	}
+	cb.tryOpenToHalfOpen(time.Now())
 }
 
 /*
-RecordFailure records a failure and updates the circuit state.
-This method tracks the number of failures and opens the circuit if
-the failure threshold is exceeded. It handles state transitions
-differently based on the current circuit state.
+RecordFailure records a failure and updates circuit state.
 */
 func (cb *CircuitBreaker) RecordFailure() {
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
+	cb.failureCount.Add(1)
 
-	cb.failureCount++
-	if cb.failureCount >= cb.maxFailures {
-		if cb.state == CircuitHalfOpen {
-			// If we fail in half-open state, go back to open
-			cb.state = CircuitOpen
-			cb.openTime = time.Now()
-			log.Printf("Circuit breaker reopened from half-open state")
-		} else if cb.state == CircuitClosed {
-			// Only open the circuit if we were closed
-			cb.state = CircuitOpen
-			cb.openTime = time.Now()
-			log.Printf("Circuit breaker opened")
+	switch cb.state.Load() {
+	case cbHalfOpen:
+		cb.safeDecHalfOpenInflight()
+		cb.transitionToOpen()
+	case cbClosed:
+		if int(cb.failureCount.Load()) >= cb.maxFailures {
+			cb.transitionToOpen()
 		}
 	}
 }
 
 /*
-RecordSuccess records a successful attempt and updates the circuit state.
-This method handles the transition from half-open to closed state after
-successful operations, and resets failure counts in closed state.
+RecordSuccess records a successful completion.
 */
 func (cb *CircuitBreaker) RecordSuccess() {
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
+	cb.failureCount.Store(0)
 
-	if cb.state == CircuitHalfOpen {
-			cb.halfOpenAttempts++
-			if cb.halfOpenAttempts >= cb.halfOpenMax {
-				cb.state = CircuitClosed
-				cb.failureCount = 0
-				cb.halfOpenAttempts = 0
-				log.Printf("Circuit breaker closed from half-open")
-			}
-	} else if cb.state == CircuitClosed {
-		// Reset failure count on success in closed state
-		cb.failureCount = 0
+	switch cb.state.Load() {
+	case cbHalfOpen:
+		cb.safeDecHalfOpenInflight()
+		n := cb.halfOpenSuccess.Add(1)
+		if int(n) >= cb.halfOpenMax {
+			cb.halfOpenSuccess.Store(0)
+			cb.state.Store(cbClosed)
+		}
+	case cbClosed:
 	}
 }
 
 /*
-Allow determines if a request is allowed based on the circuit state.
-This method implements the core circuit breaker logic, determining whether
-to allow requests based on the current state and timing conditions.
-
-Returns:
-  - bool: true if the request should be allowed, false if it should be rejected
+Allow reports whether a new attempt may proceed.
 */
 func (cb *CircuitBreaker) Allow() bool {
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
+	now := time.Now()
 
-	switch cb.state {
-	case CircuitClosed:
+	for {
+		switch cb.state.Load() {
+		case cbClosed:
+			return true
+
+		case cbOpen:
+			if cb.tryOpenToHalfOpen(now) {
+				continue
+			}
+			return false
+
+		case cbHalfOpen:
+			return cb.acquireHalfOpenSlot()
+
+		default:
+			return false
+		}
+	}
+}
+
+func (cb *CircuitBreaker) tryOpenToHalfOpen(now time.Time) bool {
+	if cb.state.Load() != cbOpen {
+		return false
+	}
+
+	resetNs := cb.resetTimeout.Nanoseconds()
+	if resetNs <= 0 {
+		resetNs = int64(time.Minute)
+	}
+
+	opened := cb.openSinceNs.Load()
+	if opened == 0 || now.UnixNano()-opened <= resetNs {
+		return false
+	}
+
+	if cb.state.CompareAndSwap(cbOpen, cbHalfOpen) {
+		cb.halfOpenSuccess.Store(0)
+		cb.halfOpenInflight.Store(0)
+		Publish(NewWarningEvent(
+			"qpool",
+			"circuit-half-open",
+			"circuit breaker half-open after reset timeout",
+			nil,
+		))
+
 		return true
-	case CircuitOpen:
-		if time.Since(cb.openTime) > cb.resetTimeout {
-			cb.state = CircuitHalfOpen
-			cb.halfOpenAttempts = 0
+	}
+
+	return cb.state.Load() != cbOpen
+}
+
+func (cb *CircuitBreaker) acquireHalfOpenSlot() bool {
+	for {
+		if cb.state.Load() != cbHalfOpen {
+			return false
+		}
+
+		live := cb.halfOpenInflight.Load()
+		if cb.halfOpenMax >= 0 && int(live) >= cb.halfOpenMax {
+			return false
+		}
+
+		if cb.halfOpenInflight.CompareAndSwap(live, live+1) {
 			return true
 		}
-		return false
-	case CircuitHalfOpen:
-		return cb.halfOpenAttempts < cb.halfOpenMax
-	default:
-		return false
+	}
+}
+
+func (cb *CircuitBreaker) transitionToOpen() {
+	cb.state.Store(cbOpen)
+	now := time.Now().UnixNano()
+	for {
+		cur := cb.openSinceNs.Load()
+		if now <= cur {
+			break
+		}
+		if cb.openSinceNs.CompareAndSwap(cur, now) {
+			break
+		}
+	}
+	cb.halfOpenSuccess.Store(0)
+	cb.halfOpenInflight.Store(0)
+	Publish(NewWarningEvent(
+		"qpool",
+		"circuit-open",
+		"circuit breaker open",
+		nil,
+	))
+}
+
+func (cb *CircuitBreaker) safeDecHalfOpenInflight() {
+	for {
+		cur := cb.halfOpenInflight.Load()
+		if cur <= 0 {
+			return
+		}
+		if cb.halfOpenInflight.CompareAndSwap(cur, cur-1) {
+			return
+		}
 	}
 }

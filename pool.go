@@ -4,305 +4,314 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/theapemachine/errnie"
+	"github.com/phuslu/log"
 )
 
 /*
-	Q is our hybrid worker pool/message queue implementation.
-
-It combines traditional worker pool functionality with quantum-inspired state management.
-The pool maintains a balance between worker availability and job scheduling while
-providing quantum-like properties such as state superposition and entanglement through
-its integration with QSpace.
-
-Key features:
-  - Dynamic worker scaling
-  - Circuit breaker pattern support
-  - Quantum-inspired state management
-  - Metrics collection and monitoring
+Q combines a buffered job queue, fixed worker set, optional regulators, and result tracking via QSpace.
 */
 type Q struct {
-	ctx        context.Context
-	cancel     context.CancelFunc
-	quit       chan struct{}
-	wg         sync.WaitGroup
-	workers    chan chan Job
-	jobs       chan Job
-	space      *QSpace
-	scaler     *Scaler
-	metrics    *Metrics
-	breakers   map[string]*CircuitBreaker
-	workerMu   sync.Mutex
-	workerList []*Worker
-	breakersMu sync.RWMutex
-	config     *Config
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+
+	jobCh        chan Job
+	shutdownMu   sync.RWMutex
+	stopping     atomic.Bool
+	closeJobOnce sync.Once
+	minWorkers   int
+	maxWorkers   int
+
+	space   *QSpace
+	scaler  *Scaler
+	metrics *Metrics
+
+	breakers   *circuitBreakerCache
+	registry   *workerRegistry
+	nextWorker atomic.Uint64
+
+	config *Config
 }
 
 /*
-	NewQ creates a new quantum pool with the specified worker constraints and configuration.
-
-The pool initializes with the minimum number of workers and scales dynamically based on load.
-
-Parameters:
-  - ctx: Parent context for lifecycle management
-  - minWorkers: Minimum number of workers to maintain
-  - maxWorkers: Maximum number of workers allowed
-  - config: Pool configuration parameters
-
-Returns:
-  - *Q: A new quantum pool instance
+NewQ constructs a pool with minWorkers..maxWorkers goroutines competing on a shared job channel.
 */
 func NewQ(ctx context.Context, minWorkers, maxWorkers int, config *Config) *Q {
+	if config == nil {
+		config = NewConfig()
+	}
+
+	if maxWorkers < 1 {
+		maxWorkers = 1
+	}
+
+	if minWorkers < 1 {
+		minWorkers = 1
+	}
+
+	if minWorkers > maxWorkers {
+		minWorkers = maxWorkers
+	}
+
 	ctx, cancel := context.WithCancel(ctx)
+
+	capacity := maxWorkers * 10
+
+	if config.JobChannelCapacity > 0 {
+		capacity = config.JobChannelCapacity
+	}
+
 	q := &Q{
 		ctx:        ctx,
 		cancel:     cancel,
-		breakers:   make(map[string]*CircuitBreaker),
-		workerList: make([]*Worker, 0),
-		quit:       make(chan struct{}),
-		jobs:       make(chan Job, maxWorkers*10),
-		workers:    make(chan chan Job, maxWorkers),
+		jobCh:      make(chan Job, capacity),
+		minWorkers: minWorkers,
+		maxWorkers: maxWorkers,
 		space:      NewQSpace(),
 		metrics:    NewMetrics(),
+		breakers:   newCircuitBreakerCache(config.CircuitBreakerLimit),
+		registry:   newWorkerRegistry(),
 		config:     config,
 	}
 
-	// Start initial workers
 	for i := 0; i < minWorkers; i++ {
 		q.startWorker()
 	}
 
-	// Start the manager goroutine
-	q.wg.Add(1)
-	go func() {
-		defer q.wg.Done()
-		q.manage()
-	}()
-
-	// Start metrics collection
-	q.wg.Add(1)
-	go func() {
-		defer q.wg.Done()
-		q.collectMetrics()
-	}()
-
-	// Start scaler with appropriate configuration
-	scalerConfig := &ScalerConfig{
-		TargetLoad:         2.0,                    // Reasonable target load
-		ScaleUpThreshold:   4.0,                    // Scale up when load is high
-		ScaleDownThreshold: 1.0,                    // Scale down when load is low
-		Cooldown:           time.Millisecond * 500, // Reasonable cooldown
+	if config.Scaler != nil {
+		q.scaler = NewScaler(q, minWorkers, maxWorkers, config.Scaler)
 	}
-	q.scaler = NewScaler(q, minWorkers, maxWorkers, scalerConfig)
 
 	return q
 }
 
 /*
-	manage handles the core job scheduling loop of the quantum pool.
-
-It distributes jobs to available workers while respecting timeouts and
-maintaining quantum state consistency through QSpace integration.
-
-This method runs as a goroutine and continues until the pool's context is cancelled.
+MetricSnapshot returns a point-in-time copy of atomic pool counters (workers,
+busy workers, queue depth, and regulator-facing fields).
 */
-func (q *Q) manage() {
-	for {
-		select {
-		case <-q.ctx.Done():
-			return
-		case job := <-q.jobs:
-			// Wait for a worker with timeout
-			select {
-			case <-q.ctx.Done():
-				return
-			case workerChan := <-q.workers:
-				// Send job to worker
-				select {
-				case workerChan <- job:
-					// Job successfully sent to worker
-				case <-q.ctx.Done():
-					return
-				}
-			case <-time.After(q.getSchedulingTimeout()):
-				errnie.Warn("No available workers for job: %s, timeout occurred", job.ID)
-				// Store error result since we couldn't process the job
-				q.space.Store(job.ID, nil, []State{{
-					Value:       fmt.Errorf("no available workers"),
-					Probability: 1.0,
-				}}, job.TTL)
-			}
+func (q *Q) MetricSnapshot() MetricReading {
+	if q == nil {
+		return MetricReading{}
+	}
+
+	r := q.metrics.CollectReading()
+
+	return *r
+}
+
+/*
+WorkerBounds returns the configured minimum and maximum worker goroutine counts.
+*/
+func (q *Q) WorkerBounds() (minWorkers, maxWorkers int) {
+	if q == nil {
+		return 0, 0
+	}
+
+	return q.minWorkers, q.maxWorkers
+}
+
+/*
+PeriodicScalerConfigured reports whether NewQ wired the built-in
+interval scaler. Adaptive admission regulators may resize the pool
+independently; those are not mirrored here.
+*/
+func (q *Q) PeriodicScalerConfigured() bool {
+	return q != nil && q.config != nil && q.config.Scaler != nil
+}
+
+func (q *Q) publishTelemetry(ev Event) {
+	if q != nil && q.config != nil && q.config.TelemetryPublish != nil {
+		q.config.TelemetryPublish(ev)
+
+		return
+	}
+
+	Publish(ev)
+}
+
+func (q *Q) schedulingTimeout() time.Duration {
+	if q.config != nil && q.config.SchedulingTimeout > 0 {
+		return q.config.SchedulingTimeout
+	}
+
+	return 5 * time.Second
+}
+
+func errorFuture(err error) chan *QValue {
+	ch := make(chan *QValue, 1)
+	qv := NewQValue(nil)
+	qv.Error = err
+	ch <- qv
+
+	close(ch)
+
+	return ch
+}
+
+func (q *Q) scheduleDoneError(ctx context.Context) (error, bool) {
+	if err := q.ctx.Err(); err != nil {
+		return fmt.Errorf("qpool: pool closed: %w", err), false
+	}
+
+	return fmt.Errorf("job scheduling timeout: %w", ctx.Err()), true
+}
+
+func (q *Q) enqueueJob(ctx context.Context, job Job) error {
+	if q.stopping.Load() {
+		return fmt.Errorf("qpool: pool closed")
+	}
+
+	q.shutdownMu.RLock()
+	defer q.shutdownMu.RUnlock()
+
+	if q.stopping.Load() {
+		return fmt.Errorf("qpool: pool closed")
+	}
+
+	if err := q.ctx.Err(); err != nil {
+		return fmt.Errorf("qpool: pool closed: %w", err)
+	}
+
+	select {
+	case <-q.ctx.Done():
+		return fmt.Errorf("qpool: pool closed: %w", q.ctx.Err())
+	case q.jobCh <- job:
+		q.publishTelemetry(Event{
+			Component: "qpool",
+			Op:        "schedule",
+			Message:   fmt.Sprintf("job scheduled: %s", job.ID),
+			Time:      time.Now(),
+			Level:     log.InfoLevel,
+		})
+
+		q.metrics.incJobQueued()
+
+		return nil
+	case <-ctx.Done():
+		err, schedulingFailure := q.scheduleDoneError(ctx)
+
+		if schedulingFailure {
+			q.metrics.incSchedulingFailure()
 		}
+
+		return err
 	}
 }
 
 /*
-	collectMetrics collects and updates metrics for the quantum pool.
-
-It periodically updates metrics such as job queue size, active workers, and
-other relevant statistics. This method runs as a goroutine and continues until
-the pool's context is cancelled.
+Schedule enqueues a job when regulators and optional circuit breaker permit.
+Results arrive on the returned channel backed by QSpace. The job id doubles as
+the result key until TTL expires — reuse the same id for a logically new piece
+of work while older results remain queued and callers will unblock with the
+stale completion first unless result cleanup removed it first.
 */
-func (q *Q) collectMetrics() {
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-q.ctx.Done():
-			return
-		case <-ticker.C:
-			q.metrics.mu.Lock()
-			q.metrics.JobQueueSize = len(q.jobs)
-			q.metrics.ActiveWorkers = len(q.workers)
-			q.metrics.mu.Unlock()
-		}
-	}
-}
-
-/*
-	Schedule submits a job to the quantum pool for execution.
-
-The job is processed according to quantum-inspired principles, maintaining
-state history and uncertainty levels through QSpace integration.
-
-Parameters:
-  - id: Unique identifier for the job
-  - fn: The function to execute
-  - opts: Optional job configuration parameters
-
-Returns:
-  - chan *QValue: Channel that will receive the job's result
-*/
-func (q *Q) Schedule(id string, fn func() (any, error), opts ...JobOption) chan *QValue {
-	// Create context with configured timeout
-	ctx, cancel := context.WithTimeout(q.ctx, q.getSchedulingTimeout())
+func (q *Q) Schedule(
+	id string,
+	fn func(context.Context) (any, error),
+	opts ...JobOption,
+) chan *QValue {
+	ctx, cancel := context.WithTimeout(q.ctx, q.schedulingTimeout())
 	defer cancel()
 
 	startTime := time.Now()
 
 	job := Job{
-		ID: id,
-		Fn: fn,
+		ID:        id,
+		Fn:        fn,
+		StartTime: startTime,
 		RetryPolicy: &RetryPolicy{
-			MaxAttempts: 3,
+			MaxAttempts: 1,
 			Strategy:    &ExponentialBackoff{Initial: time.Second},
 		},
-		StartTime: startTime,
 	}
 
-	// Apply options
 	for _, opt := range opts {
 		opt(&job)
 	}
 
-	// Check circuit breaker if configured
-	if job.CircuitID != "" {
-		breaker := q.getCircuitBreaker(job)
-		if breaker != nil && !breaker.Allow() {
-			ch := make(chan *QValue, 1)
-			ch <- &QValue{
-				Error:     fmt.Errorf("circuit breaker %s is open", job.CircuitID),
-				CreatedAt: time.Now(),
+	if q.config != nil && len(q.config.Regulators) > 0 {
+		reading := q.metrics.CollectReading()
+
+		for _, reg := range q.config.Regulators {
+			reg.Observe(reading)
+		}
+
+		for _, reg := range q.config.Regulators {
+			if reg.Limit() {
+				q.metrics.incThrottled()
+
+				return errorFuture(fmt.Errorf("qpool: regulator rejected schedule"))
 			}
-			close(ch)
-			return ch
 		}
 	}
 
-	// Try to schedule job with context timeout
-	select {
-	case q.jobs <- job:
-		// Use the pointer channel directly from QSpace
+	if job.CircuitID != "" {
+		breaker := q.breakerFor(&job)
+
+		if breaker != nil && !breaker.Allow() {
+			return errorFuture(fmt.Errorf("circuit breaker %s is open", job.CircuitID))
+		}
+
+		if breaker != nil {
+			job.circuitBreaker = breaker
+		}
+	}
+
+	if q.stopping.Load() {
+		return errorFuture(fmt.Errorf("qpool: pool closed"))
+	}
+
+	if len(job.Dependencies) > 0 {
+		if err := q.startDependencyWait(job); err != nil {
+			return errorFuture(err)
+		}
+
 		return q.space.Await(id)
-	case <-ctx.Done():
-		ch := make(chan *QValue, 1)
-		ch <- &QValue{
-			Error:     fmt.Errorf("job scheduling timeout: %w", ctx.Err()),
-			CreatedAt: time.Now(),
-		}
-		close(ch)
-
-		// Update metrics for scheduling failure
-		q.metrics.mu.Lock()
-		q.metrics.SchedulingFailures++
-		q.metrics.mu.Unlock()
-
-		return ch
 	}
+
+	if err := q.enqueueJob(ctx, job); err != nil {
+		return errorFuture(err)
+	}
+
+	return q.space.Await(id)
 }
 
 /*
-	CreateBroadcastGroup creates a new broadcast group.
-
-Initializes a new broadcast group with specified parameters and default
-quantum properties such as minimum uncertainty.
+CreateBroadcastGroup allocates a group stored inside QSpace.
 */
 func (q *Q) CreateBroadcastGroup(id string, ttl time.Duration) *BroadcastGroup {
 	return q.space.CreateBroadcastGroup(id, ttl)
 }
 
 /*
-	Subscribe returns a channel for receiving values from a broadcast group.
-
-Provides a channel for receiving quantum values from a specific broadcast group.
+Subscribe returns the broadcast group's subscriber channel for groupID.
 */
-func (q *Q) Subscribe(groupID string) chan QValue {
-	qvChan := q.space.Subscribe(groupID)
-	if qvChan == nil {
-		return nil
-	}
-
-	resultChan := make(chan QValue, 10)
-	go func() {
-		defer close(resultChan)
-		for qv := range qvChan {
-			if qv != nil {
-				resultChan <- QValue{
-					Value:     qv.Value,
-					Error:     qv.Error,
-					CreatedAt: qv.CreatedAt,
-				}
-			}
-		}
-	}()
-	return resultChan
+func (q *Q) Subscribe(groupID string) chan *QValue {
+	return q.space.Subscribe(groupID)
 }
 
 /*
-	startWorker starts a new worker.
-
-Initializes a new worker and adds it to the pool's worker list.
+PeekResult returns a shallow copy of the stored QValue for job id when QSpace holds
+a non-expired result. It returns (nil, false) when no result is stored for id, when
+TTL expiration or eviction removed the entry, or when the pool or space cannot serve
+the query (including during shutdown). The returned *QValue points at a new struct
+value copied from the actor's map entry; see QSpace.PeekResult for concurrency and
+read-only semantics versus nested reference fields in QValue.
 */
-func (q *Q) startWorker() {
-	worker := &Worker{
-		pool:   q,
-		jobs:   make(chan Job),
-		cancel: nil,
+func (q *Q) PeekResult(id string) (*QValue, bool) {
+	if q == nil {
+		return nil, false
 	}
-	q.workerMu.Lock()
-	q.workerList = append(q.workerList, worker)
-	q.workerMu.Unlock()
 
-	q.metrics.mu.Lock()
-	q.metrics.WorkerCount++
-	q.metrics.mu.Unlock()
-
-	q.wg.Add(1)
-	go func() {
-		defer q.wg.Done()
-		worker.run()
-	}()
-	errnie.Info("Started worker, total workers: %d", q.metrics.WorkerCount)
+	return q.space.PeekResult(id)
 }
 
 /*
-	WithTTL configures TTL for a job.
-
-Sets the time-to-live (TTL) for a job, which determines how long the job will
-remain in the system before being discarded.
+WithTTL sets how long QSpace retains the job result before expiration
+cleanup. It does not cap execution time; use WithExecTimeout for that.
 */
 func WithTTL(ttl time.Duration) JobOption {
 	return func(j *Job) {
@@ -311,81 +320,43 @@ func WithTTL(ttl time.Duration) JobOption {
 }
 
 /*
-	getCircuitBreaker returns the circuit breaker for a job.
-
-If the job does not have a circuit ID or configuration, it returns nil.
+WithExecTimeout sets the per-invocation deadline passed to Fn. Zero selects
+the pool Config.SchedulingTimeout default (when positive) or five seconds.
 */
-func (q *Q) getCircuitBreaker(job Job) *CircuitBreaker {
-	if job.CircuitID == "" || job.CircuitConfig == nil {
-		return nil
+func WithExecTimeout(duration time.Duration) JobOption {
+	return func(j *Job) {
+		j.ExecTimeout = duration
 	}
+}
 
-	q.breakersMu.Lock()
-	defer q.breakersMu.Unlock()
-
-	breaker, exists := q.breakers[job.CircuitID]
-	if !exists {
-		breaker = &CircuitBreaker{
-			maxFailures:  job.CircuitConfig.MaxFailures,
-			resetTimeout: job.CircuitConfig.ResetTimeout,
-			halfOpenMax:  job.CircuitConfig.HalfOpenMax,
-			state:        CircuitClosed,
+/*
+WithDependencyAwaitTimeout sets how long a job waits for each dependency before
+its dependency wait attempt times out. It does not add dependencies; combine it
+with WithDependencies for dependency-ordered jobs.
+*/
+func WithDependencyAwaitTimeout(duration time.Duration) JobOption {
+	return func(job *Job) {
+		if duration <= 0 {
+			return
 		}
-		q.breakers[job.CircuitID] = breaker
+
+		if job.DependencyRetryPolicy == nil {
+			job.DependencyRetryPolicy = &RetryPolicy{
+				MaxAttempts: 1,
+				Strategy:    &ExponentialBackoff{Initial: time.Second},
+			}
+		}
+
+		if job.DependencyRetryPolicy.MaxAttempts <= 0 {
+			job.DependencyRetryPolicy.MaxAttempts = 1
+		}
+
+		if job.DependencyRetryPolicy.Strategy == nil {
+			job.DependencyRetryPolicy.Strategy = &ExponentialBackoff{
+				Initial: time.Second,
+			}
+		}
+
+		job.DependencyRetryPolicy.PerAttemptTimeout = duration
 	}
-
-	return breaker
-}
-
-/*
-	getSchedulingTimeout returns the scheduling timeout from the configuration or
-
-uses a default value if not specified.
-*/
-func (q *Q) getSchedulingTimeout() time.Duration {
-	if q.config != nil && q.config.SchedulingTimeout > 0 {
-		return q.config.SchedulingTimeout
-	}
-	return 5 * time.Second // Default timeout
-}
-
-/*
-	Close gracefully shuts down the quantum pool.
-
-It ensures all workers complete their current jobs and cleans up resources.
-The shutdown process:
- 1. Cancels the pool's context
- 2. Waits for all goroutines to complete
- 3. Closes all channels safely
- 4. Cleans up worker resources
-*/
-func (q *Q) Close() {
-	if q == nil {
-		return
-	}
-
-	errnie.Info("Closing Quantum Pool")
-
-	// Cancel context first to stop all operations
-	if q.cancel != nil {
-		errnie.Info("Cancelling context")
-		q.cancel()
-	}
-
-	// Wait for all goroutines to finish before closing channels
-	q.wg.Wait()
-
-	// Now it's safe to close channels as no goroutines are using them
-	q.workerMu.Lock()
-	for _, worker := range q.workerList {
-		close(worker.jobs)
-	}
-	q.workerList = nil
-	q.workerMu.Unlock()
-
-	close(q.quit)
-	close(q.jobs)
-	close(q.workers)
-
-	errnie.Info("Quantum Pool closed")
 }

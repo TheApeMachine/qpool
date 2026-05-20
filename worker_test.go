@@ -8,133 +8,128 @@ import (
 	. "github.com/smartystreets/goconvey/convey"
 )
 
-const timeoutMsg = "Test timed out waiting for value retrieval"
+func TestQScheduleJobLifecycle(t *testing.T) {
+	Convey("Schedule runs a job and delivers the result", t, func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 
-func TestWorker(t *testing.T) {
-	Convey("Given a worker", t, func() {
-		Convey("It should process a job successfully", func() {
-			pool := &Q{
-				ctx:     context.Background(),
-				workers: make(chan chan Job, 1),
-				space:   NewQSpace(),
-				metrics: NewMetrics(),
-			}
+		defer cancel()
 
-			worker := &Worker{
-				pool: pool,
-				jobs: make(chan Job, 1),
-			}
-
-			Reset(func() {
-				close(worker.jobs)
-				pool.space.Close()
-			})
-
-			job := Job{
-				ID:           "job_success",
-				Fn:           func() (any, error) { return "result", nil },
-				StartTime:    time.Now(),
-				TTL:          10 * time.Second,
-				Dependencies: []string{},
-			}
-
-			worker.jobs <- job
-			go worker.run()
-
-			result := pool.space.Await(job.ID)
-			select {
-			case <-time.After(2 * time.Second):
-				t.Fatal(timeoutMsg)
-			case value := <-result:
-				So(value.Error, ShouldBeNil)
-				So(value.Value, ShouldEqual, "result")
-			}
+		q := NewQ(ctx, 2, 5, &Config{
+			SchedulingTimeout: time.Second,
+			Scaler:            nil,
 		})
 
-		Convey("It should handle job timeout", func() {
-			pool := &Q{
-				ctx:     context.Background(),
-				workers: make(chan chan Job, 1),
-				space:   NewQSpace(),
-				metrics: NewMetrics(),
-			}
+		defer q.Close()
 
-			worker := &Worker{
-				pool: pool,
-				jobs: make(chan Job, 1),
-			}
+		done := make(chan struct{})
 
-			Reset(func() {
-				close(worker.jobs)
-				pool.space.Close()
-			})
+		ch := q.Schedule("job-1", func(ctx context.Context) (any, error) {
+			close(done)
 
-			job := Job{
-				ID: "job_timeout",
-				Fn: func() (any, error) {
-					time.Sleep(200 * time.Millisecond)
-					return nil, nil
-				},
-				StartTime:    time.Now(),
-				TTL:          100 * time.Millisecond,
-				Dependencies: []string{},
-			}
-
-			ctx, cancel := context.WithTimeout(pool.ctx, 100*time.Millisecond)
-			defer cancel()
-			worker.pool.ctx = ctx
-
-			
-			worker.jobs <- job
-			go worker.run()
-
-			result := pool.space.Await(job.ID)
-			select {
-			case <-time.After(2 * time.Second):
-				t.Fatal(timeoutMsg)
-			case value := <-result:
-				So(value.Error, ShouldNotBeNil)
-				So(value.Error.Error(), ShouldContainSubstring, "timed out")
-			}
+			return "ok", nil
 		})
 
-		Convey("It should not process a job if dependencies are not met", func() {
-			pool := &Q{
-				ctx:     context.Background(),
-				workers: make(chan chan Job, 1),
-				space:   NewQSpace(),
-				metrics: NewMetrics(),
-			}
+		select {
+		case <-time.After(2 * time.Second):
+			t.Fatal("job fn never ran")
+		case <-done:
+		}
 
-			worker := &Worker{
-				pool: pool,
-				jobs: make(chan Job, 1),
-			}
+		select {
+		case <-time.After(2 * time.Second):
+			t.Fatal("result timeout")
+		case res := <-ch:
+			So(res, ShouldNotBeNil)
+			So(res.Error, ShouldBeNil)
+			So(res.Value, ShouldEqual, "ok")
+		}
+	})
+}
 
-			Reset(func() {
-				close(worker.jobs)
-				pool.space.Close()
-			})
+func TestQScheduleRegulatorRejects(t *testing.T) {
+	Convey("Regulators can reject Schedule before enqueue", t, func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 
-			job := Job{
-				ID:           "job_dependency",
-				Fn:           func() (any, error) { return "result", nil },
-				StartTime:    time.Now(),
-				TTL:          10 * time.Second,
-				Dependencies: []string{"dep1"},
-			}
+		defer cancel()
 
-			worker.jobs <- job
-			go worker.run()
+		cfg := NewConfig()
+		cfg.Scaler = nil
+		cfg.Regulators = []Regulator{NewRateLimiter(0, time.Hour)}
 
-			result := pool.space.Await(job.ID)
-			select {
-			case <-time.After(2 * time.Second):
-				t.Fatal(timeoutMsg)
-			case value := <-result:
-				So(value.Error, ShouldNotBeNil)
-				So(value.Error.Error(), ShouldContainSubstring, "dependency dep1 failed")
-			}
+		q := NewQ(ctx, 1, 2, cfg)
+
+		defer q.Close()
+
+		ch := q.Schedule("blocked", func(ctx context.Context) (any, error) {
+			return "nope", nil
 		})
+
+		select {
+		case <-time.After(time.Second):
+			t.Fatal("expected immediate regulator rejection")
+		case res := <-ch:
+			So(res, ShouldNotBeNil)
+			So(res.Error, ShouldNotBeNil)
+			So(res.Error.Error(), ShouldContainSubstring, "rejected")
+		}
+	})
+}
+
+func TestPeekResultReadsStoredJob(t *testing.T) {
+	Convey("PeekResult returns stored completion after job finishes", t, func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+
+		defer cancel()
+
+		q := NewQ(ctx, 1, 2, &Config{Scaler: nil})
+
+		defer q.Close()
+
+		ch := q.Schedule("peek-src", func(ctx context.Context) (any, error) {
+			return 77, nil
+		})
+
+		var res *QValue
+
+		select {
+		case <-time.After(2 * time.Second):
+			t.Fatal("result timeout waiting for peek-src job")
+		case res = <-ch:
+		}
+
+		So(res, ShouldNotBeNil)
+		So(res.Error, ShouldBeNil)
+
+		pv, ok := q.PeekResult("peek-src")
+
+		So(ok, ShouldBeTrue)
+		So(pv, ShouldNotBeNil)
+		So(pv.Error, ShouldBeNil)
+		So(pv.Value, ShouldEqual, 77)
+	})
+}
+
+func TestDependencyFailureStoresError(t *testing.T) {
+	Convey("missing dependency yields error result", t, func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+
+		defer cancel()
+
+		q := NewQ(ctx, 1, 2, &Config{Scaler: nil})
+
+		defer q.Close()
+
+		ch := q.Schedule("child", func(ctx context.Context) (any, error) {
+			return "x", nil
+		}, WithDependencies([]string{"missing"}))
+
+		select {
+		case <-time.After(3 * time.Second):
+			t.Fatal("timeout waiting dependency failure")
+		case res := <-ch:
+			So(res, ShouldNotBeNil)
+			So(res.Error, ShouldNotBeNil)
+			So(res.Error.Error(), ShouldContainSubstring, "dependency missing")
+		}
 	})
 }

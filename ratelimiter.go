@@ -1,134 +1,104 @@
 package qpool
 
 import (
-	"sync"
+	"sync/atomic"
 	"time"
 )
 
 /*
-RateLimiter implements the Regulator interface using a token bucket algorithm.
-It controls the rate of operations by maintaining a bucket of tokens that are consumed
-by each operation and replenished at a fixed rate.
-
-Like a water tank with a steady inflow and controlled outflow, this regulator ensures
-that operations occur at a sustainable rate, preventing system overload while allowing
-for brief bursts of activity when the token bucket is full.
-
-Key features:
-  - Smooth rate limiting with burst capacity
-  - Configurable token replenishment rate
-  - Thread-safe operation
-  - Metric-aware for adaptive rate limiting
+RateLimiter implements Regulator using a token bucket with atomic accounting only.
 */
 type RateLimiter struct {
-	tokens     int           // Current number of available tokens
-	maxTokens  int           // Maximum token capacity
-	refillRate time.Duration // Time between token replenishments
-	lastRefill time.Time     // Last time tokens were added
-	mu         sync.Mutex    // Ensures thread-safe access to tokens
-	metrics    *Metrics      // System metrics for adaptive behavior
+	tokens     atomic.Int64
+	maxTokens  int64
+	refillRate time.Duration
+	lastRefill atomic.Int64
 }
 
 /*
-NewRateLimiter creates a new rate limit regulator with specified parameters.
-
-Parameters:
-  - maxTokens: Maximum number of tokens (burst capacity)
-  - refillRate: Duration between token replenishments
-
-Returns:
-  - *RateLimiter: A new rate limit regulator instance
-
-Example:
-    limiter := NewRateLimiter(100, time.Second) // 100 ops/second with burst capacity
+NewRateLimiter creates a rate limit regulator.
 */
 func NewRateLimiter(maxTokens int, refillRate time.Duration) *RateLimiter {
-	now := time.Now()
-	return &RateLimiter{
-		tokens:     maxTokens,
-		maxTokens:  maxTokens,
-		refillRate: refillRate,
-		lastRefill: now.Add(-refillRate), // Start with a full refill period elapsed
+	capacity := maxTokens
+	if capacity < 0 {
+		capacity = 0
 	}
+
+	rl := &RateLimiter{
+		maxTokens:  int64(capacity),
+		refillRate: refillRate,
+	}
+
+	if rl.refillRate <= 0 {
+		rl.refillRate = time.Second
+	}
+
+	rl.tokens.Store(int64(capacity))
+	rl.lastRefill.Store(time.Now().UnixNano())
+
+	return rl
 }
 
 /*
-Observe implements the Regulator interface by monitoring system metrics.
-The rate limiter can use these metrics to dynamically adjust its rate limits
-based on system conditions.
-
-For example, it might:
-  - Reduce rates during high system load
-  - Increase limits when resources are abundant
-  - Adjust burst capacity based on queue length
-
-Parameters:
-  - metrics: Current system metrics including performance and health indicators
+Observe implements Regulator (reserved for adaptive extensions).
 */
-func (rl *RateLimiter) Observe(metrics *Metrics) {
-	rl.metrics = metrics
+func (rl *RateLimiter) Observe(reading *MetricReading) {
+	_ = reading
 }
 
 /*
-Limit implements the Regulator interface by determining if an operation should be limited.
-It consumes a token if available, allowing the operation to proceed. If no tokens
-are available, the operation is limited.
-
-Returns:
-  - bool: true if the operation should be limited, false if it can proceed
-
-Thread-safety: This method is thread-safe through mutex protection.
+Limit implements Regulator: true when this schedule should be rejected (no token).
 */
 func (rl *RateLimiter) Limit() bool {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
+	rl.refillTokens(time.Now().UnixNano())
 
-	rl.refill()
-	if rl.tokens > 0 {
-		rl.tokens--
-		return false // Don't limit
+	for {
+		cur := rl.tokens.Load()
+		if cur <= 0 {
+			return true
+		}
+
+		if rl.tokens.CompareAndSwap(cur, cur-1) {
+			return false
+		}
 	}
-	return true // Limit
 }
 
 /*
-Renormalize implements the Regulator interface by attempting to restore normal operation.
-This method triggers a token refill, potentially allowing more operations to proceed
-if enough time has passed since the last refill.
-
-The rate limiter uses this method to maintain a steady flow of operations while
-adhering to the configured rate limits.
+Renormalize triggers refill without consuming a token.
 */
 func (rl *RateLimiter) Renormalize() {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-	rl.refill()
+	rl.refillTokens(time.Now().UnixNano())
 }
 
-/*
-refill adds tokens to the bucket based on elapsed time.
-This is an internal method that implements the token bucket algorithm's
-replenishment logic.
-
-The number of tokens added is proportional to the time elapsed since the last
-refill, up to the maximum capacity of the bucket.
-
-Thread-safety: This method assumes the caller holds the mutex lock.
-*/
-func (rl *RateLimiter) refill() {
-	now := time.Now()
-	elapsed := now.Sub(rl.lastRefill)
-	
-	// Convert to nanoseconds for integer division
-	elapsedNs := elapsed.Nanoseconds()
-	refillRateNs := rl.refillRate.Nanoseconds()
-
-	// Calculate tokens to add - only round up if we're at least halfway through a period
-	tokensToAdd := (elapsedNs + (refillRateNs / 2)) / refillRateNs
-	
-	if tokensToAdd > 0 {
-		rl.tokens = Min(rl.maxTokens, rl.tokens+int(tokensToAdd))
-		// Only move lastRefill forward by the number of complete periods
-		rl.lastRefill = rl.lastRefill.Add(time.Duration(tokensToAdd) * rl.refillRate)
+func (rl *RateLimiter) refillTokens(nowUnixNano int64) {
+	refillNs := rl.refillRate.Nanoseconds()
+	if refillNs <= 0 {
+		refillNs = int64(time.Second)
 	}
-} 
+
+	for {
+		last := rl.lastRefill.Load()
+		elapsed := nowUnixNano - last
+		if elapsed < refillNs {
+			return
+		}
+
+		periods := elapsed / refillNs
+
+		nextLast := last + periods*refillNs
+		if !rl.lastRefill.CompareAndSwap(last, nextLast) {
+			continue
+		}
+
+		for {
+			cur := rl.tokens.Load()
+			cappedTokens := min(cur+periods, rl.maxTokens)
+			if rl.tokens.CompareAndSwap(cur, cappedTokens) {
+				break
+			}
+		}
+
+		return
+	}
+}

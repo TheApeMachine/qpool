@@ -1,17 +1,15 @@
 module github.com/theapemachine/qpool
 
-go 1.23.0
+go 1.26.1
 
-require (
-	github.com/smartystreets/goconvey v1.8.1
-	github.com/theapemachine/errnie v0.0.4
-)
+require github.com/smartystreets/goconvey v1.8.1
 
 require (
 	github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d // indirect
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
 	github.com/charmbracelet/lipgloss v0.10.0 // indirect
 	github.com/charmbracelet/log v0.4.0 // indirect
+	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/fsnotify/fsnotify v1.6.0 // indirect
 	github.com/go-logfmt/logfmt v0.6.0 // indirect
 	github.com/hashicorp/hcl v1.0.0 // indirect
@@ -40,8 +38,10 @@ require (
 )
 
 require (
-	github.com/davecgh/go-spew v1.1.1
 	github.com/gopherjs/gopherjs v1.17.2 // indirect
 	github.com/jtolds/gls v4.20.0+incompatible // indirect
+	github.com/phuslu/log v1.0.124
 	github.com/smarty/assertions v1.15.0 // indirect
+	github.com/theapemachine/errnie v0.0.2
+	golang.org/x/sync v0.20.0
 )

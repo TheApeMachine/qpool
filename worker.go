@@ -3,193 +3,155 @@ package qpool
 import (
 	"context"
 	"fmt"
+	"runtime/debug"
 	"time"
 
-	"github.com/theapemachine/errnie"
+	"github.com/phuslu/log"
 )
 
-// Worker processes jobs
-type Worker struct {
-	pool       *Q
-	jobs       chan Job
-	cancel     context.CancelFunc
-	currentJob *Job // Added Field to Track Current Job
-}
+func processJob(q *Q, workerCtx context.Context, job Job) {
+	deadline := q.schedulingTimeout()
 
-// run starts the worker's job processing loop
-func (w *Worker) run() {
-	jobChan := w.jobs // Store the job channel locally for clarity
+	if job.ExecTimeout > 0 {
+		deadline = job.ExecTimeout
+	}
 
-	for {
-		// First check if we should exit
-		select {
-		case <-w.pool.ctx.Done():
-			errnie.Info("Worker exiting due to context cancellation")
-			return
-		default:
-		}
+	execCtx, cancel := context.WithTimeout(workerCtx, deadline)
+	defer cancel()
 
-		// Register ourselves as available
-		errnie.Info("Worker registering as available")
-		w.pool.workers <- jobChan
+	startedAt := time.Now()
 
-		// Wait for a job
-		select {
-		case <-w.pool.ctx.Done():
-			errnie.Info("Worker exiting while waiting for job")
-			return
-		case job, ok := <-jobChan:
-			if !ok {
-				errnie.Warn("Worker job channel closed")
-				return
-			}
+	q.publishTelemetry(Event{
+		Component: "qpool",
+		Op:        "job-start",
+		Message:   fmt.Sprintf("job started: %s", job.ID),
+		Time:      startedAt,
+		Level:     log.InfoLevel,
+		Fields: []Field{
+			{Key: "job", Value: job.ID},
+		},
+	})
 
-			errnie.Info("Worker received job: %s", job.ID)
-			w.currentJob = &job
-			result, err := w.processJobWithTimeout(w.pool.ctx, job)
-			w.currentJob = nil
-			errnie.Info("Worker completed job: %s, err: %v", job.ID, err)
+	result, err := runJobWithRetries(execCtx, job)
 
-			// Handle result
-			if err != nil {
-				w.pool.metrics.RecordJobFailure()
-				// Store error result
-				w.pool.space.StoreError(job.ID, err, job.TTL)
-			} else {
-				w.pool.metrics.RecordJobSuccess(time.Since(job.StartTime))
-				errnie.Info("Job %s succeeded", job.ID)
-				// Store successful result
-				w.pool.space.Store(job.ID, result, []State{{Value: result, Probability: 1.0}}, job.TTL)
-			}
-			errnie.Info("Stored result for job: %s", job.ID)
+	latency := time.Since(job.StartTime)
+	execDur := time.Since(startedAt)
 
-			// Notify dependents
-			if len(job.Dependencies) > 0 {
-				for _, depID := range job.Dependencies {
-					if children := w.pool.space.children[depID]; len(children) > 0 {
-						for _, childID := range children {
-							errnie.Info("Notifying dependent job %s", childID)
-						}
-					}
-				}
+	if err != nil {
+		q.metrics.RecordJobOutcome(latency, false)
+
+		if job.CircuitID != "" {
+			if cb := q.breakerForJob(&job); cb != nil {
+				cb.RecordFailure()
 			}
 		}
-	}
-}
 
-// processJobWithTimeout processes a job with a timeout
-func (w *Worker) processJobWithTimeout(ctx context.Context, job Job) (any, error) {
-	startTime := time.Now()
+		q.publishTelemetry(Event{
+			Component: "qpool",
+			Op:        "job-error",
+			Message:   fmt.Sprintf("job failed: %s (%v)", job.ID, err),
+			Time:      time.Now(),
+			Level:     log.ErrorLevel,
+			Err:       err,
+			Fields: []Field{
+				{Key: "job", Value: job.ID},
+				{Key: "phase", Value: "execution"},
+				{Key: "duration_ms", Value: latency.Milliseconds()},
+				{Key: "exec_duration_ms", Value: execDur.Milliseconds()},
+			},
+		})
 
-	// Check dependencies before job execution
-	for _, depID := range job.Dependencies {
-		if err := w.checkSingleDependency(depID, job.DependencyRetryPolicy); err != nil {
-			w.pool.metrics.RecordJobExecution(startTime, false)
-			if job.CircuitID != "" {
-				w.recordFailure(job.CircuitID)
-			}
-			return nil, err
-		}
-	}
+		q.space.StoreError(job.ID, err, job.TTL)
 
-	done := make(chan struct{})
-	var result any
-	var err error
-
-	go func() {
-		defer close(done)
-		result, err = job.Fn()
-		errnie.Info("Job %s completed", job.ID)
-	}()
-
-	select {
-	case <-ctx.Done():
-		w.pool.metrics.RecordJobFailure()
-		return nil, fmt.Errorf("job %s timed out", job.ID)
-	case <-done:
-		w.pool.metrics.RecordJobExecution(startTime, err == nil)
-		return result, err
-	}
-}
-
-// checkSingleDependency checks a single job dependency with retries
-func (w *Worker) checkSingleDependency(depID string, retryPolicy *RetryPolicy) error {
-	maxAttempts := 1
-	var strategy RetryStrategy = &ExponentialBackoff{Initial: time.Second}
-
-	if retryPolicy != nil {
-		maxAttempts = retryPolicy.MaxAttempts
-		strategy = retryPolicy.Strategy
-	}
-
-	circuitID := ""
-	if w.currentJob != nil {
-		circuitID = w.currentJob.CircuitID
-	}
-
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		// First check if the dependency exists
-		if !w.pool.space.Exists(depID) {
-			if attempt < maxAttempts-1 {
-				time.Sleep(strategy.NextDelay(attempt + 1))
-				continue
-			}
-			break
-		}
-
-		ch := w.pool.space.Await(depID)
-		select {
-		case result := <-ch:
-			if result.Error == nil {
-				return nil
-			}
-		case <-time.After(time.Second): // Add timeout for each attempt
-			// Continue to next attempt or break
-		}
-
-		if attempt < maxAttempts-1 {
-			time.Sleep(strategy.NextDelay(attempt + 1))
-			continue
-		}
-	}
-
-	w.pool.breakersMu.RLock()
-	breaker, exists := w.pool.breakers[circuitID]
-	w.pool.breakersMu.RUnlock()
-
-	if exists {
-		breaker.RecordFailure()
-	}
-
-	w.pool.space.mu.Lock()
-	if w.pool.space.children == nil {
-		w.pool.space.children = make(map[string][]string)
-	}
-	if w.currentJob != nil {
-		w.pool.space.children[depID] = append(w.pool.space.children[depID], w.currentJob.ID)
-	}
-	w.pool.space.mu.Unlock()
-
-	return fmt.Errorf("dependency %s failed after %d attempts", depID, maxAttempts)
-}
-
-// recordFailure records a failure for a specific circuit breaker
-func (w *Worker) recordFailure(circuitID string) {
-	if circuitID == "" {
 		return
 	}
 
-	w.pool.breakersMu.RLock()
-	breaker, exists := w.pool.breakers[circuitID]
-	w.pool.breakersMu.RUnlock()
+	q.metrics.RecordJobOutcome(latency, true)
 
-	if exists {
-		breaker.RecordFailure()
+	if job.CircuitID != "" {
+		if cb := q.breakerForJob(&job); cb != nil {
+			cb.RecordSuccess()
+		}
 	}
+
+	q.publishTelemetry(Event{
+		Component: "qpool",
+		Op:        "job-complete",
+		Message:   fmt.Sprintf("job completed: %s in %s", job.ID, latency.Round(time.Millisecond)),
+		Time:      time.Now(),
+		Level:     log.InfoLevel,
+		Fields: []Field{
+			{Key: "job", Value: job.ID},
+			{Key: "duration_ms", Value: latency.Milliseconds()},
+			{Key: "exec_duration_ms", Value: execDur.Milliseconds()},
+		},
+	})
+
+	q.space.Store(job.ID, result, job.TTL)
 }
 
-// Add this method to the Worker struct
-func (w *Worker) handleJobTimeout(job Job) error {
-	w.pool.metrics.RecordJobFailure()
-	return fmt.Errorf("job %s timed out", job.ID)
+func runJobWithRetries(ctx context.Context, job Job) (any, error) {
+	maxAttempts := 1
+
+	strategy := RetryStrategy(&ExponentialBackoff{Initial: time.Second})
+
+	if job.RetryPolicy != nil {
+		if job.RetryPolicy.MaxAttempts > 0 {
+			maxAttempts = job.RetryPolicy.MaxAttempts
+		}
+
+		if job.RetryPolicy.Strategy != nil {
+			strategy = job.RetryPolicy.Strategy
+		}
+	}
+
+	var lastErr error
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
+		res, err := invokeFnOnce(ctx, job)
+
+		if err == nil {
+			return res, nil
+		}
+
+		lastErr = err
+
+		if job.RetryPolicy != nil && job.RetryPolicy.Filter != nil && !job.RetryPolicy.Filter(err) {
+			break
+		}
+
+		if attempt == maxAttempts {
+			break
+		}
+
+		delay := strategy.NextDelay(attempt)
+
+		if delay <= 0 {
+			delay = time.Millisecond
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+
+	return nil, lastErr
+}
+
+func invokeFnOnce(ctx context.Context, job Job) (res any, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			res = nil
+
+			err = fmt.Errorf("qpool: panic in job %s: %v\n%s", job.ID, r, debug.Stack())
+		}
+	}()
+
+	return job.Fn(ctx)
 }

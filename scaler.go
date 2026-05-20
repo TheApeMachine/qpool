@@ -4,10 +4,12 @@ import (
 	"math"
 	"time"
 
-	"github.com/theapemachine/errnie"
+	"github.com/phuslu/log"
 )
 
-// Scaler manages pool size based on current load
+/*
+Scaler periodically evaluates queue depth using atomic metrics and adjusts worker count.
+*/
 type Scaler struct {
 	pool               *Q
 	minWorkers         int
@@ -16,118 +18,139 @@ type Scaler struct {
 	scaleUpThreshold   float64
 	scaleDownThreshold float64
 	cooldown           time.Duration
+	evalInterval       time.Duration
 	lastScale          time.Time
 }
 
-// ScalerConfig defines configuration for the Scaler
+/*
+ScalerConfig defines configuration for the periodic scaler.
+*/
 type ScalerConfig struct {
 	TargetLoad         float64
 	ScaleUpThreshold   float64
 	ScaleDownThreshold float64
 	Cooldown           time.Duration
+	/*
+		Interval is the ticker period for CollectReading and evaluate.
+
+		Zero defaults to one second inside NewScaler.
+	*/
+	Interval time.Duration
 }
 
-// evaluate assesses the current load and scales the worker pool accordingly
-func (s *Scaler) evaluate() {
-	s.pool.metrics.mu.Lock()
-	defer s.pool.metrics.mu.Unlock()
+func (s *Scaler) evaluate(read *MetricReading) {
+	if read == nil {
+		read = s.pool.metrics.CollectReading()
+	}
 
 	if time.Since(s.lastScale) < s.cooldown {
 		return
 	}
 
-	// Ensure at least one worker for load calculation
-	if s.pool.metrics.WorkerCount == 0 {
-		s.pool.metrics.WorkerCount = 1
+	workers := read.WorkerCount
+
+	if workers <= 0 {
+		workers = 1
 	}
 
-	currentLoad := float64(s.pool.metrics.JobQueueSize) / float64(s.pool.metrics.WorkerCount)
-	errnie.Log("Current load: %.2f, Workers: %d, Queue: %d",
-		currentLoad, s.pool.metrics.WorkerCount, s.pool.metrics.JobQueueSize)
+	currentLoad := float64(read.JobQueueSize) / float64(workers)
+
+	tl := s.targetLoad
+
+	if tl <= 0 {
+		tl = 1
+	}
 
 	switch {
-	case currentLoad > s.scaleUpThreshold && s.pool.metrics.WorkerCount < s.maxWorkers:
-		needed := int(math.Ceil(float64(s.pool.metrics.JobQueueSize) / s.targetLoad))
-		toAdd := Min(s.maxWorkers-s.pool.metrics.WorkerCount, needed)
+	case currentLoad > s.scaleUpThreshold && read.WorkerCount < s.maxWorkers:
+		needed := int(math.Ceil(float64(read.JobQueueSize) / tl))
+		delta := max(0, needed-read.WorkerCount)
+		toAdd := min(s.maxWorkers-read.WorkerCount, delta)
+
 		if toAdd > 0 {
-			s.scaleUp(toAdd)
+			for range toAdd {
+				s.pool.startWorker()
+			}
+
 			s.lastScale = time.Now()
+			s.pool.metrics.NoteLastScale(s.lastScale)
+
+			s.pool.publishTelemetry(Event{
+				Component: "qpool",
+				Op:        "scale-up",
+				Message:   "scaled worker pool up",
+				Time:      time.Now(),
+				Level:     log.DebugLevel,
+				Fields: []Field{
+					{Key: "delta", Value: toAdd},
+					{Key: "workers", Value: s.pool.metrics.workerCount.Load()},
+				},
+			})
 		}
 
-	case currentLoad < s.scaleDownThreshold && s.pool.metrics.WorkerCount > s.minWorkers:
-		needed := Max(int(math.Ceil(float64(s.pool.metrics.JobQueueSize)/s.targetLoad)), s.minWorkers)
-		toRemove := Min(s.pool.metrics.WorkerCount-s.minWorkers, Max(1, (s.pool.metrics.WorkerCount-needed)/2))
+	case currentLoad < s.scaleDownThreshold && read.WorkerCount > s.minWorkers:
+		needed := max(int(math.Ceil(float64(read.JobQueueSize)/tl)), s.minWorkers)
+
+		toRemove := min(read.WorkerCount-s.minWorkers, max(1, (read.WorkerCount-needed)/2))
+
 		if toRemove > 0 {
-			s.scaleDown(toRemove)
+			s.pool.scaleDownWorkers(toRemove)
+
 			s.lastScale = time.Now()
+			s.pool.metrics.NoteLastScale(s.lastScale)
+
+			s.pool.publishTelemetry(Event{
+				Component: "qpool",
+				Op:        "scale-down",
+				Message:   "scaled worker pool down",
+				Time:      time.Now(),
+				Level:     log.DebugLevel,
+				Fields: []Field{
+					{Key: "delta", Value: toRemove},
+					{Key: "workers", Value: s.pool.metrics.workerCount.Load()},
+				},
+			})
 		}
 	}
 }
 
-// scaleUp adds 'count' number of workers to the pool
-func (s *Scaler) scaleUp(count int) {
-	toAdd := Min(s.maxWorkers-s.pool.metrics.WorkerCount, Max(1, count))
-
-	for i := 0; i < toAdd; i++ {
-		s.pool.startWorker()
-	}
-	errnie.Info("Scaled up by %d workers, total workers: %d", toAdd, s.pool.metrics.WorkerCount)
-}
-
-// scaleDown removes 'count' number of workers from the pool
-func (s *Scaler) scaleDown(count int) {
-	s.pool.workerMu.Lock()
-	defer s.pool.workerMu.Unlock()
-
-	for i := 0; i < count; i++ {
-		if len(s.pool.workerList) == 0 {
-			break
-		}
-
-		// Remove the last worker from the list
-		w := s.pool.workerList[len(s.pool.workerList)-1]
-		s.pool.workerList = s.pool.workerList[:len(s.pool.workerList)-1]
-
-		// Cancel the worker's context outside the lock to avoid holding it during cleanup
-		cancelFunc := w.cancel
-
-		s.pool.metrics.WorkerCount--
-
-		// Release the lock before cleanup operations
-		s.pool.workerMu.Unlock()
-
-		// Cancel the worker's context
-		if cancelFunc != nil {
-			cancelFunc()
-		}
-
-		errnie.Info("Scaled down worker, total workers: %d", s.pool.metrics.WorkerCount)
-
-		// Add a small delay between worker removals
-		time.Sleep(time.Millisecond * 50)
-
-		// Re-acquire the lock for the next iteration
-		s.pool.workerMu.Lock()
-	}
-}
-
-// run starts the scaler's evaluation loop
 func (s *Scaler) run() {
-	ticker := time.NewTicker(time.Second * 1)
+	interval := s.evalInterval
+
+	if interval <= 0 {
+		interval = time.Second
+	}
+
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-s.pool.ctx.Done():
 			return
+
 		case <-ticker.C:
-			s.evaluate()
+			read := s.pool.metrics.CollectReading()
+
+			if s.pool.config != nil {
+				for _, reg := range s.pool.config.Regulators {
+					reg.Renormalize()
+				}
+			}
+
+			s.evaluate(read)
 		}
 	}
 }
 
-// NewScaler initializes and starts a new Scaler
+/*
+NewScaler starts the scaler loop when cfg is non-nil.
+*/
 func NewScaler(q *Q, minWorkers, maxWorkers int, config *ScalerConfig) *Scaler {
+	if config == nil {
+		return nil
+	}
+
 	scaler := &Scaler{
 		pool:               q,
 		minWorkers:         minWorkers,
@@ -136,12 +159,15 @@ func NewScaler(q *Q, minWorkers, maxWorkers int, config *ScalerConfig) *Scaler {
 		scaleUpThreshold:   config.ScaleUpThreshold,
 		scaleDownThreshold: config.ScaleDownThreshold,
 		cooldown:           config.Cooldown,
+		evalInterval:       config.Interval,
 		lastScale:          time.Now(),
 	}
 
 	q.wg.Add(1)
+
 	go func() {
 		defer q.wg.Done()
+
 		scaler.run()
 	}()
 

@@ -11,6 +11,12 @@ type RetryPolicy struct {
 	Strategy    RetryStrategy
 	BackoffFunc func(attempt int) time.Duration
 	Filter      func(error) bool
+	/*
+		PerAttemptTimeout bounds how long a single blocking wait may last before retrying.
+
+		When set on DependencyRetryPolicy, it controls dependency channel awaits; zero derives a duration from Strategy.NextDelay(1) with a floor of one second.
+	*/
+	PerAttemptTimeout time.Duration
 }
 
 // RetryStrategy defines the interface for retry behavior

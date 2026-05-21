@@ -43,7 +43,7 @@ func TestQScheduleDependencyWaitDoesNotStarveWorkers(test *testing.T) {
 	})
 }
 
-func receiveQValue(test *testing.T, resultChannel <-chan *QValue) *QValue {
+func receiveQValue[T any](test *testing.T, resultChannel <-chan *QValue[T]) *QValue[T] {
 	test.Helper()
 
 	select {

@@ -1,33 +1,47 @@
 package qpool
 
 import (
-	"fmt"
 	"time"
+
+	"github.com/theapemachine/errnie"
 )
 
 /*
 QValue is a stored job result or broadcast payload with optional error metadata.
 */
-type QValue struct {
-	Value     interface{}
-	Error     error
-	CreatedAt time.Time
-	TTL       time.Duration
+type QValue[T any] struct {
+	SenderID   string
+	ReceiverID string
+	Value      T
+	Error      error
+	CreatedAt  int64
+	TTL        time.Duration
 }
 
 /*
 NewQValue constructs a value with a creation timestamp.
 */
-func NewQValue(initialValue interface{}) *QValue {
-	return &QValue{
-		Value:     initialValue,
-		CreatedAt: time.Now(),
+func NewQValue[T any](
+	senderID string,
+	receiverID string,
+	initialValue T,
+	ttl time.Duration,
+) (*QValue[T], error) {
+	value := &QValue[T]{
+		SenderID:   senderID,
+		ReceiverID: receiverID,
+		Value:      initialValue,
+		CreatedAt:  time.Now().UnixNano(),
+		TTL:        ttl,
 	}
-}
 
-/*
-ID returns a diagnostic string (not guaranteed globally unique).
-*/
-func (qv *QValue) ID() string {
-	return fmt.Sprintf("qv_%v_%d", qv.Value, qv.CreatedAt.UnixNano())
+	// Value may be nil for error-only results; do not pass it to Require.
+	return value, errnie.Require(
+		map[string]any{
+			"SenderID":   value.SenderID,
+			"ReceiverID": value.ReceiverID,
+			"CreatedAt":  value.CreatedAt,
+			"TTL":        value.TTL,
+		},
+	)
 }

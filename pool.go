@@ -32,6 +32,7 @@ type Q struct {
 	breakers   *circuitBreakerCache
 	registry   *workerRegistry
 	nextWorker atomic.Uint64
+	fastPool   *Pool
 
 	config *Config
 }
@@ -74,6 +75,7 @@ func NewQ(ctx context.Context, minWorkers, maxWorkers int, config *Config) *Q {
 		metrics:    NewMetrics(),
 		breakers:   newCircuitBreakerCache(config.CircuitBreakerLimit),
 		registry:   newWorkerRegistry(),
+		fastPool:   NewPool(uint64(maxWorkers)),
 		config:     config,
 	}
 
@@ -140,9 +142,14 @@ func (q *Q) schedulingTimeout() time.Duration {
 	return 5 * time.Second
 }
 
-func errorFuture(err error) chan *QValue {
-	ch := make(chan *QValue, 1)
-	qv := NewQValue(nil)
+func errorFuture(err error) chan *QValue[any] {
+	ch := make(chan *QValue[any], 1)
+	qv, err := NewQValue[any]("", "", nil, 0)
+
+	if err != nil {
+		return nil
+	}
+
 	qv.Error = err
 	ch <- qv
 
@@ -212,7 +219,7 @@ func (q *Q) Schedule(
 	id string,
 	fn func(context.Context) (any, error),
 	opts ...JobOption,
-) chan *QValue {
+) chan *QValue[any] {
 	ctx, cancel := context.WithTimeout(q.ctx, q.schedulingTimeout())
 	defer cancel()
 
@@ -289,7 +296,7 @@ func (q *Q) CreateBroadcastGroup(id string, ttl time.Duration) *BroadcastGroup {
 /*
 Subscribe returns the broadcast group's subscriber channel for groupID.
 */
-func (q *Q) Subscribe(groupID string) chan *QValue {
+func (q *Q) Subscribe(groupID string) chan *QValue[any] {
 	return q.space.Subscribe(groupID)
 }
 
@@ -301,7 +308,7 @@ the query (including during shutdown). The returned *QValue points at a new stru
 value copied from the actor's map entry; see QSpace.PeekResult for concurrency and
 read-only semantics versus nested reference fields in QValue.
 */
-func (q *Q) PeekResult(id string) (*QValue, bool) {
+func (q *Q) PeekResult(id string) (*QValue[any], bool) {
 	if q == nil {
 		return nil, false
 	}

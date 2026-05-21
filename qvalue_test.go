@@ -1,8 +1,6 @@
 package qpool
 
 import (
-	"strconv"
-	"strings"
 	"testing"
 	"time"
 
@@ -13,33 +11,31 @@ func TestNewQValue(t *testing.T) {
 	Convey("Given NewQValue", t, func() {
 		before := time.Now()
 
-		value := NewQValue("payload")
+		value, err := NewQValue[any]("", "", "payload", 0)
+		if err != nil {
+			t.Fatal(err)
+		}
 
 		So(value, ShouldNotBeNil)
 		So(value.Value, ShouldEqual, "payload")
-		So(value.CreatedAt.After(before.Add(-time.Millisecond)), ShouldBeTrue)
-		So(value.CreatedAt.Before(time.Now().Add(time.Millisecond)), ShouldBeTrue)
+		So(time.Unix(0, value.CreatedAt).After(before.Add(-time.Millisecond)), ShouldBeTrue)
+		So(time.Unix(0, value.CreatedAt).Before(time.Now().Add(time.Millisecond)), ShouldBeTrue)
 	})
-}
 
-func TestQValueID(t *testing.T) {
-	Convey("Given QValue ID", t, func() {
-		at := time.Date(2024, 5, 10, 9, 0, 0, 123456789, time.UTC)
+	Convey("When Value is nil for error-only results", func() {
+		value, err := NewQValue[any]("", "", nil, 0)
 
-		value := &QValue{
-			Value:     "answer",
-			CreatedAt: at,
-		}
-
-		id := value.ID()
-
-		So(strings.HasPrefix(id, "qv_answer_"), ShouldBeTrue)
-		So(id, ShouldContainSubstring, strconv.FormatInt(at.UnixNano(), 10))
+		So(err, ShouldBeNil)
+		So(value, ShouldNotBeNil)
+		So(value.Value, ShouldBeNil)
 	})
 }
 
 func BenchmarkNewQValue(b *testing.B) {
-	for range b.N {
-		_ = NewQValue(42)
+	for b.Loop() {
+		_, err := NewQValue[any]("", "", 42, 0)
+		if err != nil {
+			b.Fatal(err)
+		}
 	}
 }

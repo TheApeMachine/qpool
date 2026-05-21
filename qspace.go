@@ -1,6 +1,7 @@
 package qpool
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -12,8 +13,8 @@ QSpace stores job results, waits, broadcast groups, and dependency edges.
 */
 type QSpace struct {
 	valuesMu sync.RWMutex
-	values   map[string]*QValue
-	waiting  map[string][]chan *QValue
+	values   map[string]*QValue[any]
+	waiting  map[string][]chan *QValue[any]
 
 	groupsMu sync.RWMutex
 	groups   map[string]*BroadcastGroup
@@ -33,8 +34,8 @@ NewQSpace starts the expiration loop.
 */
 func NewQSpace() *QSpace {
 	qspace := &QSpace{
-		values:          make(map[string]*QValue),
-		waiting:         make(map[string][]chan *QValue),
+		values:          make(map[string]*QValue[any]),
+		waiting:         make(map[string][]chan *QValue[any]),
 		groups:          make(map[string]*BroadcastGroup),
 		children:        make(map[string]map[string]struct{}),
 		parents:         make(map[string]map[string]struct{}),
@@ -75,7 +76,11 @@ func (qs *QSpace) Store(id string, value interface{}, ttl time.Duration) {
 		return
 	}
 
-	qvalue := NewQValue(value)
+	qvalue, err := NewQValue("", "", value, ttl)
+	if err != nil {
+		return
+	}
+
 	qvalue.TTL = ttl
 
 	qs.valuesMu.Lock()
@@ -95,12 +100,12 @@ func (qs *QSpace) Store(id string, value interface{}, ttl time.Duration) {
 /*
 Await returns a channel that receives exactly one *QValue for id.
 */
-func (qs *QSpace) Await(id string) chan *QValue {
+func (qs *QSpace) Await(id string) chan *QValue[any] {
 	if qs.stopped.Load() {
 		return closedQValueChannel()
 	}
 
-	resultChannel := make(chan *QValue, 1)
+	resultChannel := make(chan *QValue[any], 1)
 
 	qs.valuesMu.Lock()
 	defer qs.valuesMu.Unlock()
@@ -128,7 +133,7 @@ PeekResult returns (nil, false) when id has no stored completion, when the entry
 
 When ok is true, it returns a shallow copy of the stored QValue. Fields such as QValue.Value and QValue.Error may still reference shared underlying objects, so callers must treat the returned value as read-only.
 */
-func (qs *QSpace) PeekResult(id string) (*QValue, bool) {
+func (qs *QSpace) PeekResult(id string) (*QValue[any], bool) {
 	qs.valuesMu.RLock()
 	defer qs.valuesMu.RUnlock()
 
@@ -170,7 +175,11 @@ func (qs *QSpace) StoreError(id string, err error, ttl time.Duration) {
 		return
 	}
 
-	qvalue := NewQValue(nil)
+	qvalue, err := NewQValue[any]("", "", nil, 0)
+	if err != nil {
+		return
+	}
+
 	qvalue.Error = err
 	qvalue.TTL = ttl
 
@@ -234,7 +243,10 @@ func (qs *QSpace) RegisterDependent(depID, jobID string) {
 CreateBroadcastGroup registers a pub/sub group owned by this space.
 */
 func (qs *QSpace) CreateBroadcastGroup(id string, ttl time.Duration) *BroadcastGroup {
-	group := NewBroadcastGroup(id, ttl, 100)
+	group, err := NewBroadcastGroup(context.Background(), id, ttl)
+	if err != nil {
+		return nil
+	}
 
 	if qs.stopped.Load() {
 		group.Close()
@@ -259,7 +271,7 @@ func (qs *QSpace) CreateBroadcastGroup(id string, ttl time.Duration) *BroadcastG
 /*
 Subscribe attaches to a broadcast group by id.
 */
-func (qs *QSpace) Subscribe(groupID string) chan *QValue {
+func (qs *QSpace) Subscribe(groupID string) chan *QValue[any] {
 	if qs.stopped.Load() {
 		return closedQValueChannel()
 	}
@@ -277,7 +289,7 @@ func (qs *QSpace) Subscribe(groupID string) chan *QValue {
 		return closedQValueChannel()
 	}
 
-	return resultChannel
+	return resultChannel.Incoming
 }
 
 /*
@@ -294,7 +306,6 @@ func (qs *QSpace) Close() {
 
 func (qs *QSpace) cleanup(now time.Time) {
 	expiredValues := qs.cleanupValues(now)
-	qs.cleanupBroadcastGroups(now)
 
 	if len(expiredValues) == 0 {
 		return
@@ -323,7 +334,7 @@ func (qs *QSpace) cleanupValues(now time.Time) []string {
 			continue
 		}
 
-		if now.Sub(qvalue.CreatedAt) <= qvalue.TTL {
+		if now.Sub(time.Unix(0, qvalue.CreatedAt)) <= qvalue.TTL {
 			continue
 		}
 
@@ -332,28 +343,6 @@ func (qs *QSpace) cleanupValues(now time.Time) []string {
 	}
 
 	return expired
-}
-
-func (qs *QSpace) cleanupBroadcastGroups(now time.Time) {
-	qs.groupsMu.Lock()
-	defer qs.groupsMu.Unlock()
-
-	if qs.stopped.Load() {
-		return
-	}
-
-	for id, group := range qs.groups {
-		if group == nil {
-			continue
-		}
-
-		if !group.Expired(now) {
-			continue
-		}
-
-		group.Close()
-		delete(qs.groups, id)
-	}
 }
 
 func (qs *QSpace) shutdownState() {
@@ -386,15 +375,15 @@ func (qs *QSpace) shutdownState() {
 	qs.graphMu.Unlock()
 }
 
-func closedQValueChannel() chan *QValue {
-	resultChannel := make(chan *QValue)
+func closedQValueChannel() chan *QValue[any] {
+	resultChannel := make(chan *QValue[any], 1)
 
 	close(resultChannel)
 
 	return resultChannel
 }
 
-func qspaceDeliverWaiters(waiters []chan *QValue, qvalue *QValue) {
+func qspaceDeliverWaiters(waiters []chan *QValue[any], qvalue *QValue[any]) error {
 	for _, resultChannel := range waiters {
 		select {
 		case resultChannel <- qvalue:
@@ -403,6 +392,8 @@ func qspaceDeliverWaiters(waiters []chan *QValue, qvalue *QValue) {
 
 		close(resultChannel)
 	}
+
+	return nil
 }
 
 func qspaceAddEdge(

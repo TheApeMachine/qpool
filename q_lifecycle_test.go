@@ -62,7 +62,7 @@ func TestQCloseUnblocksBlockedSchedule(test *testing.T) {
 		})
 
 		scheduleEntered := make(chan struct{})
-		blockedResult := make(chan *QValue, 1)
+		blockedResult := make(chan *QValue[any], 1)
 
 		go func() {
 			close(scheduleEntered)
@@ -74,7 +74,7 @@ func TestQCloseUnblocksBlockedSchedule(test *testing.T) {
 			result, ok := <-resultChannel
 
 			if !ok {
-				blockedResult <- &QValue{Error: fmt.Errorf("result channel closed")}
+				blockedResult <- &QValue[any]{Error: fmt.Errorf("result channel closed")}
 
 				return
 			}

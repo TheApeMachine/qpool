@@ -89,7 +89,7 @@ func TestPeekResultReadsStoredJob(t *testing.T) {
 			return 77, nil
 		})
 
-		var res *QValue
+		var res *QValue[any]
 
 		select {
 		case <-time.After(2 * time.Second):

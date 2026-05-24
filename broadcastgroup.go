@@ -118,6 +118,13 @@ func (bg *BroadcastGroup) Send(qv *QValue[any]) {
 				return true
 			}
 
+			select {
+			case subscriber.Incoming <- qv:
+			default:
+				// Slow consumer: drop the frame instead of closing the channel.
+				// Closing would panic every later Send on that subscriber.
+			}
+
 			return true
 		})
 	}

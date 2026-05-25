@@ -2,7 +2,7 @@ module github.com/theapemachine/qpool
 
 go 1.26.1
 
-replace github.com/theapemachine/errnie => ../errnie
+// replace github.com/theapemachine/errnie => ../errnie
 
 require github.com/smartystreets/goconvey v1.8.1
 

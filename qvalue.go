@@ -12,6 +12,7 @@ QValue is a stored job result or broadcast payload with optional error metadata.
 type QValue[T any] struct {
 	SenderID   string
 	ReceiverID string
+	Type       string
 	Value      T
 	Error      error
 	CreatedAt  int64

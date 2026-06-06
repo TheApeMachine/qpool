@@ -75,7 +75,7 @@ func (q *Q[T]) waitDependencies(dependencyCtx context.Context, job Job) error {
 	}
 
 	var (
-		waitGroup atomicWaitGroup
+		waitGroup WaitGroup
 		firstErr  atomic.Pointer[error]
 	)
 

@@ -5,19 +5,19 @@ import (
 	"sync/atomic"
 )
 
-type atomicWaitGroup struct {
+type WaitGroup struct {
 	count atomic.Int64
 }
 
-func (wg *atomicWaitGroup) Add(delta int64) {
+func (wg *WaitGroup) Add(delta int64) {
 	wg.count.Add(delta)
 }
 
-func (wg *atomicWaitGroup) Done() {
+func (wg *WaitGroup) Done() {
 	wg.Add(-1)
 }
 
-func (wg *atomicWaitGroup) Wait() {
+func (wg *WaitGroup) Wait() {
 	for wg.count.Load() > 0 {
 		runtime.Gosched()
 	}

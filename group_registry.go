@@ -5,20 +5,20 @@ import (
 	"sync/atomic"
 )
 
-type groupRegistryEntry struct {
+type GroupRegistryEntry struct {
 	keyHash uint64
 	key     string
 	group   atomic.Pointer[BroadcastGroup]
-	next    atomic.Pointer[groupRegistryEntry]
+	next    atomic.Pointer[GroupRegistryEntry]
 }
 
-type lockfreeGroupRegistry struct {
+type GroupRegistry struct {
 	shards [registryShardCount]struct {
-		head atomic.Pointer[groupRegistryEntry]
+		head atomic.Pointer[GroupRegistryEntry]
 	}
 }
 
-func (registry *lockfreeGroupRegistry) store(key string, group *BroadcastGroup) {
+func (registry *GroupRegistry) store(key string, group *BroadcastGroup) {
 	if registry == nil || group == nil {
 		return
 	}
@@ -26,7 +26,7 @@ func (registry *lockfreeGroupRegistry) store(key string, group *BroadcastGroup) 
 	shard := &registry.shards[groupShardIndex(key)]
 	keyHash := fnvHash(key)
 
-	entry := &groupRegistryEntry{
+	entry := &GroupRegistryEntry{
 		keyHash: keyHash,
 		key:     key,
 	}
@@ -43,7 +43,7 @@ func (registry *lockfreeGroupRegistry) store(key string, group *BroadcastGroup) 
 	}
 }
 
-func (registry *lockfreeGroupRegistry) load(key string) *BroadcastGroup {
+func (registry *GroupRegistry) load(key string) *BroadcastGroup {
 	if registry == nil {
 		return nil
 	}
@@ -60,7 +60,7 @@ func (registry *lockfreeGroupRegistry) load(key string) *BroadcastGroup {
 	return nil
 }
 
-func (registry *lockfreeGroupRegistry) closeAll() {
+func (registry *GroupRegistry) closeAll() {
 	if registry == nil {
 		return
 	}

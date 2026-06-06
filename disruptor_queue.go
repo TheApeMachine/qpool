@@ -17,7 +17,6 @@ type disruptorWorkKind uint8
 const (
 	disruptorWorkNone disruptorWorkKind = iota
 	disruptorWorkJob
-	disruptorWorkFast
 )
 
 type jobDisruptorQueue struct {
@@ -25,7 +24,7 @@ type jobDisruptorQueue struct {
 	ring          []jobDisruptorSlot
 	mask          int64
 	pool          *Q[any]
-	listenWG      atomicWaitGroup
+	wg            *WaitGroup
 	closed        atomic.Bool
 	activeWorkers atomic.Int64
 }
@@ -34,13 +33,6 @@ type jobDisruptorSlot struct {
 	worker atomic.Int64
 	kind   disruptorWorkKind
 	job    Job
-	fast   fastDisruptorWork
-}
-
-type fastDisruptorWork struct {
-	ctx    context.Context
-	fn     func(context.Context) (interface{}, error)
-	result *resultSlot
 }
 
 type jobDisruptorHandler struct {
@@ -86,10 +78,10 @@ func newJobDisruptorQueue(
 	}
 
 	queue.disruptor = instance
-	queue.listenWG.Add(1)
+	queue.wg.Add(1)
 
 	go func() {
-		defer queue.listenWG.Done()
+		defer queue.wg.Done()
 		instance.Listen()
 	}()
 
@@ -105,21 +97,13 @@ func (queue *jobDisruptorQueue) setActiveWorkers(workers int64) {
 }
 
 func (queue *jobDisruptorQueue) publishJob(ctx context.Context, job Job) error {
-	return queue.publish(ctx, disruptorWorkJob, job, fastDisruptorWork{})
-}
-
-func (queue *jobDisruptorQueue) publishFast(
-	ctx context.Context,
-	work fastDisruptorWork,
-) error {
-	return queue.publish(ctx, disruptorWorkFast, Job{}, work)
+	return queue.publish(ctx, disruptorWorkJob, job)
 }
 
 func (queue *jobDisruptorQueue) publish(
 	ctx context.Context,
 	kind disruptorWorkKind,
 	job Job,
-	fast fastDisruptorWork,
 ) error {
 	if queue == nil || queue.disruptor == nil {
 		return fmt.Errorf("qpool: job queue unavailable")
@@ -150,7 +134,6 @@ func (queue *jobDisruptorQueue) publish(
 			slot.worker.Store(unassignedDisruptorWorker)
 			slot.kind = kind
 			slot.job = job
-			slot.fast = fast
 
 			if kind == disruptorWorkJob {
 				queue.pool.metrics.incJobQueued()
@@ -173,7 +156,7 @@ func (queue *jobDisruptorQueue) Close() {
 	}
 
 	_ = queue.disruptor.Close()
-	queue.listenWG.Wait()
+	queue.wg.Wait()
 }
 
 func (handler *jobDisruptorHandler) Handle(lowerSequence, upperSequence int64) {
@@ -185,17 +168,12 @@ func (handler *jobDisruptorHandler) Handle(lowerSequence, upperSequence int64) {
 			continue
 		}
 
-		switch slot.kind {
-		case disruptorWorkJob:
+		if slot.kind == disruptorWorkJob {
 			handler.handleJob(slot)
-
-		case disruptorWorkFast:
-			handler.handleFast(slot)
 		}
 
 		slot.kind = disruptorWorkNone
 		slot.job = Job{}
-		slot.fast = fastDisruptorWork{}
 	}
 }
 
@@ -208,31 +186,6 @@ func (handler *jobDisruptorHandler) handleJob(slot *jobDisruptorSlot) {
 
 		processJob(handler.queue.pool, handler.queue.pool.ctx, slot.job)
 	}()
-}
-
-func (handler *jobDisruptorHandler) handleFast(slot *jobDisruptorSlot) {
-	work := slot.fast
-
-	if work.result == nil {
-		return
-	}
-
-	result := work.result
-
-	if err := work.ctx.Err(); err != nil {
-		finishFast(result, nil, err)
-
-		return
-	}
-
-	if err := handler.queue.pool.ctx.Err(); err != nil {
-		finishFast(result, nil, fmt.Errorf("qpool: pool closed: %w", err))
-
-		return
-	}
-
-	value, err := invokeFastFnOnce(work.ctx, work.fn)
-	finishFast(result, value, err)
 }
 
 func (handler *jobDisruptorHandler) assignedWorker(
@@ -257,7 +210,6 @@ func (handler *jobDisruptorHandler) assignedWorker(
 func backoffDisruptorReservation(spin int) {
 	if spin < 64 {
 		runtime.Gosched()
-
 		return
 	}
 
@@ -270,6 +222,7 @@ func nextPowerOfTwo(value int) int {
 	}
 
 	power := 1
+
 	for power < value {
 		power <<= 1
 	}

@@ -7,26 +7,26 @@ import (
 
 const registryShardCount = 256
 
-type registryShard struct {
-	head atomic.Pointer[registryEntry]
+type RegistryShard struct {
+	head atomic.Pointer[RegistryEntry]
 }
 
-type registryEntry struct {
+type RegistryEntry struct {
 	keyHash  uint64
 	key      string
 	value    atomic.Pointer[resultSlot]
 	stored   atomic.Pointer[QValue[erasedAny]]
 	children atomic.Pointer[depEdge]
 	parents  atomic.Pointer[depEdge]
-	next     atomic.Pointer[registryEntry]
+	next     atomic.Pointer[RegistryEntry]
 }
 
-type lockfreeRegistry struct {
-	shards [registryShardCount]registryShard
+type Registry struct {
+	shards [registryShardCount]RegistryShard
 }
 
-func newLockfreeRegistry() *lockfreeRegistry {
-	return &lockfreeRegistry{}
+func NewRegistry() *Registry {
+	return &Registry{}
 }
 
 func registryShardIndex(key string) uint64 {
@@ -36,7 +36,7 @@ func registryShardIndex(key string) uint64 {
 	return hasher.Sum64() % registryShardCount
 }
 
-func (registry *lockfreeRegistry) find(key string) *registryEntry {
+func (registry *Registry) find(key string) *RegistryEntry {
 	if registry == nil {
 		return nil
 	}
@@ -53,7 +53,7 @@ func (registry *lockfreeRegistry) find(key string) *registryEntry {
 	return nil
 }
 
-func (registry *lockfreeRegistry) getOrCreate(key string) *registryEntry {
+func (registry *Registry) getOrCreate(key string) *RegistryEntry {
 	if registry == nil {
 		return nil
 	}
@@ -65,7 +65,7 @@ func (registry *lockfreeRegistry) getOrCreate(key string) *registryEntry {
 	shard := &registry.shards[registryShardIndex(key)]
 	keyHash := fnvHash(key)
 
-	newEntry := &registryEntry{
+	newEntry := &RegistryEntry{
 		keyHash: keyHash,
 		key:     key,
 	}
@@ -90,7 +90,7 @@ func (registry *lockfreeRegistry) getOrCreate(key string) *registryEntry {
 	}
 }
 
-func (registry *lockfreeRegistry) removeExpired(key string) {
+func (registry *Registry) removeExpired(key string) {
 	if registry == nil {
 		return
 	}
@@ -99,7 +99,7 @@ func (registry *lockfreeRegistry) removeExpired(key string) {
 	keyHash := fnvHash(key)
 
 	for {
-		prev := (*registryEntry)(nil)
+		prev := (*RegistryEntry)(nil)
 		entry := shard.head.Load()
 
 		for entry != nil {
@@ -127,7 +127,7 @@ func (registry *lockfreeRegistry) removeExpired(key string) {
 	}
 }
 
-func (registry *lockfreeRegistry) closeAll() {
+func (registry *Registry) closeAll() {
 	if registry == nil {
 		return
 	}

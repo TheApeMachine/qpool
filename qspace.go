@@ -16,8 +16,8 @@ type depEdge struct {
 QSpace stores job results, waits, broadcast groups, and dependency edges.
 */
 type QSpace struct {
-	entries         lockfreeRegistry
-	groups          lockfreeGroupRegistry
+	entries         Registry
+	groups          GroupRegistry
 	stopped         atomic.Bool
 	cleanupInterval time.Duration
 	maintDone       atomic.Bool
@@ -37,17 +37,21 @@ func NewQSpace() *QSpace {
 }
 
 func (qs *QSpace) loop() {
+	defer qs.maintDone.Store(true)
+
 	for !qs.stopped.Load() {
-		time.Sleep(qs.cleanupInterval)
+		deadline := time.Now().Add(qs.cleanupInterval)
+
+		for time.Now().Before(deadline) && !qs.stopped.Load() {
+			time.Sleep(10 * time.Millisecond)
+		}
 
 		if qs.stopped.Load() {
-			break
+			return
 		}
 
 		qs.cleanup(time.Now())
 	}
-
-	qs.maintDone.Store(true)
 }
 
 /*
@@ -180,11 +184,11 @@ func (qs *QSpace) AddRelationship(parentID, childID string) error {
 		return fmt.Errorf("qpool: space closed")
 	}
 
-	if qspaceWouldCreateCircle(&qs.entries, parentID, childID) {
+	if wouldCreateCircle(&qs.entries, parentID, childID) {
 		return fmt.Errorf("qpool: circular dependency detected")
 	}
 
-	qspaceAddEdge(&qs.entries, parentID, childID)
+	addEdge(&qs.entries, parentID, childID)
 
 	return nil
 }
@@ -197,7 +201,7 @@ func (qs *QSpace) RegisterDependent(depID, jobID string) {
 		return
 	}
 
-	qspaceAddEdge(&qs.entries, depID, jobID)
+	addEdge(&qs.entries, depID, jobID)
 }
 
 /*
@@ -272,12 +276,12 @@ func (qs *QSpace) cleanup(now time.Time) {
 
 			entry.stored.Store(nil)
 			qs.entries.removeExpired(entry.key)
-			qspacePruneEdges(&qs.entries, entry.key)
+			pruneEdges(&qs.entries, entry.key)
 		}
 	}
 }
 
-func qspaceAddEdge(registry *lockfreeRegistry, parentID, childID string) {
+func addEdge(registry *Registry, parentID, childID string) {
 	parent := registry.getOrCreate(parentID)
 	child := registry.getOrCreate(childID)
 
@@ -302,7 +306,7 @@ func depPush(head *atomic.Pointer[depEdge], id string) {
 	}
 }
 
-func qspacePruneEdges(registry *lockfreeRegistry, id string) {
+func pruneEdges(registry *Registry, id string) {
 	entry := registry.find(id)
 	if entry == nil {
 		return
@@ -354,7 +358,7 @@ func depRemove(head *atomic.Pointer[depEdge], id string) {
 	}
 }
 
-func qspaceWouldCreateCircle(registry *lockfreeRegistry, parentID, childID string) bool {
+func wouldCreateCircle(registry *Registry, parentID, childID string) bool {
 	visited := make(map[string]struct{})
 	stack := []string{childID}
 

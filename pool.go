@@ -42,10 +42,9 @@ type Q[T any] struct {
 	top         atomic.Pointer[node]
 	_p3         [cacheLinePadSize - unsafe.Sizeof(atomic.Pointer[dataItem[T]]{})]byte
 	workerCount uint64
-	deps        atomicWaitGroup
-	scalerWG    atomicWaitGroup
+	deps        *WaitGroup
+	scalerWG    *WaitGroup
 	jobQueue    *jobDisruptorQueue
-	fastQueue   *jobDisruptorQueue
 	stopping    atomic.Bool
 	minWorkers  int
 	maxWorkers  int
@@ -104,16 +103,7 @@ func NewQ[T any](ctx context.Context, minWorkers, maxWorkers int, config *Config
 		panic(err)
 	}
 
-	fastQueue, err := newJobDisruptorQueue(qAny(q), maxWorkers*16, maxWorkers)
-	if err != nil {
-		jobQueue.Close()
-		cancel()
-		panic(err)
-	}
-
 	q.jobQueue = jobQueue
-	q.fastQueue = fastQueue
-	q.fastQueue.setActiveWorkers(int64(maxWorkers))
 
 	for i := 0; i < minWorkers; i++ {
 		q.startWorker()

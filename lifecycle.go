@@ -167,10 +167,6 @@ func (pool *Q[T]) closePool() {
 		pool.jobQueue.Close()
 	}
 
-	if pool.fastQueue != nil {
-		pool.fastQueue.Close()
-	}
-
 	pool.deactivateWorkers()
 	pool.deps.Wait()
 	pool.scalerWG.Wait()

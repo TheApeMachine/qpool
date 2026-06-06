@@ -9,7 +9,7 @@ import (
 	"github.com/phuslu/log"
 )
 
-func processJob(q *Q, workerCtx context.Context, job Job) {
+func processJob(q *Q[any], workerCtx context.Context, job Job) {
 	deadline := q.schedulingTimeout()
 
 	if job.ExecTimeout > 0 {

@@ -35,7 +35,7 @@ func TestCircuitBreakerCacheGetOrCreate(test *testing.T) {
 func TestQBreakerForJob(test *testing.T) {
 	Convey("Given an admitted circuit breaker job", test, func() {
 		ctx := test.Context()
-		pool := NewQ(ctx, 1, 1, &Config{
+		pool := NewQ[any](ctx, 1, 1, &Config{
 			CircuitBreakerLimit: 1,
 			Scaler:              nil,
 		})

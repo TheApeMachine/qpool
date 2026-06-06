@@ -1,7 +1,6 @@
 package qpool
 
 import (
-	"context"
 	"fmt"
 	"sync"
 	"time"
@@ -11,7 +10,7 @@ import (
 
 type workerToken struct {
 	id     uint64
-	cancel context.CancelFunc
+	cancel func()
 }
 
 type workerRegistry struct {
@@ -74,24 +73,16 @@ func (registry *workerRegistry) remove(id uint64) {
 	registry.positions[lastToken.id] = index
 }
 
-func (pool *Q) startWorker() {
+func (pool *Q[any]) startWorker() {
 	if !pool.metrics.tryIncWorkerIfBelow(pool.maxWorkers) {
 		return
 	}
 
-	workerCtx, cancel := context.WithCancel(pool.ctx)
-
 	id := pool.nextWorker.Add(1)
-	token := &workerToken{id: id, cancel: cancel}
+	token := &workerToken{id: id, cancel: func() {}}
 
 	pool.registry.push(token)
-	pool.wg.Add(1)
-
-	go func() {
-		defer pool.wg.Done()
-
-		pool.runWorker(workerCtx, token)
-	}()
+	pool.jobQueue.setActiveWorkers(pool.metrics.workerCount.Load())
 
 	pool.publishTelemetry(Event{
 		Component: "qpool",
@@ -105,44 +96,7 @@ func (pool *Q) startWorker() {
 	})
 }
 
-func (pool *Q) runWorker(workerCtx context.Context, token *workerToken) {
-	defer pool.registry.remove(token.id)
-	defer pool.metrics.decWorkerCount()
-
-	for {
-		select {
-		case <-workerCtx.Done():
-			pool.publishTelemetry(Event{
-				Component: "qpool",
-				Op:        "worker-exit",
-				Message:   "worker exiting due to cancellation",
-				Time:      time.Now(),
-				Level:     log.DebugLevel,
-				Fields: []Field{
-					{Key: "worker", Value: token.id},
-				},
-			})
-
-			return
-
-		case job, ok := <-pool.jobCh:
-			if !ok {
-				return
-			}
-
-			pool.metrics.decJobQueued()
-			pool.metrics.incBusyWorker()
-
-			func() {
-				defer pool.metrics.decBusyWorker()
-
-				processJob(pool, workerCtx, job)
-			}()
-		}
-	}
-}
-
-func (pool *Q) scaleDownWorkers(count int) {
+func (pool *Q[any]) scaleDownWorkers(count int) {
 	for range count {
 		token := pool.registry.popLast()
 
@@ -151,13 +105,26 @@ func (pool *Q) scaleDownWorkers(count int) {
 		}
 
 		token.cancel()
+		pool.metrics.decWorkerCount()
+		pool.jobQueue.setActiveWorkers(pool.metrics.workerCount.Load())
+
+		pool.publishTelemetry(Event{
+			Component: "qpool",
+			Op:        "worker-exit",
+			Message:   "worker deactivated",
+			Time:      time.Now(),
+			Level:     log.DebugLevel,
+			Fields: []Field{
+				{Key: "worker", Value: token.id},
+			},
+		})
 	}
 }
 
 /*
-Close cancels workers and drains queued jobs with shutdown errors.
+Close cancels the pool and drains committed disruptor jobs with shutdown errors.
 */
-func (pool *Q) Close() {
+func (pool *Q[any]) Close() {
 	if pool == nil {
 		return
 	}
@@ -177,18 +144,17 @@ func (pool *Q) Close() {
 	}
 
 	pool.waitForScheduleLockDrain()
-	pool.wg.Wait()
-	pool.shutdownMu.Lock()
 
-	pool.closeJobOnce.Do(func() {
-		close(pool.jobCh)
-	})
-
-	for job := range pool.jobCh {
-		pool.space.StoreError(job.ID, fmt.Errorf("qpool: pool shut down"), job.TTL)
+	if pool.jobQueue != nil {
+		pool.jobQueue.Close()
 	}
 
-	pool.shutdownMu.Unlock()
+	if pool.fastQueue != nil {
+		pool.fastQueue.Close()
+	}
+
+	pool.deactivateWorkers()
+	pool.wg.Wait()
 	pool.space.Close()
 	pool.publishTelemetry(Event{
 		Component: "qpool",
@@ -199,8 +165,20 @@ func (pool *Q) Close() {
 	})
 }
 
-func (pool *Q) waitForScheduleLockDrain() {
+func (pool *Q[any]) waitForScheduleLockDrain() {
 	// Taking the write lock blocks until schedules already inside RLock exit.
 	pool.shutdownMu.Lock()
 	defer pool.shutdownMu.Unlock()
+}
+
+func (pool *Q[any]) deactivateWorkers() {
+	for {
+		token := pool.registry.popLast()
+		if token == nil {
+			return
+		}
+
+		token.cancel()
+		pool.metrics.decWorkerCount()
+	}
 }

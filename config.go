@@ -8,8 +8,9 @@ import (
 Config controls timeouts, admission regulators, queue buffering, and optional periodic scaling.
 */
 type Config struct {
-	SchedulingTimeout  time.Duration
-	Regulators         []Regulator
+	SchedulingTimeout time.Duration
+	Regulators        []Regulator
+	// JobChannelCapacity is the legacy name for scheduled-job disruptor capacity.
 	JobChannelCapacity int
 	// CircuitBreakerLimit bounds the per-pool circuit breaker LRU.
 	CircuitBreakerLimit int

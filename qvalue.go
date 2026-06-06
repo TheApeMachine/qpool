@@ -2,8 +2,6 @@ package qpool
 
 import (
 	"time"
-
-	"github.com/theapemachine/errnie"
 )
 
 /*
@@ -37,12 +35,5 @@ func NewQValue[T any](
 	}
 
 	// Value may be nil for error-only results; do not pass it to Require.
-	return value, errnie.Require(
-		map[string]any{
-			"SenderID":   value.SenderID,
-			"ReceiverID": value.ReceiverID,
-			"CreatedAt":  value.CreatedAt,
-			"TTL":        value.TTL,
-		},
-	)
+	return value, nil
 }

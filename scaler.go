@@ -11,7 +11,7 @@ import (
 Scaler periodically evaluates queue depth using atomic metrics and adjusts worker count.
 */
 type Scaler struct {
-	pool               *Q
+	pool               *Q[any]
 	minWorkers         int
 	maxWorkers         int
 	targetLoad         float64
@@ -146,7 +146,7 @@ func (s *Scaler) run() {
 /*
 NewScaler starts the scaler loop when cfg is non-nil.
 */
-func NewScaler(q *Q, minWorkers, maxWorkers int, config *ScalerConfig) *Scaler {
+func NewScaler(q *Q[any], minWorkers, maxWorkers int, config *ScalerConfig) *Scaler {
 	if config == nil {
 		return nil
 	}

@@ -12,7 +12,7 @@ executor. It returns the result directly on the returned channel and does not
 store results in QSpace, publish telemetry, apply retries, dependencies,
 regulators, circuit breakers, TTLs, or scaler accounting.
 */
-func (q *Q) ScheduleFast(
+func (q *Q[any]) ScheduleFast(
 	ctx context.Context,
 	fn func(context.Context) (any, error),
 ) chan *QValue[any] {
@@ -56,41 +56,35 @@ func (q *Q) ScheduleFast(
 		return resultChannel
 	}
 
-	if q.fastPool == nil {
+	if q.fastQueue == nil {
 		q.shutdownMu.RUnlock()
-		finishFast(resultChannel, nil, fmt.Errorf("qpool: fast executor unavailable"))
+		finishFast(resultChannel, nil, fmt.Errorf("qpool: disruptor queue unavailable"))
 
 		return resultChannel
 	}
 
-	q.wg.Add(1)
-	fastPool := q.fastPool
+	work := fastDisruptorWork{
+		ctx:    ctx,
+		fn:     fn,
+		result: resultChannel,
+	}
+
+	err := q.fastQueue.publishFast(ctx, work)
 	q.shutdownMu.RUnlock()
 
-	fastPool.Submit(func() {
-		defer q.wg.Done()
-
-		if err := ctx.Err(); err != nil {
-			finishFast(resultChannel, nil, err)
-
-			return
-		}
-
-		if err := q.ctx.Err(); err != nil {
-			finishFast(resultChannel, nil, fmt.Errorf("qpool: pool closed: %w", err))
-
-			return
-		}
-
-		value, err := invokeFastFnOnce(ctx, fn)
-		finishFast(resultChannel, value, err)
-	})
+	if err != nil {
+		finishFast(resultChannel, nil, fmt.Errorf("qpool: schedule fast job: %w", err))
+	}
 
 	return resultChannel
 }
 
 func finishFast(resultChannel chan *QValue[any], value any, err error) {
-	qvalue, err := NewQValue("", "", value, 0)
+	qvalue, qvalueErr := NewQValue("", "", value, 0)
+	if qvalueErr != nil {
+		err = qvalueErr
+	}
+
 	qvalue.Error = err
 	resultChannel <- qvalue
 	close(resultChannel)

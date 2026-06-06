@@ -14,7 +14,7 @@ func TestQPoolScheduleSimple(t *testing.T) {
 	Convey("Given a new Q pool", t, func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 
-		q := NewQ(ctx, 2, 5, &Config{
+		q := NewQ[any](ctx, 2, 5, &Config{
 			SchedulingTimeout: time.Second,
 			Scaler:            nil,
 		})
@@ -49,7 +49,7 @@ func TestQPoolTelemetryPublish(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		events := make(chan Event, 8)
 
-		q := NewQ(ctx, 1, 1, &Config{
+		q := NewQ[any](ctx, 1, 1, &Config{
 			SchedulingTimeout: time.Second,
 			Scaler:            nil,
 			TelemetryPublish: func(event Event) {
@@ -104,7 +104,7 @@ func TestSchedule_circuitBreakerOpenRejectsFurtherSchedules(t *testing.T) {
 			SchedulingTimeout: 5 * time.Second,
 		}
 
-		q := NewQ(ctx, 2, 2, poolConfig)
+		q := NewQ[any](ctx, 2, 2, poolConfig)
 
 		Reset(func() {
 			cancel()

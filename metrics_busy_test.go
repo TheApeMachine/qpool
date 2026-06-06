@@ -11,7 +11,7 @@ import (
 func TestMetrics_BusyWorkersDuringJob(t *testing.T) {
 	Convey("BusyWorkers tracks jobs in processJob", t, func() {
 		ctx := context.Background()
-		q := NewQ(ctx, 1, 2, &Config{Scaler: nil})
+		q := NewQ[any](ctx, 1, 2, &Config{Scaler: nil})
 
 		defer q.Close()
 

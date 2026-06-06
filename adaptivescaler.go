@@ -10,7 +10,7 @@ import (
 AdaptiveScalerRegulator implements Regulator by scaling the pool when Observed readings cross thresholds.
 */
 type AdaptiveScalerRegulator struct {
-	pool               *Q
+	pool               *Q[any]
 	minWorkers         int
 	maxWorkers         int
 	targetLoad         float64
@@ -25,7 +25,7 @@ type AdaptiveScalerRegulator struct {
 NewAdaptiveScalerRegulator constructs an adaptive scaler regulator.
 */
 func NewAdaptiveScalerRegulator(
-	pool *Q, minWorkers, maxWorkers int, config *ScalerConfig,
+	pool *Q[any], minWorkers, maxWorkers int, config *ScalerConfig,
 ) *AdaptiveScalerRegulator {
 	as := &AdaptiveScalerRegulator{
 		pool:               pool,

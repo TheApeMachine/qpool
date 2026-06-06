@@ -11,7 +11,7 @@ import (
 func TestQScheduleDependencyWaitDoesNotStarveWorkers(test *testing.T) {
 	Convey("Given a single-worker pool and a dependent job scheduled first", test, func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		pool := NewQ(ctx, 1, 1, &Config{
+		pool := NewQ[any](ctx, 1, 1, &Config{
 			SchedulingTimeout: time.Second,
 			Scaler:            nil,
 		})

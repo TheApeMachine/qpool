@@ -12,7 +12,7 @@ func BenchmarkQ_Schedule_simpleJob(b *testing.B) {
 	cfg.Scaler = nil
 	cfg.TelemetryPublish = func(Event) {}
 
-	q := NewQ(ctx, 4, 8, cfg)
+	q := NewQ[any](ctx, 4, 8, cfg)
 
 	defer q.Close()
 
@@ -43,7 +43,7 @@ func BenchmarkQ_Schedule_parallel(b *testing.B) {
 	cfg.Scaler = nil
 	cfg.TelemetryPublish = func(Event) {}
 
-	q := NewQ(ctx, 4, 8, cfg)
+	q := NewQ[any](ctx, 4, 8, cfg)
 
 	defer q.Close()
 
@@ -76,7 +76,7 @@ func BenchmarkQ_ScheduleFast_simpleJob(b *testing.B) {
 	cfg.Scaler = nil
 	cfg.TelemetryPublish = func(Event) {}
 
-	q := NewQ(ctx, 4, 8, cfg)
+	q := NewQ[any](ctx, 4, 8, cfg)
 
 	defer q.Close()
 
@@ -107,7 +107,7 @@ func BenchmarkQ_ScheduleFast_parallel(b *testing.B) {
 	cfg.Scaler = nil
 	cfg.TelemetryPublish = func(Event) {}
 
-	q := NewQ(ctx, 4, 8, cfg)
+	q := NewQ[any](ctx, 4, 8, cfg)
 
 	defer q.Close()
 

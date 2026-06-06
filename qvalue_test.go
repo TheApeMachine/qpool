@@ -22,7 +22,7 @@ func TestNewQValue(t *testing.T) {
 		So(time.Unix(0, value.CreatedAt).Before(time.Now().Add(time.Millisecond)), ShouldBeTrue)
 	})
 
-	Convey("When Value is nil for error-only results", func() {
+	Convey("When Value is nil for error-only results", t, func() {
 		value, err := NewQValue[any]("", "", nil, 0)
 
 		So(err, ShouldBeNil)

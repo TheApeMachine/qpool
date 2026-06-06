@@ -4,7 +4,10 @@ go 1.26.1
 
 // replace github.com/theapemachine/errnie => ../errnie
 
-require github.com/smartystreets/goconvey v1.8.1
+require (
+	github.com/smarty/go-disruptor v0.5.0
+	github.com/smartystreets/goconvey v1.8.1
+)
 
 require (
 	github.com/andybalholm/brotli v1.2.1 // indirect

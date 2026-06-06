@@ -68,7 +68,7 @@ Renormalize is a no-op.
 func (lb *LoadBalancer) Renormalize() {}
 
 /*
-SelectWorker is retained for API compatibility; routing uses the shared job channel.
+SelectWorker is retained for API compatibility; routing uses the shared disruptor.
 */
 func (lb *LoadBalancer) SelectWorker() (int, error) {
 	read := lb.lastReading.Load()
@@ -84,14 +84,14 @@ func (lb *LoadBalancer) SelectWorker() (int, error) {
 }
 
 /*
-RecordJobStart is a no-op under channel-based dispatch.
+RecordJobStart is a no-op under disruptor-based dispatch.
 */
 func (lb *LoadBalancer) RecordJobStart(workerID int) {
 	_ = workerID
 }
 
 /*
-RecordJobComplete is a no-op under channel-based dispatch.
+RecordJobComplete is a no-op under disruptor-based dispatch.
 */
 func (lb *LoadBalancer) RecordJobComplete(workerID int, duration time.Duration) {
 	_ = workerID

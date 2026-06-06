@@ -1,3 +1,5 @@
+//go:build !go1.26
+
 #include "go_asm.h"
 #include "go_tls.h"
 #include "textflag.h"

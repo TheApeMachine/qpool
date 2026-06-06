@@ -14,7 +14,7 @@ func TestQScheduleJobLifecycle(t *testing.T) {
 
 		defer cancel()
 
-		q := NewQ(ctx, 2, 5, &Config{
+		q := NewQ[any](ctx, 2, 5, &Config{
 			SchedulingTimeout: time.Second,
 			Scaler:            nil,
 		})
@@ -56,7 +56,7 @@ func TestQScheduleRegulatorRejects(t *testing.T) {
 		cfg.Scaler = nil
 		cfg.Regulators = []Regulator{NewRateLimiter(0, time.Hour)}
 
-		q := NewQ(ctx, 1, 2, cfg)
+		q := NewQ[any](ctx, 1, 2, cfg)
 
 		defer q.Close()
 
@@ -81,7 +81,7 @@ func TestPeekResultReadsStoredJob(t *testing.T) {
 
 		defer cancel()
 
-		q := NewQ(ctx, 1, 2, &Config{Scaler: nil})
+		q := NewQ[any](ctx, 1, 2, &Config{Scaler: nil})
 
 		defer q.Close()
 
@@ -115,7 +115,7 @@ func TestDependencyFailureStoresError(t *testing.T) {
 
 		defer cancel()
 
-		q := NewQ(ctx, 1, 2, &Config{Scaler: nil})
+		q := NewQ[any](ctx, 1, 2, &Config{Scaler: nil})
 
 		defer q.Close()
 

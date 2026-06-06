@@ -77,7 +77,7 @@ func (cache *circuitBreakerCache) evictOverflow() {
 	}
 }
 
-func (pool *Q) breakerFor(job *Job) *CircuitBreaker {
+func (pool *Q[any]) breakerFor(job *Job) *CircuitBreaker {
 	if pool.breakers == nil {
 		return nil
 	}
@@ -85,7 +85,7 @@ func (pool *Q) breakerFor(job *Job) *CircuitBreaker {
 	return pool.breakers.getOrCreate(job.CircuitID, job.CircuitConfig)
 }
 
-func (pool *Q) breakerForJob(job *Job) *CircuitBreaker {
+func (pool *Q[any]) breakerForJob(job *Job) *CircuitBreaker {
 	if job.circuitBreaker != nil {
 		return job.circuitBreaker
 	}

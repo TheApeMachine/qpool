@@ -1,3 +1,5 @@
+//go:build !go1.26
+
 #include "textflag.h"
 
 TEXT ·GetG(SB), NOSPLIT, $0-8

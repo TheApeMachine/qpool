@@ -6,41 +6,56 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/phuslu/log"
 )
 
+type (
+	slotFunc[T any] struct {
+		threadPtr unsafe.Pointer
+		data      T
+	}
+
+	dataItem[T any] struct {
+		next  atomic.Pointer[dataItem[T]]
+		value *slotFunc[T]
+	}
+)
+
 /*
-Q combines a buffered job queue, fixed worker set, optional regulators, and result tracking via QSpace.
+Q combines a disruptor-backed job queue, fixed worker set, optional regulators, and result tracking via QSpace.
 */
-type Q struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
-
-	jobCh        chan Job
-	shutdownMu   sync.RWMutex
-	stopping     atomic.Bool
-	closeJobOnce sync.Once
-	minWorkers   int
-	maxWorkers   int
-
-	space   *QSpace
-	scaler  *Scaler
-	metrics *Metrics
-
+type Q[T any] struct {
+	ctx        context.Context
+	cancel     context.CancelFunc
+	_p1        [cacheLinePadSize - unsafe.Sizeof(uint64(0))]byte
+	alloc      func() any
+	free       func(any)
+	task       func(T)
+	_p2        [cacheLinePadSize - unsafe.Sizeof(uint64(0)) - 3*unsafe.Sizeof(func() {})]byte
+	top        atomic.Pointer[dataItem[T]]
+	_p3        [cacheLinePadSize - unsafe.Sizeof(atomic.Pointer[dataItem[T]]{})]byte
+	wg         sync.WaitGroup
+	jobQueue   *jobDisruptorQueue
+	fastQueue  *jobDisruptorQueue
+	shutdownMu sync.RWMutex
+	stopping   atomic.Bool
+	minWorkers int
+	maxWorkers int
+	space      *QSpace
+	scaler     *Scaler
+	metrics    *Metrics
 	breakers   *circuitBreakerCache
 	registry   *workerRegistry
 	nextWorker atomic.Uint64
-	fastPool   *Pool
-
-	config *Config
+	config     *Config
 }
 
 /*
-NewQ constructs a pool with minWorkers..maxWorkers goroutines competing on a shared job channel.
+NewQ constructs a pool with minWorkers..maxWorkers active disruptor workers.
 */
-func NewQ(ctx context.Context, minWorkers, maxWorkers int, config *Config) *Q {
+func NewQ[T any](ctx context.Context, minWorkers, maxWorkers int, config *Config) *Q[T] {
 	if config == nil {
 		config = NewConfig()
 	}
@@ -65,19 +80,34 @@ func NewQ(ctx context.Context, minWorkers, maxWorkers int, config *Config) *Q {
 		capacity = config.JobChannelCapacity
 	}
 
-	q := &Q{
+	q := &Q[T]{
 		ctx:        ctx,
 		cancel:     cancel,
-		jobCh:      make(chan Job, capacity),
 		minWorkers: minWorkers,
 		maxWorkers: maxWorkers,
 		space:      NewQSpace(),
 		metrics:    NewMetrics(),
 		breakers:   newCircuitBreakerCache(config.CircuitBreakerLimit),
 		registry:   newWorkerRegistry(),
-		fastPool:   NewPool(uint64(maxWorkers)),
 		config:     config,
 	}
+
+	jobQueue, err := newJobDisruptorQueue(q, capacity, maxWorkers)
+	if err != nil {
+		cancel()
+		panic(err)
+	}
+
+	fastQueue, err := newJobDisruptorQueue(q, maxWorkers*16, maxWorkers)
+	if err != nil {
+		jobQueue.Close()
+		cancel()
+		panic(err)
+	}
+
+	q.jobQueue = jobQueue
+	q.fastQueue = fastQueue
+	q.fastQueue.setActiveWorkers(int64(maxWorkers))
 
 	for i := 0; i < minWorkers; i++ {
 		q.startWorker()
@@ -94,7 +124,7 @@ func NewQ(ctx context.Context, minWorkers, maxWorkers int, config *Config) *Q {
 MetricSnapshot returns a point-in-time copy of atomic pool counters (workers,
 busy workers, queue depth, and regulator-facing fields).
 */
-func (q *Q) MetricSnapshot() MetricReading {
+func (q *Q[T]) MetricSnapshot() MetricReading {
 	if q == nil {
 		return MetricReading{}
 	}
@@ -107,7 +137,7 @@ func (q *Q) MetricSnapshot() MetricReading {
 /*
 WorkerBounds returns the configured minimum and maximum worker goroutine counts.
 */
-func (q *Q) WorkerBounds() (minWorkers, maxWorkers int) {
+func (q *Q[T]) WorkerBounds() (minWorkers, maxWorkers int) {
 	if q == nil {
 		return 0, 0
 	}
@@ -120,11 +150,11 @@ PeriodicScalerConfigured reports whether NewQ wired the built-in
 interval scaler. Adaptive admission regulators may resize the pool
 independently; those are not mirrored here.
 */
-func (q *Q) PeriodicScalerConfigured() bool {
+func (q *Q[T]) PeriodicScalerConfigured() bool {
 	return q != nil && q.config != nil && q.config.Scaler != nil
 }
 
-func (q *Q) publishTelemetry(ev Event) {
+func (q *Q[T]) publishTelemetry(ev Event) {
 	if q != nil && q.config != nil && q.config.TelemetryPublish != nil {
 		q.config.TelemetryPublish(ev)
 
@@ -144,9 +174,9 @@ func (q *Q) schedulingTimeout() time.Duration {
 
 func errorFuture(err error) chan *QValue[any] {
 	ch := make(chan *QValue[any], 1)
-	qv, err := NewQValue[any]("", "", nil, 0)
+	qv, qvalueErr := NewQValue[any]("", "", nil, 0)
 
-	if err != nil {
+	if qvalueErr != nil {
 		return nil
 	}
 
@@ -158,7 +188,7 @@ func errorFuture(err error) chan *QValue[any] {
 	return ch
 }
 
-func (q *Q) scheduleDoneError(ctx context.Context) (error, bool) {
+func (q *Q[T]) scheduleDoneError(ctx context.Context) (error, bool) {
 	if err := q.ctx.Err(); err != nil {
 		return fmt.Errorf("qpool: pool closed: %w", err), false
 	}
@@ -166,7 +196,7 @@ func (q *Q) scheduleDoneError(ctx context.Context) (error, bool) {
 	return fmt.Errorf("job scheduling timeout: %w", ctx.Err()), true
 }
 
-func (q *Q) enqueueJob(ctx context.Context, job Job) error {
+func (q *Q[T]) enqueueJob(ctx context.Context, job Job) error {
 	if q.stopping.Load() {
 		return fmt.Errorf("qpool: pool closed")
 	}
@@ -182,30 +212,32 @@ func (q *Q) enqueueJob(ctx context.Context, job Job) error {
 		return fmt.Errorf("qpool: pool closed: %w", err)
 	}
 
-	select {
-	case <-q.ctx.Done():
-		return fmt.Errorf("qpool: pool closed: %w", q.ctx.Err())
-	case q.jobCh <- job:
-		q.publishTelemetry(Event{
-			Component: "qpool",
-			Op:        "schedule",
-			Message:   fmt.Sprintf("job scheduled: %s", job.ID),
-			Time:      time.Now(),
-			Level:     log.InfoLevel,
-		})
-
-		q.metrics.incJobQueued()
-
-		return nil
-	case <-ctx.Done():
-		err, schedulingFailure := q.scheduleDoneError(ctx)
-
-		if schedulingFailure {
-			q.metrics.incSchedulingFailure()
+	if err := q.jobQueue.publishJob(ctx, job); err != nil {
+		if q.ctx.Err() != nil {
+			return fmt.Errorf("qpool: pool closed: %w", q.ctx.Err())
 		}
 
-		return err
+		if ctx.Err() != nil {
+			err, schedulingFailure := q.scheduleDoneError(ctx)
+			if schedulingFailure {
+				q.metrics.incSchedulingFailure()
+			}
+
+			return err
+		}
+
+		return fmt.Errorf("qpool: schedule job: %w", err)
 	}
+
+	q.publishTelemetry(Event{
+		Component: "qpool",
+		Op:        "schedule",
+		Message:   fmt.Sprintf("job scheduled: %s", job.ID),
+		Time:      time.Now(),
+		Level:     log.InfoLevel,
+	})
+
+	return nil
 }
 
 /*
@@ -215,11 +247,11 @@ the result key until TTL expires — reuse the same id for a logically new piece
 of work while older results remain queued and callers will unblock with the
 stale completion first unless result cleanup removed it first.
 */
-func (q *Q) Schedule(
+func (q *Q[T]) Schedule(
 	id string,
-	fn func(context.Context) (any, error),
+	fn func(context.Context) (T, error),
 	opts ...JobOption,
-) chan *QValue[any] {
+) chan *QValue[T] {
 	ctx, cancel := context.WithTimeout(q.ctx, q.schedulingTimeout())
 	defer cancel()
 
@@ -289,14 +321,14 @@ func (q *Q) Schedule(
 /*
 CreateBroadcastGroup allocates a group stored inside QSpace.
 */
-func (q *Q) CreateBroadcastGroup(id string, ttl time.Duration) *BroadcastGroup {
+func (q *Q[T]) CreateBroadcastGroup(id string, ttl time.Duration) *BroadcastGroup {
 	return q.space.CreateBroadcastGroup(id, ttl)
 }
 
 /*
 Subscribe returns the broadcast group's subscriber channel for groupID.
 */
-func (q *Q) Subscribe(groupID string) chan *QValue[any] {
+func (q *Q[T]) Subscribe(groupID string) chan *QValue[T] {
 	return q.space.Subscribe(groupID)
 }
 
@@ -308,7 +340,7 @@ the query (including during shutdown). The returned *QValue points at a new stru
 value copied from the actor's map entry; see QSpace.PeekResult for concurrency and
 read-only semantics versus nested reference fields in QValue.
 */
-func (q *Q) PeekResult(id string) (*QValue[any], bool) {
+func (q *Q[T]) PeekResult(id string) (*QValue[T], bool) {
 	if q == nil {
 		return nil, false
 	}

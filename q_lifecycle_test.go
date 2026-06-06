@@ -31,9 +31,9 @@ func TestWorkerRegistryPushPopRemove(test *testing.T) {
 }
 
 func TestQCloseUnblocksBlockedSchedule(test *testing.T) {
-	Convey("Given a Q pool with a full job channel", test, func() {
+	Convey("Given a Q pool with a full scheduled-job disruptor queue", test, func() {
 		ctx, cancel := context.WithCancel(context.Background())
-		pool := NewQ(ctx, 1, 1, &Config{
+		pool := NewQ[any](ctx, 1, 1, &Config{
 			SchedulingTimeout:  5 * time.Second,
 			JobChannelCapacity: 1,
 			Scaler:             nil,

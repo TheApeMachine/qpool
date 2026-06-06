@@ -9,7 +9,7 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-func (q *Q) startDependencyWait(job Job) error {
+func (q *Q[any]) startDependencyWait(job Job) error {
 	q.shutdownMu.RLock()
 	defer q.shutdownMu.RUnlock()
 
@@ -28,7 +28,7 @@ func (q *Q) startDependencyWait(job Job) error {
 	return nil
 }
 
-func (q *Q) resolveDependentJob(job Job) {
+func (q *Q[any]) resolveDependentJob(job Job) {
 	defer q.wg.Done()
 
 	if err := q.waitDependencies(q.ctx, job); err != nil {
@@ -45,7 +45,7 @@ func (q *Q) resolveDependentJob(job Job) {
 	}
 }
 
-func (q *Q) recordDependencyFailure(job Job, err error) {
+func (q *Q[any]) recordDependencyFailure(job Job, err error) {
 	latency := time.Since(job.StartTime)
 	q.metrics.RecordJobOutcome(latency, false)
 
@@ -72,7 +72,7 @@ func (q *Q) recordDependencyFailure(job Job, err error) {
 	q.space.StoreError(job.ID, err, job.TTL)
 }
 
-func (q *Q) waitDependencies(dependencyCtx context.Context, job Job) error {
+func (q *Q[any]) waitDependencies(dependencyCtx context.Context, job Job) error {
 	if len(job.Dependencies) == 0 {
 		return nil
 	}
@@ -118,7 +118,7 @@ func dependencyAwaitTimeout(policy *RetryPolicy, strategy RetryStrategy) time.Du
 	return base
 }
 
-func (q *Q) waitOneDependency(
+func (q *Q[any]) waitOneDependency(
 	dependencyCtx context.Context,
 	job Job,
 	dependencyID string,

@@ -175,8 +175,8 @@ func (qs *QSpace) StoreError(id string, err error, ttl time.Duration) {
 		return
 	}
 
-	qvalue, err := NewQValue[any]("", "", nil, 0)
-	if err != nil {
+	qvalue, qvalueErr := NewQValue[any]("", "", nil, 0)
+	if qvalueErr != nil {
 		return
 	}
 

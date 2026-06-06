@@ -20,11 +20,15 @@ func BenchmarkQ_Schedule_simpleJob(b *testing.B) {
 	b.ResetTimer()
 
 	for range b.N {
-		ch := q.Schedule("bench", func(ctx context.Context) (any, error) {
+		wait := q.Schedule("bench", func(ctx context.Context) (any, error) {
 			return 1, nil
 		})
 
-		qv := <-ch
+		qv, err := wait.Get(ctx)
+
+		if err != nil {
+			b.Fatalf("unexpected wait error: %v", err)
+		}
 
 		if qv == nil {
 			b.Fatal("unexpected nil QValue")
@@ -52,11 +56,15 @@ func BenchmarkQ_Schedule_parallel(b *testing.B) {
 
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			ch := q.Schedule("bench", func(ctx context.Context) (any, error) {
+			wait := q.Schedule("bench", func(ctx context.Context) (any, error) {
 				return 1, nil
 			})
 
-			qv := <-ch
+			qv, err := wait.Get(ctx)
+
+			if err != nil {
+				b.Fatalf("unexpected wait error: %v", err)
+			}
 
 			if qv == nil {
 				b.Fatal("unexpected nil QValue")
@@ -84,11 +92,15 @@ func BenchmarkQ_ScheduleFast_simpleJob(b *testing.B) {
 	b.ResetTimer()
 
 	for range b.N {
-		ch := q.ScheduleFast(ctx, func(ctx context.Context) (any, error) {
+		wait := q.ScheduleFast(ctx, func(ctx context.Context) (any, error) {
 			return 1, nil
 		})
 
-		qv := <-ch
+		qv, err := wait.Get(ctx)
+
+		if err != nil {
+			b.Fatalf("unexpected wait error: %v", err)
+		}
 
 		if qv == nil {
 			b.Fatal("unexpected nil QValue")
@@ -116,11 +128,15 @@ func BenchmarkQ_ScheduleFast_parallel(b *testing.B) {
 
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			ch := q.ScheduleFast(ctx, func(ctx context.Context) (any, error) {
+			wait := q.ScheduleFast(ctx, func(ctx context.Context) (any, error) {
 				return 1, nil
 			})
 
-			qv := <-ch
+			qv, err := wait.Get(ctx)
+
+			if err != nil {
+				b.Fatalf("unexpected wait error: %v", err)
+			}
 
 			if qv == nil {
 				b.Fatal("unexpected nil QValue")

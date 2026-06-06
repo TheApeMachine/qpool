@@ -3,7 +3,6 @@ package qpool
 import (
 	"context"
 	"fmt"
-	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -36,10 +35,10 @@ type Q[T any] struct {
 	_p2        [cacheLinePadSize - unsafe.Sizeof(uint64(0)) - 3*unsafe.Sizeof(func() {})]byte
 	top        atomic.Pointer[dataItem[T]]
 	_p3        [cacheLinePadSize - unsafe.Sizeof(atomic.Pointer[dataItem[T]]{})]byte
-	wg         sync.WaitGroup
+	deps       atomicWaitGroup
+	scalerWG   atomicWaitGroup
 	jobQueue   *jobDisruptorQueue
 	fastQueue  *jobDisruptorQueue
-	shutdownMu sync.RWMutex
 	stopping   atomic.Bool
 	minWorkers int
 	maxWorkers int
@@ -92,13 +91,13 @@ func NewQ[T any](ctx context.Context, minWorkers, maxWorkers int, config *Config
 		config:     config,
 	}
 
-	jobQueue, err := newJobDisruptorQueue(q, capacity, maxWorkers)
+	jobQueue, err := newJobDisruptorQueue(qAny(q), capacity, maxWorkers)
 	if err != nil {
 		cancel()
 		panic(err)
 	}
 
-	fastQueue, err := newJobDisruptorQueue(q, maxWorkers*16, maxWorkers)
+	fastQueue, err := newJobDisruptorQueue(qAny(q), maxWorkers*16, maxWorkers)
 	if err != nil {
 		jobQueue.Close()
 		cancel()
@@ -114,10 +113,17 @@ func NewQ[T any](ctx context.Context, minWorkers, maxWorkers int, config *Config
 	}
 
 	if config.Scaler != nil {
-		q.scaler = NewScaler(q, minWorkers, maxWorkers, config.Scaler)
+		q.scaler = NewScaler(qAny(q), minWorkers, maxWorkers, config.Scaler)
 	}
 
 	return q
+}
+
+/*
+Close shuts down the pool.
+*/
+func (q *Q[T]) Close() {
+	q.closePool()
 }
 
 /*
@@ -164,28 +170,12 @@ func (q *Q[T]) publishTelemetry(ev Event) {
 	Publish(ev)
 }
 
-func (q *Q) schedulingTimeout() time.Duration {
+func (q *Q[T]) schedulingTimeout() time.Duration {
 	if q.config != nil && q.config.SchedulingTimeout > 0 {
 		return q.config.SchedulingTimeout
 	}
 
 	return 5 * time.Second
-}
-
-func errorFuture(err error) chan *QValue[any] {
-	ch := make(chan *QValue[any], 1)
-	qv, qvalueErr := NewQValue[any]("", "", nil, 0)
-
-	if qvalueErr != nil {
-		return nil
-	}
-
-	qv.Error = err
-	ch <- qv
-
-	close(ch)
-
-	return ch
 }
 
 func (q *Q[T]) scheduleDoneError(ctx context.Context) (error, bool) {
@@ -200,9 +190,6 @@ func (q *Q[T]) enqueueJob(ctx context.Context, job Job) error {
 	if q.stopping.Load() {
 		return fmt.Errorf("qpool: pool closed")
 	}
-
-	q.shutdownMu.RLock()
-	defer q.shutdownMu.RUnlock()
 
 	if q.stopping.Load() {
 		return fmt.Errorf("qpool: pool closed")
@@ -242,7 +229,7 @@ func (q *Q[T]) enqueueJob(ctx context.Context, job Job) error {
 
 /*
 Schedule enqueues a job when regulators and optional circuit breaker permit.
-Results arrive on the returned channel backed by QSpace. The job id doubles as
+Results arrive on the returned lock-free handle backed by QSpace. The job id doubles as
 the result key until TTL expires — reuse the same id for a logically new piece
 of work while older results remain queued and callers will unblock with the
 stale completion first unless result cleanup removed it first.
@@ -251,15 +238,17 @@ func (q *Q[T]) Schedule(
 	id string,
 	fn func(context.Context) (T, error),
 	opts ...JobOption,
-) chan *QValue[T] {
+) *ResultWait[T] {
 	ctx, cancel := context.WithTimeout(q.ctx, q.schedulingTimeout())
 	defer cancel()
 
 	startTime := time.Now()
 
 	job := Job{
-		ID:        id,
-		Fn:        fn,
+		ID: id,
+		Fn: func(ctx context.Context) (any, error) {
+			return fn(ctx)
+		},
 		StartTime: startTime,
 		RetryPolicy: &RetryPolicy{
 			MaxAttempts: 1,
@@ -282,7 +271,7 @@ func (q *Q[T]) Schedule(
 			if reg.Limit() {
 				q.metrics.incThrottled()
 
-				return errorFuture(fmt.Errorf("qpool: regulator rejected schedule"))
+				return errorResultWait[T](fmt.Errorf("qpool: regulator rejected schedule"))
 			}
 		}
 	}
@@ -291,7 +280,7 @@ func (q *Q[T]) Schedule(
 		breaker := q.breakerFor(&job)
 
 		if breaker != nil && !breaker.Allow() {
-			return errorFuture(fmt.Errorf("circuit breaker %s is open", job.CircuitID))
+			return errorResultWait[T](fmt.Errorf("circuit breaker %s is open", job.CircuitID))
 		}
 
 		if breaker != nil {
@@ -300,22 +289,22 @@ func (q *Q[T]) Schedule(
 	}
 
 	if q.stopping.Load() {
-		return errorFuture(fmt.Errorf("qpool: pool closed"))
+		return errorResultWait[T](fmt.Errorf("qpool: pool closed"))
 	}
 
 	if len(job.Dependencies) > 0 {
 		if err := q.startDependencyWait(job); err != nil {
-			return errorFuture(err)
+			return errorResultWait[T](err)
 		}
 
-		return q.space.Await(id)
+		return typedResultWait[T](q.space.Await(id))
 	}
 
 	if err := q.enqueueJob(ctx, job); err != nil {
-		return errorFuture(err)
+		return errorResultWait[T](err)
 	}
 
-	return q.space.Await(id)
+	return typedResultWait[T](q.space.Await(id))
 }
 
 /*
@@ -326,9 +315,9 @@ func (q *Q[T]) CreateBroadcastGroup(id string, ttl time.Duration) *BroadcastGrou
 }
 
 /*
-Subscribe returns the broadcast group's subscriber channel for groupID.
+Subscribe returns the broadcast group's lock-free consumer for groupID.
 */
-func (q *Q[T]) Subscribe(groupID string) chan *QValue[T] {
+func (q *Q[T]) Subscribe(groupID string) *BroadcastConsumer {
 	return q.space.Subscribe(groupID)
 }
 
@@ -345,7 +334,9 @@ func (q *Q[T]) PeekResult(id string) (*QValue[T], bool) {
 		return nil, false
 	}
 
-	return q.space.PeekResult(id)
+	v, ok := q.space.PeekResult(id)
+
+	return qValuePtr[T](v), ok
 }
 
 /*

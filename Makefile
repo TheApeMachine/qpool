@@ -1,9 +1,12 @@
 .PHONY: test bench
 
-# The pool package uses go:linkname to access runtime scheduling
-# primitives (dropg, readgstatus) for zero-overhead goroutine parking.
-# Go 1.26 restricts these by default; -checklinkname=0 preserves access.
-LDFLAGS := -ldflags='-checklinkname=0'
+# qpool uses go:linkname runtime hooks; Go 1.26+ needs this when linking symm.
+# export GOFLAGS so make targets and nested go/cgo subprocesses inherit the flag.
+# Outside Make, run: export GOFLAGS=-ldflags=-checklinkname=0
+# No inner quotes: a single shell layer passes the flag through unambiguously.
+export GOFLAGS := -ldflags=-checklinkname=0
+
+LDFLAGS := $(GOFLAGS)
 
 test:
 	go test $(LDFLAGS) -v ./...

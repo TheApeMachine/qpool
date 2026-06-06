@@ -3,30 +3,24 @@ package qpool
 import (
 	"context"
 	"fmt"
-	"sync"
 	"sync/atomic"
 	"time"
 )
+
+type depEdge struct {
+	id   string
+	next atomic.Pointer[depEdge]
+}
 
 /*
 QSpace stores job results, waits, broadcast groups, and dependency edges.
 */
 type QSpace struct {
-	valuesMu sync.RWMutex
-	values   map[string]*QValue[any]
-	waiting  map[string][]chan *QValue[any]
-
-	groupsMu sync.RWMutex
-	groups   map[string]*BroadcastGroup
-
-	graphMu  sync.RWMutex
-	children map[string]map[string]struct{}
-	parents  map[string]map[string]struct{}
-
-	cleanupInterval time.Duration
-	shutdown        chan struct{}
-	done            chan struct{}
+	entries         lockfreeRegistry
+	groups          lockfreeGroupRegistry
 	stopped         atomic.Bool
+	cleanupInterval time.Duration
+	maintDone       atomic.Bool
 }
 
 /*
@@ -34,14 +28,7 @@ NewQSpace starts the expiration loop.
 */
 func NewQSpace() *QSpace {
 	qspace := &QSpace{
-		values:          make(map[string]*QValue[any]),
-		waiting:         make(map[string][]chan *QValue[any]),
-		groups:          make(map[string]*BroadcastGroup),
-		children:        make(map[string]map[string]struct{}),
-		parents:         make(map[string]map[string]struct{}),
 		cleanupInterval: time.Minute,
-		shutdown:        make(chan struct{}),
-		done:            make(chan struct{}),
 	}
 
 	go qspace.loop()
@@ -50,22 +37,17 @@ func NewQSpace() *QSpace {
 }
 
 func (qs *QSpace) loop() {
-	defer close(qs.done)
+	for !qs.stopped.Load() {
+		time.Sleep(qs.cleanupInterval)
 
-	ticker := time.NewTicker(qs.cleanupInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			qs.cleanup(time.Now())
-
-		case <-qs.shutdown:
-			qs.shutdownState()
-
-			return
+		if qs.stopped.Load() {
+			break
 		}
+
+		qs.cleanup(time.Now())
 	}
+
+	qs.maintDone.Store(true)
 }
 
 /*
@@ -83,66 +65,64 @@ func (qs *QSpace) Store(id string, value interface{}, ttl time.Duration) {
 
 	qvalue.TTL = ttl
 
-	qs.valuesMu.Lock()
-	defer qs.valuesMu.Unlock()
-
-	if qs.stopped.Load() {
+	entry := qs.entries.getOrCreate(id)
+	if entry == nil || qs.stopped.Load() {
 		return
 	}
 
-	qs.values[id] = qvalue
-	waiters := qs.waiting[id]
-	delete(qs.waiting, id)
+	entry.stored.Store(qvalue)
 
-	qspaceDeliverWaiters(waiters, qvalue)
+	if slot := entry.value.Load(); slot != nil {
+		slot.Deliver(qvalue)
+	}
 }
 
 /*
-Await returns a channel that receives exactly one *QValue for id.
+Await registers a lock-free waiter for id.
 */
-func (qs *QSpace) Await(id string) chan *QValue[any] {
+func (qs *QSpace) Await(id string) *ResultWait[erasedAny] {
 	if qs.stopped.Load() {
-		return closedQValueChannel()
+		return errorResultWait[erasedAny](errResultClosed)
 	}
 
-	resultChannel := make(chan *QValue[any], 1)
-
-	qs.valuesMu.Lock()
-	defer qs.valuesMu.Unlock()
-
-	if qs.stopped.Load() {
-		close(resultChannel)
-
-		return resultChannel
+	entry := qs.entries.getOrCreate(id)
+	if entry == nil || qs.stopped.Load() {
+		return errorResultWait[erasedAny](errResultClosed)
 	}
 
-	if qvalue, ok := qs.values[id]; ok {
-		resultChannel <- qvalue
-		close(resultChannel)
-
-		return resultChannel
+	if stored := entry.stored.Load(); stored != nil {
+		return readyResultWait[erasedAny](stored)
 	}
 
-	qs.waiting[id] = append(qs.waiting[id], resultChannel)
+	slot := entry.value.Load()
+	if slot == nil {
+		return errorResultWait[erasedAny](errResultClosed)
+	}
 
-	return resultChannel
+	if slot.state.Load() == slotReady {
+		if stored := entry.stored.Load(); stored != nil {
+			return readyResultWait[erasedAny](stored)
+		}
+	}
+
+	return pendingResultWait[erasedAny](slot)
 }
 
 /*
 PeekResult returns (nil, false) when id has no stored completion, when the entry was removed by TTL cleanup, or when the space is stopped.
-
-When ok is true, it returns a shallow copy of the stored QValue. Fields such as QValue.Value and QValue.Error may still reference shared underlying objects, so callers must treat the returned value as read-only.
 */
-func (qs *QSpace) PeekResult(id string) (*QValue[any], bool) {
-	qs.valuesMu.RLock()
-	defer qs.valuesMu.RUnlock()
-
+func (qs *QSpace) PeekResult(id string) (*QValue[erasedAny], bool) {
 	if qs.stopped.Load() {
 		return nil, false
 	}
 
-	value, ok := qs.values[id]
-	if !ok {
+	entry := qs.entries.find(id)
+	if entry == nil {
+		return nil, false
+	}
+
+	value := entry.stored.Load()
+	if value == nil {
 		return nil, false
 	}
 
@@ -155,16 +135,13 @@ func (qs *QSpace) PeekResult(id string) (*QValue[any], bool) {
 Exists reports whether id currently has a stored value.
 */
 func (qs *QSpace) Exists(id string) bool {
-	qs.valuesMu.RLock()
-	defer qs.valuesMu.RUnlock()
-
 	if qs.stopped.Load() {
 		return false
 	}
 
-	_, ok := qs.values[id]
+	entry := qs.entries.find(id)
 
-	return ok
+	return entry != nil && entry.stored.Load() != nil
 }
 
 /*
@@ -175,7 +152,7 @@ func (qs *QSpace) StoreError(id string, err error, ttl time.Duration) {
 		return
 	}
 
-	qvalue, qvalueErr := NewQValue[any]("", "", nil, 0)
+	qvalue, qvalueErr := NewQValue[erasedAny]("", "", nil, 0)
 	if qvalueErr != nil {
 		return
 	}
@@ -183,18 +160,16 @@ func (qs *QSpace) StoreError(id string, err error, ttl time.Duration) {
 	qvalue.Error = err
 	qvalue.TTL = ttl
 
-	qs.valuesMu.Lock()
-	defer qs.valuesMu.Unlock()
-
-	if qs.stopped.Load() {
+	entry := qs.entries.getOrCreate(id)
+	if entry == nil || qs.stopped.Load() {
 		return
 	}
 
-	qs.values[id] = qvalue
-	waiters := qs.waiting[id]
-	delete(qs.waiting, id)
+	entry.stored.Store(qvalue)
 
-	qspaceDeliverWaiters(waiters, qvalue)
+	if slot := entry.value.Load(); slot != nil {
+		slot.Deliver(qvalue)
+	}
 }
 
 /*
@@ -205,18 +180,11 @@ func (qs *QSpace) AddRelationship(parentID, childID string) error {
 		return fmt.Errorf("qpool: space closed")
 	}
 
-	qs.graphMu.Lock()
-	defer qs.graphMu.Unlock()
-
-	if qs.stopped.Load() {
-		return fmt.Errorf("qpool: space closed")
-	}
-
-	if qspaceWouldCreateCircle(qs.children, parentID, childID) {
+	if qspaceWouldCreateCircle(&qs.entries, parentID, childID) {
 		return fmt.Errorf("qpool: circular dependency detected")
 	}
 
-	qspaceAddEdge(qs.children, qs.parents, parentID, childID)
+	qspaceAddEdge(&qs.entries, parentID, childID)
 
 	return nil
 }
@@ -229,14 +197,7 @@ func (qs *QSpace) RegisterDependent(depID, jobID string) {
 		return
 	}
 
-	qs.graphMu.Lock()
-	defer qs.graphMu.Unlock()
-
-	if qs.stopped.Load() {
-		return
-	}
-
-	qspaceAddEdge(qs.children, qs.parents, depID, jobID)
+	qspaceAddEdge(&qs.entries, depID, jobID)
 }
 
 /*
@@ -254,16 +215,7 @@ func (qs *QSpace) CreateBroadcastGroup(id string, ttl time.Duration) *BroadcastG
 		return group
 	}
 
-	qs.groupsMu.Lock()
-	defer qs.groupsMu.Unlock()
-
-	if qs.stopped.Load() {
-		group.Close()
-
-		return group
-	}
-
-	qs.groups[id] = group
+	qs.groups.store(id, group)
 
 	return group
 }
@@ -271,181 +223,138 @@ func (qs *QSpace) CreateBroadcastGroup(id string, ttl time.Duration) *BroadcastG
 /*
 Subscribe attaches to a broadcast group by id.
 */
-func (qs *QSpace) Subscribe(groupID string) chan *QValue[any] {
+func (qs *QSpace) Subscribe(groupID string) *BroadcastConsumer {
 	if qs.stopped.Load() {
-		return closedQValueChannel()
+		return nil
 	}
 
-	qs.groupsMu.RLock()
-	group := qs.groups[groupID]
-	qs.groupsMu.RUnlock()
-
+	group := qs.groups.load(groupID)
 	if group == nil {
-		return closedQValueChannel()
+		return nil
 	}
 
-	resultChannel := group.Subscribe("", 10)
-	if resultChannel == nil {
-		return closedQValueChannel()
-	}
-
-	return resultChannel.Incoming
+	return group.Subscribe("", 10)
 }
 
 /*
-Close stops maintenance and releases channels.
+Close stops maintenance and releases waiters.
 */
 func (qs *QSpace) Close() {
 	if qs.stopped.Swap(true) {
 		return
 	}
 
-	close(qs.shutdown)
-	<-qs.done
+	for !qs.maintDone.Load() {
+		time.Sleep(time.Millisecond)
+	}
+
+	qs.entries.closeAll()
+	qs.groups.closeAll()
 }
 
 func (qs *QSpace) cleanup(now time.Time) {
-	expiredValues := qs.cleanupValues(now)
+	for shardIndex := range qs.entries.shards {
+		shard := &qs.entries.shards[shardIndex]
 
-	if len(expiredValues) == 0 {
+		for entry := shard.head.Load(); entry != nil; entry = entry.next.Load() {
+			value := entry.stored.Load()
+			if value == nil {
+				continue
+			}
+
+			if value.TTL <= 0 {
+				continue
+			}
+
+			if now.Sub(time.Unix(0, value.CreatedAt)) <= value.TTL {
+				continue
+			}
+
+			entry.stored.Store(nil)
+			qs.entries.removeExpired(entry.key)
+			qspacePruneEdges(&qs.entries, entry.key)
+		}
+	}
+}
+
+func qspaceAddEdge(registry *lockfreeRegistry, parentID, childID string) {
+	parent := registry.getOrCreate(parentID)
+	child := registry.getOrCreate(childID)
+
+	if parent == nil || child == nil {
 		return
 	}
 
-	qs.graphMu.Lock()
-	defer qs.graphMu.Unlock()
-
-	for _, id := range expiredValues {
-		qspacePruneEdges(qs.children, qs.parents, id)
-	}
+	depPush(&parent.children, childID)
+	depPush(&child.parents, parentID)
 }
 
-func (qs *QSpace) cleanupValues(now time.Time) []string {
-	qs.valuesMu.Lock()
-	defer qs.valuesMu.Unlock()
+func depPush(head *atomic.Pointer[depEdge], id string) {
+	edge := &depEdge{id: id}
 
-	if qs.stopped.Load() {
-		return nil
-	}
+	for {
+		current := head.Load()
+		edge.next.Store(current)
 
-	expired := make([]string, 0)
-
-	for id, qvalue := range qs.values {
-		if qvalue.TTL <= 0 {
-			continue
-		}
-
-		if now.Sub(time.Unix(0, qvalue.CreatedAt)) <= qvalue.TTL {
-			continue
-		}
-
-		delete(qs.values, id)
-		expired = append(expired, id)
-	}
-
-	return expired
-}
-
-func (qs *QSpace) shutdownState() {
-	qs.valuesMu.Lock()
-
-	for _, waiters := range qs.waiting {
-		for _, resultChannel := range waiters {
-			close(resultChannel)
-		}
-	}
-
-	qs.waiting = nil
-	qs.values = nil
-	qs.valuesMu.Unlock()
-
-	qs.groupsMu.Lock()
-
-	for _, group := range qs.groups {
-		if group != nil {
-			group.Close()
-		}
-	}
-
-	qs.groups = nil
-	qs.groupsMu.Unlock()
-
-	qs.graphMu.Lock()
-	qs.children = nil
-	qs.parents = nil
-	qs.graphMu.Unlock()
-}
-
-func closedQValueChannel() chan *QValue[any] {
-	resultChannel := make(chan *QValue[any], 1)
-
-	close(resultChannel)
-
-	return resultChannel
-}
-
-func qspaceDeliverWaiters(waiters []chan *QValue[any], qvalue *QValue[any]) error {
-	for _, resultChannel := range waiters {
-		select {
-		case resultChannel <- qvalue:
-		default:
-		}
-
-		close(resultChannel)
-	}
-
-	return nil
-}
-
-func qspaceAddEdge(
-	children map[string]map[string]struct{},
-	parents map[string]map[string]struct{},
-	parentID string,
-	childID string,
-) {
-	if children[parentID] == nil {
-		children[parentID] = make(map[string]struct{})
-	}
-
-	children[parentID][childID] = struct{}{}
-
-	if parents[childID] == nil {
-		parents[childID] = make(map[string]struct{})
-	}
-
-	parents[childID][parentID] = struct{}{}
-}
-
-func qspacePruneEdges(
-	children map[string]map[string]struct{},
-	parents map[string]map[string]struct{},
-	id string,
-) {
-	delete(children, id)
-
-	for parentID, childSet := range children {
-		delete(childSet, id)
-
-		if len(childSet) == 0 {
-			delete(children, parentID)
-		}
-	}
-
-	delete(parents, id)
-
-	for childID, parentSet := range parents {
-		delete(parentSet, id)
-
-		if len(parentSet) == 0 {
-			delete(parents, childID)
+		if head.CompareAndSwap(current, edge) {
+			return
 		}
 	}
 }
 
-func qspaceWouldCreateCircle(
-	children map[string]map[string]struct{},
-	parentID string,
-	childID string,
-) bool {
+func qspacePruneEdges(registry *lockfreeRegistry, id string) {
+	entry := registry.find(id)
+	if entry == nil {
+		return
+	}
+
+	for edge := entry.children.Load(); edge != nil; edge = edge.next.Load() {
+		if child := registry.find(edge.id); child != nil {
+			depRemove(&child.parents, id)
+		}
+	}
+
+	for edge := entry.parents.Load(); edge != nil; edge = edge.next.Load() {
+		if parent := registry.find(edge.id); parent != nil {
+			depRemove(&parent.children, id)
+		}
+	}
+
+	entry.children.Store(nil)
+	entry.parents.Store(nil)
+}
+
+func depRemove(head *atomic.Pointer[depEdge], id string) {
+	for {
+		prev := (*depEdge)(nil)
+		current := head.Load()
+
+		for current != nil {
+			next := current.next.Load()
+
+			if current.id == id {
+				if prev == nil {
+					if head.CompareAndSwap(current, next) {
+						return
+					}
+
+					break
+				}
+
+				prev.next.Store(next)
+
+				return
+			}
+
+			prev = current
+			current = next
+		}
+
+		return
+	}
+}
+
+func qspaceWouldCreateCircle(registry *lockfreeRegistry, parentID, childID string) bool {
 	visited := make(map[string]struct{})
 	stack := []string{childID}
 
@@ -464,8 +373,13 @@ func qspaceWouldCreateCircle(
 
 		visited[currentID] = struct{}{}
 
-		for nextChildID := range children[currentID] {
-			stack = append(stack, nextChildID)
+		entry := registry.find(currentID)
+		if entry == nil {
+			continue
+		}
+
+		for edge := entry.children.Load(); edge != nil; edge = edge.next.Load() {
+			stack = append(stack, edge.id)
 		}
 	}
 

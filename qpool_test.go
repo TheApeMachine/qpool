@@ -28,18 +28,16 @@ func TestQPoolScheduleSimple(t *testing.T) {
 		})
 
 		Convey("When scheduling a simple job", func() {
-			resultCh := q.Schedule("test-job", func(ctx context.Context) (any, error) {
+			wait := q.Schedule("test-job", func(ctx context.Context) (any, error) {
 				return "success", nil
 			})
 
-			select {
-			case <-ctx.Done():
-				So(ctx.Err(), ShouldBeNil)
-			case result := <-resultCh:
-				So(result, ShouldNotBeNil)
-				So(result.Error, ShouldBeNil)
-				So(result.Value, ShouldEqual, "success")
-			}
+			result, err := wait.Get(ctx)
+
+			So(err, ShouldBeNil)
+			So(result, ShouldNotBeNil)
+			So(result.Error, ShouldBeNil)
+			So(result.Value, ShouldEqual, "success")
 		})
 	})
 }
@@ -66,27 +64,26 @@ func TestQPoolTelemetryPublish(t *testing.T) {
 		})
 
 		Convey("It should route pool events through the configured publisher", func() {
-			resultChannel := q.Schedule("telemetry-job", func(ctx context.Context) (any, error) {
+			wait := q.Schedule("telemetry-job", func(ctx context.Context) (any, error) {
 				return "ok", nil
 			})
 
-			select {
-			case result := <-resultChannel:
-				So(result, ShouldNotBeNil)
-				So(result.Error, ShouldBeNil)
-			case <-time.After(2 * time.Second):
-				So("telemetry job", ShouldEqual, "timed out")
-			}
+			result, err := wait.Get(context.Background())
+
+			So(err, ShouldBeNil)
+			So(result, ShouldNotBeNil)
+			So(result.Error, ShouldBeNil)
 
 			observed := false
 
-			for !observed {
+			deadline := time.Now().Add(2 * time.Second)
+
+			for !observed && time.Now().Before(deadline) {
 				select {
 				case event := <-events:
 					observed = event.Component == "qpool"
-				case <-time.After(2 * time.Second):
-					So("qpool telemetry event", ShouldEqual, "timed out")
-					return
+				default:
+					time.Sleep(time.Millisecond)
 				}
 			}
 
@@ -132,33 +129,29 @@ func TestSchedule_circuitBreakerOpenRejectsFurtherSchedules(t *testing.T) {
 				for failureIndex := range row.failuresToOpen {
 					jobID := fmt.Sprintf("%s-fail-%d", circuitID, failureIndex)
 
-					resultChannel := q.Schedule(jobID, func(jobCtx context.Context) (any, error) {
+					wait := q.Schedule(jobID, func(jobCtx context.Context) (any, error) {
 						return nil, errors.New("intentional failure")
 					}, WithCircuitBreaker(circuitID, row.maxFailures, time.Minute))
 
-					select {
-					case result := <-resultChannel:
-						So(result, ShouldNotBeNil)
-						So(result.Error, ShouldNotBeNil)
-					case <-time.After(6 * time.Second):
-						So("failed job completion", ShouldEqual, "timed out")
-					}
+					result, err := wait.Get(context.Background())
+
+					So(err, ShouldBeNil)
+					So(result, ShouldNotBeNil)
+					So(result.Error, ShouldNotBeNil)
 				}
 
-				blockedChannel := q.Schedule(fmt.Sprintf("%s-blocked", circuitID), func(jobCtx context.Context) (any, error) {
+				blockedWait := q.Schedule(fmt.Sprintf("%s-blocked", circuitID), func(jobCtx context.Context) (any, error) {
 					return "skipped", nil
 				}, WithCircuitBreaker(circuitID, row.maxFailures, time.Minute))
 
-				select {
-				case result := <-blockedChannel:
-					So(result, ShouldNotBeNil)
-					So(result.Error, ShouldNotBeNil)
-					So(result.Error.Error(), ShouldContainSubstring, "circuit breaker")
-					So(result.Error.Error(), ShouldContainSubstring, circuitID)
-					So(result.Error.Error(), ShouldContainSubstring, "open")
-				case <-time.After(time.Second):
-					So("circuit rejection", ShouldEqual, "timed out")
-				}
+				result, err := blockedWait.Get(context.Background())
+
+				So(err, ShouldBeNil)
+				So(result, ShouldNotBeNil)
+				So(result.Error, ShouldNotBeNil)
+				So(result.Error.Error(), ShouldContainSubstring, "circuit breaker")
+				So(result.Error.Error(), ShouldContainSubstring, circuitID)
+				So(result.Error.Error(), ShouldContainSubstring, "open")
 			})
 		}
 	})

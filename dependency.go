@@ -3,16 +3,13 @@ package qpool
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/phuslu/log"
-	"golang.org/x/sync/errgroup"
 )
 
-func (q *Q[any]) startDependencyWait(job Job) error {
-	q.shutdownMu.RLock()
-	defer q.shutdownMu.RUnlock()
-
+func (q *Q[T]) startDependencyWait(job Job) error {
 	if q.stopping.Load() {
 		return fmt.Errorf("qpool: pool closed")
 	}
@@ -21,15 +18,15 @@ func (q *Q[any]) startDependencyWait(job Job) error {
 		return fmt.Errorf("qpool: pool closed: %w", err)
 	}
 
-	q.wg.Add(1)
+	q.deps.Add(1)
 
 	go q.resolveDependentJob(job)
 
 	return nil
 }
 
-func (q *Q[any]) resolveDependentJob(job Job) {
-	defer q.wg.Done()
+func (q *Q[T]) resolveDependentJob(job Job) {
+	defer q.deps.Done()
 
 	if err := q.waitDependencies(q.ctx, job); err != nil {
 		q.recordDependencyFailure(job, err)
@@ -45,7 +42,7 @@ func (q *Q[any]) resolveDependentJob(job Job) {
 	}
 }
 
-func (q *Q[any]) recordDependencyFailure(job Job, err error) {
+func (q *Q[T]) recordDependencyFailure(job Job, err error) {
 	latency := time.Since(job.StartTime)
 	q.metrics.RecordJobOutcome(latency, false)
 
@@ -72,22 +69,45 @@ func (q *Q[any]) recordDependencyFailure(job Job, err error) {
 	q.space.StoreError(job.ID, err, job.TTL)
 }
 
-func (q *Q[any]) waitDependencies(dependencyCtx context.Context, job Job) error {
+func (q *Q[T]) waitDependencies(dependencyCtx context.Context, job Job) error {
 	if len(job.Dependencies) == 0 {
 		return nil
 	}
 
-	errGroup, errGroupCtx := errgroup.WithContext(dependencyCtx)
+	var (
+		waitGroup atomicWaitGroup
+		firstErr  atomic.Pointer[error]
+	)
+
+	waitGroup.Add(int64(len(job.Dependencies)))
 
 	for _, dependencyID := range job.Dependencies {
 		dependencyID := dependencyID
 
-		errGroup.Go(func() error {
-			return q.waitOneDependency(errGroupCtx, job, dependencyID)
-		})
+		go func() {
+			defer waitGroup.Done()
+
+			if err := q.waitOneDependency(dependencyCtx, job, dependencyID); err != nil {
+				for {
+					if current := firstErr.Load(); current != nil {
+						return
+					}
+
+					if firstErr.CompareAndSwap(nil, &err) {
+						return
+					}
+				}
+			}
+		}()
 	}
 
-	return errGroup.Wait()
+	waitGroup.Wait()
+
+	if errPtr := firstErr.Load(); errPtr != nil {
+		return *errPtr
+	}
+
+	return dependencyCtx.Err()
 }
 
 func dependencyAwaitTimeout(policy *RetryPolicy, strategy RetryStrategy) time.Duration {
@@ -118,7 +138,7 @@ func dependencyAwaitTimeout(policy *RetryPolicy, strategy RetryStrategy) time.Du
 	return base
 }
 
-func (q *Q[any]) waitOneDependency(
+func (q *Q[T]) waitOneDependency(
 	dependencyCtx context.Context,
 	job Job,
 	dependencyID string,
@@ -138,13 +158,13 @@ func (q *Q[any]) waitOneDependency(
 	awaitTimeout := dependencyAwaitTimeout(job.DependencyRetryPolicy, strategy)
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		resultChannel := q.space.Await(dependencyID)
+		wait := q.space.Await(dependencyID)
 		waitCtx, cancel := context.WithTimeout(dependencyCtx, awaitTimeout)
 
-		select {
-		case result := <-resultChannel:
-			cancel()
+		result, err := wait.Get(waitCtx)
+		cancel()
 
+		if err == nil {
 			if result == nil {
 				lastErr = fmt.Errorf("dependency %s returned nil result", dependencyID)
 
@@ -160,18 +180,16 @@ func (q *Q[any]) waitOneDependency(
 			}
 
 			return nil
+		}
 
-		case <-waitCtx.Done():
-			lastErr = waitCtx.Err()
-			cancel()
+		lastErr = err
 
-			if err := dependencyCtx.Err(); err != nil {
-				return fmt.Errorf("dependency %s: %w", dependencyID, err)
-			}
+		if err := dependencyCtx.Err(); err != nil {
+			return fmt.Errorf("dependency %s: %w", dependencyID, err)
+		}
 
-			if attempt < maxAttempts-1 {
-				time.Sleep(strategy.NextDelay(attempt + 1))
-			}
+		if attempt < maxAttempts-1 {
+			time.Sleep(strategy.NextDelay(attempt + 1))
 		}
 	}
 

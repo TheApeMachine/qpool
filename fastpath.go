@@ -8,86 +8,86 @@ import (
 
 /*
 ScheduleFast dispatches an independent job through the low-overhead runtime
-executor. It returns the result directly on the returned channel and does not
+executor. It returns the result directly on a lock-free handle and does not
 store results in QSpace, publish telemetry, apply retries, dependencies,
 regulators, circuit breakers, TTLs, or scaler accounting.
 */
-func (q *Q[any]) ScheduleFast(
+func (q *Q[T]) ScheduleFast(
 	ctx context.Context,
-	fn func(context.Context) (any, error),
-) chan *QValue[any] {
-	resultChannel := make(chan *QValue[any], 1)
+	fn func(context.Context) (T, error),
+) *ResultWait[T] {
+	slot := newResultSlot()
 
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
 	if q == nil {
-		finishFast(resultChannel, nil, fmt.Errorf("qpool: pool closed"))
+		slot.Close()
 
-		return resultChannel
+		return errorResultWait[T](fmt.Errorf("qpool: pool closed"))
 	}
 
 	if fn == nil {
-		finishFast(resultChannel, nil, fmt.Errorf("qpool: nil fast job"))
+		slot.Close()
 
-		return resultChannel
+		return errorResultWait[T](fmt.Errorf("qpool: nil fast job"))
 	}
 
 	if err := ctx.Err(); err != nil {
-		finishFast(resultChannel, nil, err)
+		slot.Close()
 
-		return resultChannel
+		return errorResultWait[T](err)
 	}
 
-	q.shutdownMu.RLock()
-
 	if q.stopping.Load() {
-		q.shutdownMu.RUnlock()
-		finishFast(resultChannel, nil, fmt.Errorf("qpool: pool closed"))
+		slot.Close()
 
-		return resultChannel
+		return errorResultWait[T](fmt.Errorf("qpool: pool closed"))
 	}
 
 	if err := q.ctx.Err(); err != nil {
-		q.shutdownMu.RUnlock()
-		finishFast(resultChannel, nil, fmt.Errorf("qpool: pool closed: %w", err))
+		slot.Close()
 
-		return resultChannel
+		return errorResultWait[T](fmt.Errorf("qpool: pool closed: %w", err))
 	}
 
 	if q.fastQueue == nil {
-		q.shutdownMu.RUnlock()
-		finishFast(resultChannel, nil, fmt.Errorf("qpool: disruptor queue unavailable"))
+		slot.Close()
 
-		return resultChannel
+		return errorResultWait[T](fmt.Errorf("qpool: disruptor queue unavailable"))
 	}
 
 	work := fastDisruptorWork{
-		ctx:    ctx,
-		fn:     fn,
-		result: resultChannel,
+		ctx: ctx,
+		fn: func(ctx context.Context) (interface{}, error) {
+			return fn(ctx)
+		},
+		result: slot,
 	}
 
 	err := q.fastQueue.publishFast(ctx, work)
-	q.shutdownMu.RUnlock()
-
 	if err != nil {
-		finishFast(resultChannel, nil, fmt.Errorf("qpool: schedule fast job: %w", err))
+		slot.Close()
+
+		return errorResultWait[T](fmt.Errorf("qpool: schedule fast job: %w", err))
 	}
 
-	return resultChannel
+	return pendingResultWait[T](slot)
 }
 
-func finishFast(resultChannel chan *QValue[any], value any, err error) {
-	qvalue, qvalueErr := NewQValue("", "", value, 0)
+func finishFast(slot *resultSlot, value erasedAny, err error) {
+	if slot == nil {
+		return
+	}
+
+	qvalue, qvalueErr := NewQValue[erasedAny]("", "", value, 0)
 	if qvalueErr != nil {
 		err = qvalueErr
 	}
 
 	qvalue.Error = err
-	resultChannel <- qvalue
-	close(resultChannel)
+	slot.Deliver(qvalue)
 }
 
 func invokeFastFnOnce(

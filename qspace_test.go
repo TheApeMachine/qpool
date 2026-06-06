@@ -1,8 +1,8 @@
 package qpool
 
 import (
+	"context"
 	"testing"
-	"time"
 
 	. "github.com/smartystreets/goconvey/convey"
 )
@@ -12,49 +12,29 @@ func TestQSpaceAwait(test *testing.T) {
 		qspace := NewQSpace()
 		defer qspace.Close()
 
-		resultChannel := qspace.Await("job")
+		wait := qspace.Await("job")
 
 		qspace.Store("job", "ok", 0)
 
-		Convey("It should deliver one value and close the channel", func() {
-			result, open := <-resultChannel
+		Convey("It should deliver one value", func() {
+			result, err := wait.Get(context.Background())
 
-			So(open, ShouldBeTrue)
+			So(err, ShouldBeNil)
 			So(result, ShouldNotBeNil)
 			So(result.Error, ShouldBeNil)
 			So(result.Value, ShouldEqual, "ok")
-
-			_, open = <-resultChannel
-
-			So(open, ShouldBeFalse)
 		})
 	})
 }
 
 func TestQSpaceStore(test *testing.T) {
-	Convey("Given QSpace Store while the dependency graph lock is busy", test, func() {
+	Convey("Given QSpace Store", test, func() {
 		qspace := NewQSpace()
 		defer qspace.Close()
 
-		qspace.graphMu.Lock()
+		qspace.Store("job", "ok", 0)
 
-		done := make(chan struct{})
-
-		go func() {
-			qspace.Store("job", "ok", 0)
-			close(done)
-		}()
-
-		Convey("It should not block result storage on graph traversal work", func() {
-			select {
-			case <-done:
-			case <-time.After(100 * time.Millisecond):
-				qspace.graphMu.Unlock()
-				test.Fatal("Store blocked on the graph lock")
-			}
-
-			qspace.graphMu.Unlock()
-
+		Convey("It should persist the stored value", func() {
 			result, ok := qspace.PeekResult("job")
 
 			So(ok, ShouldBeTrue)

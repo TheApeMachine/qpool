@@ -2,84 +2,213 @@ package qpool
 
 import (
 	"context"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/theapemachine/errnie"
 )
 
-var broadcastGroups = sync.Map{}
+type groupRegistryEntryGlobal struct {
+	keyHash uint64
+	key     string
+	group   atomic.Pointer[BroadcastGroup]
+	next    atomic.Pointer[groupRegistryEntryGlobal]
+}
+
+var broadcastGroupHead atomic.Pointer[groupRegistryEntryGlobal]
+
+/*
+BroadcastConsumer receives values from a broadcast group without channels.
+*/
+type BroadcastConsumer struct {
+	ring *spscQValueRing
+}
+
+/*
+Poll returns the next queued value when one is available.
+*/
+func (consumer *BroadcastConsumer) Poll() *QValue[erasedAny] {
+	if consumer == nil || consumer.ring == nil {
+		return nil
+	}
+
+	return consumer.ring.Pop()
+}
+
+/*
+Wait blocks until a value is available or ctx is canceled.
+*/
+func (consumer *BroadcastConsumer) Wait(ctx context.Context) (*QValue[erasedAny], error) {
+	if consumer == nil || consumer.ring == nil {
+		return nil, errResultClosed
+	}
+
+	for {
+		if value := consumer.ring.Pop(); value != nil {
+			return value, nil
+		}
+
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		gp := GetG()
+		if gp != nil {
+			fast_park(gp)
+		}
+	}
+}
 
 /*
 Subscriber represents a broadcast group subscriber.
 */
 type Subscriber struct {
 	ID       string
-	Incoming chan *QValue[any]
+	consumer *BroadcastConsumer
 }
 
 /*
-BroadcastGroup routes publisher messages to subscribers without mutexes.
+BroadcastGroup routes publisher messages to subscribers without mutexes or channels.
 */
 type BroadcastGroup struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 	err         error
 	ID          string
-	subscribers sync.Map
+	subscribers atomic.Pointer[subscriberEntry]
+}
+
+type subscriberEntry struct {
+	id         string
+	subscriber *Subscriber
+	next       atomic.Pointer[subscriberEntry]
 }
 
 /*
-NewBroadcastGroup starts an actor that owns subscriber maps.
+NewBroadcastGroup starts a group that owns subscriber registrations.
 */
 func NewBroadcastGroup(
 	ctx context.Context, id string, ttl time.Duration,
 ) (*BroadcastGroup, error) {
-	// If a group with the same id already exists, just return it.
-	if bg, ok := broadcastGroups.Load(id); ok {
-		return bg.(*BroadcastGroup), nil
+	if existing := findBroadcastGroup(id); existing != nil {
+		return existing, nil
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
 
-	// If no group with the same id exists, create a new one.
 	bg := &BroadcastGroup{
-		ctx:         ctx,
-		cancel:      cancel,
-		ID:          id,
-		subscribers: sync.Map{},
+		ctx:    ctx,
+		cancel: cancel,
+		ID:     id,
 	}
 
-	// Store the new group in the global map.
-	broadcastGroups.Store(id, bg)
+	storeBroadcastGroup(id, bg)
 
 	return bg, errnie.Require(
 		map[string]any{
-			"ctx":         bg.ctx,
-			"cancel":      bg.cancel,
-			"id":          bg.ID,
-			"subscribers": &bg.subscribers,
+			"ctx":    bg.ctx,
+			"cancel": bg.cancel,
+			"id":     bg.ID,
 		},
 	)
 }
 
+func findBroadcastGroup(id string) *BroadcastGroup {
+	keyHash := fnvHash(id)
+
+	for entry := broadcastGroupHead.Load(); entry != nil; entry = entry.next.Load() {
+		if entry.keyHash == keyHash && entry.key == id {
+			return entry.group.Load()
+		}
+	}
+
+	return nil
+}
+
+func storeBroadcastGroup(id string, group *BroadcastGroup) {
+	entry := &groupRegistryEntryGlobal{
+		keyHash: fnvHash(id),
+		key:     id,
+	}
+
+	entry.group.Store(group)
+
+	for {
+		head := broadcastGroupHead.Load()
+		entry.next.Store(head)
+
+		if broadcastGroupHead.CompareAndSwap(head, entry) {
+			return
+		}
+	}
+}
+
+func deleteBroadcastGroup(id string) {
+	keyHash := fnvHash(id)
+
+	for {
+		prev := (*groupRegistryEntryGlobal)(nil)
+		current := broadcastGroupHead.Load()
+
+		for current != nil {
+			next := current.next.Load()
+
+			if current.keyHash == keyHash && current.key == id {
+				if prev == nil {
+					if broadcastGroupHead.CompareAndSwap(current, next) {
+						return
+					}
+
+					break
+				}
+
+				prev.next.Store(next)
+
+				return
+			}
+
+			prev = current
+			current = next
+		}
+
+		return
+	}
+}
+
 /*
-Subscribe registers a subscriber channel sized with bufferSize.
+Subscribe registers a subscriber ring sized with bufferSize.
 */
 func (bg *BroadcastGroup) Subscribe(
 	subscriberID string, bufferSize int,
-) *Subscriber {
+) *BroadcastConsumer {
+	if bg == nil {
+		return nil
+	}
+
 	select {
 	case <-bg.ctx.Done():
 		return nil
 	default:
-		subscriber := &Subscriber{
-			ID:       subscriberID,
-			Incoming: make(chan *QValue[any], bufferSize),
-		}
+	}
 
-		bg.subscribers.Store(subscriberID, subscriber)
-		return subscriber
+	consumer := &BroadcastConsumer{ring: newSPSCQValueRing(bufferSize)}
+	subscriber := &Subscriber{
+		ID:       subscriberID,
+		consumer: consumer,
+	}
+
+	entry := &subscriberEntry{
+		id:         subscriberID,
+		subscriber: subscriber,
+	}
+
+	for {
+		head := bg.subscribers.Load()
+		entry.next.Store(head)
+
+		if bg.subscribers.CompareAndSwap(head, entry) {
+			return consumer
+		}
 	}
 }
 
@@ -87,64 +216,118 @@ func (bg *BroadcastGroup) Subscribe(
 Unsubscribe removes a subscriber.
 */
 func (bg *BroadcastGroup) Unsubscribe(subscriberID string) {
+	if bg == nil {
+		return
+	}
+
 	select {
 	case <-bg.ctx.Done():
 		return
 	default:
-		bg.subscribers.Delete(subscriberID)
+	}
+
+	for {
+		prev := (*subscriberEntry)(nil)
+		current := bg.subscribers.Load()
+
+		for current != nil {
+			next := current.next.Load()
+
+			if current.id == subscriberID {
+				if prev == nil {
+					if bg.subscribers.CompareAndSwap(current, next) {
+						if current.subscriber != nil && current.subscriber.consumer != nil {
+							current.subscriber.consumer.ring.Close()
+						}
+
+						return
+					}
+
+					break
+				}
+
+				prev.next.Store(next)
+
+				if current.subscriber != nil && current.subscriber.consumer != nil {
+					current.subscriber.consumer.ring.Close()
+				}
+
+				return
+			}
+
+			prev = current
+			current = next
+		}
+
+		return
 	}
 }
 
 /*
 Send delivers qv to subscribers honoring filters and routing rules.
 */
-func (bg *BroadcastGroup) Send(qv *QValue[any]) {
+func (bg *BroadcastGroup) Send(qv *QValue[erasedAny]) {
+	if bg == nil || qv == nil {
+		return
+	}
+
 	select {
 	case <-bg.ctx.Done():
 		return
 	default:
-		if qv.ReceiverID != "" {
-			if subscriber, ok := bg.subscribers.Load(qv.ReceiverID); ok {
-				subscriber.(*Subscriber).Incoming <- qv
+	}
+
+	if qv.ReceiverID != "" {
+		for entry := bg.subscribers.Load(); entry != nil; entry = entry.next.Load() {
+			if entry.id != qv.ReceiverID {
+				continue
+			}
+
+			if entry.subscriber != nil && entry.subscriber.consumer != nil {
+				entry.subscriber.consumer.ring.Push(qv)
 			}
 
 			return
 		}
 
-		bg.subscribers.Range(func(key, value any) bool {
-			subscriber := value.(*Subscriber)
+		return
+	}
 
-			if subscriber.ID == qv.SenderID {
-				return true
-			}
+	for entry := bg.subscribers.Load(); entry != nil; entry = entry.next.Load() {
+		if entry.subscriber == nil || entry.subscriber.consumer == nil {
+			continue
+		}
 
-			select {
-			case subscriber.Incoming <- qv:
-			default:
-				// Slow consumer: drop the frame instead of closing the channel.
-				// Closing would panic every later Send on that subscriber.
-			}
+		if entry.id == qv.SenderID {
+			continue
+		}
 
-			return true
-		})
+		entry.subscriber.consumer.ring.Push(qv)
 	}
 }
 
 /*
-Close stops the actor and closes subscriber channels.
+Close stops the group and releases subscriber rings.
 */
 func (bg *BroadcastGroup) Close() {
+	if bg == nil {
+		return
+	}
+
 	select {
 	case <-bg.ctx.Done():
 		return
 	default:
-		bg.cancel()
-
-		bg.subscribers.Range(func(key, value any) bool {
-			close(value.(*Subscriber).Incoming)
-			return true
-		})
-
-		broadcastGroups.Delete(bg.ID)
 	}
+
+	bg.cancel()
+
+	for entry := bg.subscribers.Load(); entry != nil; entry = entry.next.Load() {
+		if entry.subscriber != nil && entry.subscriber.consumer != nil {
+			entry.subscriber.consumer.ring.Close()
+		}
+	}
+
+	bg.subscribers.Store(nil)
+	deleteBroadcastGroup(bg.ID)
 }

@@ -2,7 +2,7 @@ package qpool
 
 import (
 	"fmt"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/phuslu/log"
@@ -13,67 +13,90 @@ type workerToken struct {
 	cancel func()
 }
 
+type workerStackNode struct {
+	token *workerToken
+	next  atomic.Pointer[workerStackNode]
+}
+
 type workerRegistry struct {
-	mu        sync.Mutex
-	tokens    []*workerToken
-	positions map[uint64]int
+	head atomic.Pointer[workerStackNode]
 }
 
 func newWorkerRegistry() *workerRegistry {
-	return &workerRegistry{
-		positions: make(map[uint64]int),
-	}
+	return &workerRegistry{}
 }
 
 func (registry *workerRegistry) push(token *workerToken) {
-	registry.mu.Lock()
-	defer registry.mu.Unlock()
+	if registry == nil || token == nil {
+		return
+	}
 
-	registry.positions[token.id] = len(registry.tokens)
-	registry.tokens = append(registry.tokens, token)
+	node := &workerStackNode{token: token}
+
+	for {
+		head := registry.head.Load()
+		node.next.Store(head)
+
+		if registry.head.CompareAndSwap(head, node) {
+			return
+		}
+	}
 }
 
 func (registry *workerRegistry) popLast() *workerToken {
-	registry.mu.Lock()
-	defer registry.mu.Unlock()
-
-	lastIndex := len(registry.tokens) - 1
-
-	if lastIndex < 0 {
+	if registry == nil {
 		return nil
 	}
 
-	token := registry.tokens[lastIndex]
-	registry.tokens = registry.tokens[:lastIndex]
-	delete(registry.positions, token.id)
+	for {
+		head := registry.head.Load()
+		if head == nil {
+			return nil
+		}
 
-	return token
+		next := head.next.Load()
+
+		if registry.head.CompareAndSwap(head, next) {
+			return head.token
+		}
+	}
 }
 
 func (registry *workerRegistry) remove(id uint64) {
-	registry.mu.Lock()
-	defer registry.mu.Unlock()
-
-	index, ok := registry.positions[id]
-
-	if !ok {
+	if registry == nil {
 		return
 	}
 
-	lastIndex := len(registry.tokens) - 1
-	lastToken := registry.tokens[lastIndex]
-	registry.tokens[index] = lastToken
-	registry.tokens = registry.tokens[:lastIndex]
-	delete(registry.positions, id)
+	for {
+		prev := (*workerStackNode)(nil)
+		current := registry.head.Load()
 
-	if index == lastIndex {
+		for current != nil {
+			next := current.next.Load()
+
+			if current.token != nil && current.token.id == id {
+				if prev == nil {
+					if registry.head.CompareAndSwap(current, next) {
+						return
+					}
+
+					break
+				}
+
+				prev.next.Store(next)
+
+				return
+			}
+
+			prev = current
+			current = next
+		}
+
 		return
 	}
-
-	registry.positions[lastToken.id] = index
 }
 
-func (pool *Q[any]) startWorker() {
+func (pool *Q[T]) startWorker() {
 	if !pool.metrics.tryIncWorkerIfBelow(pool.maxWorkers) {
 		return
 	}
@@ -96,7 +119,7 @@ func (pool *Q[any]) startWorker() {
 	})
 }
 
-func (pool *Q[any]) scaleDownWorkers(count int) {
+func (pool *Q[T]) scaleDownWorkers(count int) {
 	for range count {
 		token := pool.registry.popLast()
 
@@ -121,10 +144,7 @@ func (pool *Q[any]) scaleDownWorkers(count int) {
 	}
 }
 
-/*
-Close cancels the pool and drains committed disruptor jobs with shutdown errors.
-*/
-func (pool *Q[any]) Close() {
+func (pool *Q[T]) closePool() {
 	if pool == nil {
 		return
 	}
@@ -143,8 +163,6 @@ func (pool *Q[any]) Close() {
 		pool.cancel()
 	}
 
-	pool.waitForScheduleLockDrain()
-
 	if pool.jobQueue != nil {
 		pool.jobQueue.Close()
 	}
@@ -154,7 +172,8 @@ func (pool *Q[any]) Close() {
 	}
 
 	pool.deactivateWorkers()
-	pool.wg.Wait()
+	pool.deps.Wait()
+	pool.scalerWG.Wait()
 	pool.space.Close()
 	pool.publishTelemetry(Event{
 		Component: "qpool",
@@ -165,13 +184,7 @@ func (pool *Q[any]) Close() {
 	})
 }
 
-func (pool *Q[any]) waitForScheduleLockDrain() {
-	// Taking the write lock blocks until schedules already inside RLock exit.
-	pool.shutdownMu.Lock()
-	defer pool.shutdownMu.Unlock()
-}
-
-func (pool *Q[any]) deactivateWorkers() {
+func (pool *Q[T]) deactivateWorkers() {
 	for {
 		token := pool.registry.popLast()
 		if token == nil {

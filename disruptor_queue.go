@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"runtime"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -26,7 +25,7 @@ type jobDisruptorQueue struct {
 	ring          []jobDisruptorSlot
 	mask          int64
 	pool          *Q[any]
-	listenWG      sync.WaitGroup
+	listenWG      atomicWaitGroup
 	closed        atomic.Bool
 	activeWorkers atomic.Int64
 }
@@ -40,8 +39,8 @@ type jobDisruptorSlot struct {
 
 type fastDisruptorWork struct {
 	ctx    context.Context
-	fn     func(context.Context) (any, error)
-	result chan *QValue[any]
+	fn     func(context.Context) (interface{}, error)
+	result *resultSlot
 }
 
 type jobDisruptorHandler struct {
@@ -218,20 +217,22 @@ func (handler *jobDisruptorHandler) handleFast(slot *jobDisruptorSlot) {
 		return
 	}
 
+	result := work.result
+
 	if err := work.ctx.Err(); err != nil {
-		finishFast(work.result, nil, err)
+		finishFast(result, nil, err)
 
 		return
 	}
 
 	if err := handler.queue.pool.ctx.Err(); err != nil {
-		finishFast(work.result, nil, fmt.Errorf("qpool: pool closed: %w", err))
+		finishFast(result, nil, fmt.Errorf("qpool: pool closed: %w", err))
 
 		return
 	}
 
 	value, err := invokeFastFnOnce(work.ctx, work.fn)
-	finishFast(work.result, value, err)
+	finishFast(result, value, err)
 }
 
 func (handler *jobDisruptorHandler) assignedWorker(

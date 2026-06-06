@@ -1,11 +1,11 @@
-//go:build !go1.26
-
-#include "go_asm.h"
-#include "go_tls.h"
 #include "textflag.h"
+#include "go_asm.h"
 
-TEXT ·GetG(SB), NOSPLIT, $0-8
-	get_tls(CX)
-	MOVQ	g(CX), AX
-	MOVQ	AX, ret+0(FP)
-	RET
+#define    get_tls(r)    MOVQ TLS, r
+#define    g(r)    0(r)(TLS*1)
+
+TEXT ·GetG(SB),NOSPLIT,$0-8
+    get_tls(CX)
+    MOVQ    g(CX), AX
+    MOVQ    AX, gp+0(FP)
+    RET

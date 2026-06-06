@@ -121,25 +121,22 @@ func (s *Scaler) run() {
 		interval = time.Second
 	}
 
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
 	for {
-		select {
-		case <-s.pool.ctx.Done():
+		if s.pool.ctx.Err() != nil {
 			return
-
-		case <-ticker.C:
-			read := s.pool.metrics.CollectReading()
-
-			if s.pool.config != nil {
-				for _, reg := range s.pool.config.Regulators {
-					reg.Renormalize()
-				}
-			}
-
-			s.evaluate(read)
 		}
+
+		time.Sleep(interval)
+
+		read := s.pool.metrics.CollectReading()
+
+		if s.pool.config != nil {
+			for _, reg := range s.pool.config.Regulators {
+				reg.Renormalize()
+			}
+		}
+
+		s.evaluate(read)
 	}
 }
 
@@ -163,10 +160,10 @@ func NewScaler(q *Q[any], minWorkers, maxWorkers int, config *ScalerConfig) *Sca
 		lastScale:          time.Now(),
 	}
 
-	q.wg.Add(1)
+	q.scalerWG.Add(1)
 
 	go func() {
-		defer q.wg.Done()
+		defer q.scalerWG.Done()
 
 		scaler.run()
 	}()

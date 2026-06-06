@@ -1,8 +1,7 @@
 package qpool
 
 import (
-	"container/list"
-	"sync"
+	"sync/atomic"
 )
 
 const defaultCircuitBreakerLimit = 1024
@@ -12,11 +11,15 @@ type circuitBreakerEntry struct {
 	breaker *CircuitBreaker
 }
 
+type breakerCacheNode struct {
+	entry *circuitBreakerEntry
+	next  atomic.Pointer[breakerCacheNode]
+}
+
 type circuitBreakerCache struct {
-	mu      sync.Mutex
-	entries map[string]*list.Element
-	order   *list.List
-	limit   int
+	head  atomic.Pointer[breakerCacheNode]
+	count atomic.Int64
+	limit int
 }
 
 func newCircuitBreakerCache(limit int) *circuitBreakerCache {
@@ -24,11 +27,17 @@ func newCircuitBreakerCache(limit int) *circuitBreakerCache {
 		limit = defaultCircuitBreakerLimit
 	}
 
-	return &circuitBreakerCache{
-		entries: make(map[string]*list.Element, limit),
-		order:   list.New(),
-		limit:   limit,
+	return &circuitBreakerCache{limit: limit}
+}
+
+func (cache *circuitBreakerCache) find(id string) *CircuitBreaker {
+	for node := cache.head.Load(); node != nil; node = node.next.Load() {
+		if node.entry != nil && node.entry.id == id {
+			return node.entry.breaker
+		}
 	}
+
+	return nil
 }
 
 func (cache *circuitBreakerCache) getOrCreate(
@@ -39,15 +48,8 @@ func (cache *circuitBreakerCache) getOrCreate(
 		return nil
 	}
 
-	cache.mu.Lock()
-	defer cache.mu.Unlock()
-
-	if element, ok := cache.entries[id]; ok {
-		cache.order.MoveToFront(element)
-
-		entry := element.Value.(*circuitBreakerEntry)
-
-		return entry.breaker
+	if breaker := cache.find(id); breaker != nil {
+		return breaker
 	}
 
 	breaker := newCircuitBreakerFromConfig(config)
@@ -56,28 +58,45 @@ func (cache *circuitBreakerCache) getOrCreate(
 		breaker: breaker,
 	}
 
-	cache.entries[id] = cache.order.PushFront(entry)
-	cache.evictOverflow()
+	node := &breakerCacheNode{entry: entry}
 
-	return breaker
-}
+	for {
+		head := cache.head.Load()
+		node.next.Store(head)
 
-func (cache *circuitBreakerCache) evictOverflow() {
-	for len(cache.entries) > cache.limit {
-		element := cache.order.Back()
+		if cache.head.CompareAndSwap(head, node) {
+			if existing := cache.find(id); existing != nil && existing != breaker {
+				return existing
+			}
 
-		if element == nil {
-			return
+			cache.count.Add(1)
+			cache.evictOverflow()
+
+			return breaker
 		}
 
-		entry := element.Value.(*circuitBreakerEntry)
-
-		delete(cache.entries, entry.id)
-		cache.order.Remove(element)
+		if existing := cache.find(id); existing != nil {
+			return existing
+		}
 	}
 }
 
-func (pool *Q[any]) breakerFor(job *Job) *CircuitBreaker {
+func (cache *circuitBreakerCache) evictOverflow() {
+	for cache.count.Load() > int64(cache.limit) {
+		head := cache.head.Load()
+		if head == nil {
+			return
+		}
+
+		next := head.next.Load()
+
+		if cache.head.CompareAndSwap(head, next) {
+			cache.count.Add(-1)
+		}
+	}
+}
+
+func (pool *Q[T]) breakerFor(job *Job) *CircuitBreaker {
 	if pool.breakers == nil {
 		return nil
 	}
@@ -85,7 +104,7 @@ func (pool *Q[any]) breakerFor(job *Job) *CircuitBreaker {
 	return pool.breakers.getOrCreate(job.CircuitID, job.CircuitConfig)
 }
 
-func (pool *Q[any]) breakerForJob(job *Job) *CircuitBreaker {
+func (pool *Q[T]) breakerForJob(job *Job) *CircuitBreaker {
 	if job.circuitBreaker != nil {
 		return job.circuitBreaker
 	}

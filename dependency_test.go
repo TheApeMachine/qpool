@@ -28,13 +28,13 @@ func TestQScheduleDependencyWaitDoesNotStarveWorkers(test *testing.T) {
 		})
 
 		Convey("It should run the dependency producer before the dependent job occupies the worker", func() {
-			parentValue := receiveQValue(test, parentResult)
+			parentValue := receiveResultWait(test, parentResult)
 
 			So(parentValue, ShouldNotBeNil)
 			So(parentValue.Error, ShouldBeNil)
 			So(parentValue.Value, ShouldEqual, "parent")
 
-			childValue := receiveQValue(test, childResult)
+			childValue := receiveResultWait(test, childResult)
 
 			So(childValue, ShouldNotBeNil)
 			So(childValue.Error, ShouldBeNil)
@@ -43,15 +43,3 @@ func TestQScheduleDependencyWaitDoesNotStarveWorkers(test *testing.T) {
 	})
 }
 
-func receiveQValue[T any](test *testing.T, resultChannel <-chan *QValue[T]) *QValue[T] {
-	test.Helper()
-
-	select {
-	case result := <-resultChannel:
-		return result
-	case <-time.After(time.Second):
-		test.Fatal("timed out waiting for qpool result")
-	}
-
-	return nil
-}

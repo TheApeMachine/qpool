@@ -26,7 +26,7 @@ func TestQScheduleFastExecutesJob(test *testing.T) {
 				return "fast", nil
 			})
 
-			result := receiveFastResult(test, resultChannel)
+			result := receiveResultWait(test, resultChannel)
 
 			So(result, ShouldNotBeNil)
 			So(result.Error, ShouldBeNil)
@@ -49,7 +49,7 @@ func TestQScheduleFastReturnsError(test *testing.T) {
 				return nil, expected
 			})
 
-			result := receiveFastResult(test, resultChannel)
+			result := receiveResultWait(test, resultChannel)
 
 			So(result, ShouldNotBeNil)
 			So(errors.Is(result.Error, expected), ShouldBeTrue)
@@ -70,7 +70,7 @@ func TestQScheduleFastRejectsClosedPool(test *testing.T) {
 				return "unexpected", nil
 			})
 
-			result := receiveFastResult(test, resultChannel)
+			result := receiveResultWait(test, resultChannel)
 
 			So(result, ShouldNotBeNil)
 			So(result.Error, ShouldNotBeNil)
@@ -95,7 +95,7 @@ func TestQScheduleFastRespectsPreCanceledContext(test *testing.T) {
 				return "unexpected", nil
 			})
 
-			result := receiveFastResult(test, resultChannel)
+			result := receiveResultWait(test, resultChannel)
 
 			So(result, ShouldNotBeNil)
 			So(errors.Is(result.Error, context.Canceled), ShouldBeTrue)
@@ -140,7 +140,7 @@ func TestQScheduleFastRunsWhenJobQueueIsSaturated(test *testing.T) {
 				return "fast", nil
 			})
 
-			result := receiveFastResult(test, resultChannel)
+			result := receiveResultWait(test, resultChannel)
 
 			So(result, ShouldNotBeNil)
 			So(result.Error, ShouldBeNil)
@@ -151,18 +151,3 @@ func TestQScheduleFastRunsWhenJobQueueIsSaturated(test *testing.T) {
 	})
 }
 
-func receiveFastResult(
-	test *testing.T,
-	resultChannel <-chan *QValue[any],
-) *QValue[any] {
-	test.Helper()
-
-	select {
-	case result := <-resultChannel:
-		return result
-	case <-time.After(time.Second):
-		test.Fatal("timed out waiting for fast result")
-	}
-
-	return nil
-}

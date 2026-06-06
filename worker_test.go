@@ -2,6 +2,7 @@ package qpool
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,28 +22,28 @@ func TestQScheduleJobLifecycle(t *testing.T) {
 
 		defer q.Close()
 
-		done := make(chan struct{})
+		var ran atomic.Bool
 
-		ch := q.Schedule("job-1", func(ctx context.Context) (any, error) {
-			close(done)
+		wait := q.Schedule("job-1", func(ctx context.Context) (any, error) {
+			ran.Store(true)
 
 			return "ok", nil
 		})
 
-		select {
-		case <-time.After(2 * time.Second):
-			t.Fatal("job fn never ran")
-		case <-done:
+		deadline := time.Now().Add(2 * time.Second)
+
+		for !ran.Load() && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
 		}
 
-		select {
-		case <-time.After(2 * time.Second):
-			t.Fatal("result timeout")
-		case res := <-ch:
-			So(res, ShouldNotBeNil)
-			So(res.Error, ShouldBeNil)
-			So(res.Value, ShouldEqual, "ok")
-		}
+		So(ran.Load(), ShouldBeTrue)
+
+		res, err := wait.Get(ctx)
+
+		So(err, ShouldBeNil)
+		So(res, ShouldNotBeNil)
+		So(res.Error, ShouldBeNil)
+		So(res.Value, ShouldEqual, "ok")
 	})
 }
 
@@ -60,18 +61,16 @@ func TestQScheduleRegulatorRejects(t *testing.T) {
 
 		defer q.Close()
 
-		ch := q.Schedule("blocked", func(ctx context.Context) (any, error) {
+		wait := q.Schedule("blocked", func(ctx context.Context) (any, error) {
 			return "nope", nil
 		})
 
-		select {
-		case <-time.After(time.Second):
-			t.Fatal("expected immediate regulator rejection")
-		case res := <-ch:
-			So(res, ShouldNotBeNil)
-			So(res.Error, ShouldNotBeNil)
-			So(res.Error.Error(), ShouldContainSubstring, "rejected")
-		}
+		res, err := wait.Get(context.Background())
+
+		So(err, ShouldBeNil)
+		So(res, ShouldNotBeNil)
+		So(res.Error, ShouldNotBeNil)
+		So(res.Error.Error(), ShouldContainSubstring, "rejected")
 	})
 }
 
@@ -85,18 +84,13 @@ func TestPeekResultReadsStoredJob(t *testing.T) {
 
 		defer q.Close()
 
-		ch := q.Schedule("peek-src", func(ctx context.Context) (any, error) {
+		wait := q.Schedule("peek-src", func(ctx context.Context) (any, error) {
 			return 77, nil
 		})
 
-		var res *QValue[any]
+		res, err := wait.Get(context.Background())
 
-		select {
-		case <-time.After(2 * time.Second):
-			t.Fatal("result timeout waiting for peek-src job")
-		case res = <-ch:
-		}
-
+		So(err, ShouldBeNil)
 		So(res, ShouldNotBeNil)
 		So(res.Error, ShouldBeNil)
 
@@ -119,17 +113,15 @@ func TestDependencyFailureStoresError(t *testing.T) {
 
 		defer q.Close()
 
-		ch := q.Schedule("child", func(ctx context.Context) (any, error) {
+		wait := q.Schedule("child", func(ctx context.Context) (any, error) {
 			return "x", nil
 		}, WithDependencies([]string{"missing"}))
 
-		select {
-		case <-time.After(3 * time.Second):
-			t.Fatal("timeout waiting dependency failure")
-		case res := <-ch:
-			So(res, ShouldNotBeNil)
-			So(res.Error, ShouldNotBeNil)
-			So(res.Error.Error(), ShouldContainSubstring, "dependency missing")
-		}
+		res, err := wait.Get(context.Background())
+
+		So(err, ShouldBeNil)
+		So(res, ShouldNotBeNil)
+		So(res.Error, ShouldNotBeNil)
+		So(res.Error.Error(), ShouldContainSubstring, "dependency missing")
 	})
 }

@@ -2,7 +2,7 @@ package qpool
 
 import (
 	"context"
-	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -42,77 +42,85 @@ func TestQCloseUnblocksBlockedSchedule(test *testing.T) {
 		defer cancel()
 		defer pool.Close()
 
-		started := make(chan struct{})
+		var runningStarted atomic.Bool
 
 		_ = pool.Schedule("running", func(jobCtx context.Context) (any, error) {
-			close(started)
+			runningStarted.Store(true)
 			<-jobCtx.Done()
 
 			return nil, jobCtx.Err()
 		})
 
-		select {
-		case <-started:
-		case <-time.After(time.Second):
-			test.Fatal("running job did not start")
+		deadline := time.Now().Add(time.Second)
+
+		for !runningStarted.Load() && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
 		}
+
+		So(runningStarted.Load(), ShouldBeTrue)
 
 		_ = pool.Schedule("queued", func(jobCtx context.Context) (any, error) {
 			return "queued", nil
 		})
 
-		scheduleEntered := make(chan struct{})
-		blockedResult := make(chan *QValue[any], 1)
+		var scheduleStarted atomic.Bool
+		var blockedResult atomic.Pointer[QValue[any]]
 
 		go func() {
-			close(scheduleEntered)
+			scheduleStarted.Store(true)
 
-			resultChannel := pool.Schedule("blocked", func(jobCtx context.Context) (any, error) {
+			wait := pool.Schedule("blocked", func(jobCtx context.Context) (any, error) {
 				return "blocked", nil
 			})
 
-			result, ok := <-resultChannel
-
-			if !ok {
-				blockedResult <- &QValue[any]{Error: fmt.Errorf("result channel closed")}
+			result, err := wait.Get(context.Background())
+			if err != nil {
+				blockedResult.Store(&QValue[any]{Error: err})
 
 				return
 			}
 
-			blockedResult <- result
+			blockedResult.Store(result)
 		}()
 
-		select {
-		case <-scheduleEntered:
-		case <-time.After(time.Second):
-			test.Fatal("blocked schedule goroutine did not start")
+		deadline = time.Now().Add(time.Second)
+
+		for !scheduleStarted.Load() && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
 		}
+
+		So(scheduleStarted.Load(), ShouldBeTrue)
 
 		time.Sleep(25 * time.Millisecond)
 
-		closeDuration := make(chan time.Duration, 1)
+		var closeDuration atomic.Int64
 		startedAt := time.Now()
 
 		go func() {
 			pool.Close()
-			closeDuration <- time.Since(startedAt)
+			closeDuration.Store(time.Since(startedAt).Nanoseconds())
 		}()
 
-		select {
-		case duration := <-closeDuration:
-			So(duration, ShouldBeLessThan, time.Second)
-		case <-time.After(time.Second):
-			test.Fatal("Close waited for the scheduling timeout")
+		deadline = time.Now().Add(time.Second)
+
+		for closeDuration.Load() == 0 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
 		}
 
-		select {
-		case result := <-blockedResult:
-			So(result, ShouldNotBeNil)
-			So(result.Error, ShouldNotBeNil)
-			So(result.Error.Error(), ShouldNotContainSubstring, "scheduling timeout")
-		case <-time.After(time.Second):
-			test.Fatal("blocked schedule did not unblock")
+		So(closeDuration.Load(), ShouldBeGreaterThan, 0)
+		So(time.Duration(closeDuration.Load()), ShouldBeLessThan, time.Second)
+
+		deadline = time.Now().Add(time.Second)
+
+		for blockedResult.Load() == nil && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
 		}
+
+		result := blockedResult.Load()
+
+		So(result, ShouldNotBeNil)
+		So(result.Error, ShouldNotBeNil)
+		So(result.Error.Error(), ShouldNotContainSubstring, "scheduling timeout")
 	})
 }
 

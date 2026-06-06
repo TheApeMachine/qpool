@@ -1,15 +1,14 @@
 package qpool
 
 import (
-	"sync"
+	"sync/atomic"
 )
 
 /*
 LogController controls qpool's standard logger emission.
 */
 type LogController struct {
-	lock       sync.Mutex
-	suppressed int
+	suppressed atomic.Int64
 }
 
 var defaultLogController = &LogController{}
@@ -19,15 +18,7 @@ SuppressLogging disables qpool and errnie standard logging until the returned
 restore function is called.
 */
 func SuppressLogging() func() {
-	restoreQPool := defaultLogController.Suppress()
-
-	var once sync.Once
-
-	return func() {
-		once.Do(func() {
-			restoreQPool()
-		})
-	}
+	return defaultLogController.Suppress()
 }
 
 /*
@@ -38,23 +29,20 @@ func (controller *LogController) Suppress() func() {
 		return func() {}
 	}
 
-	controller.lock.Lock()
-	controller.suppressed++
-	controller.lock.Unlock()
-
-	var once sync.Once
+	controller.suppressed.Add(1)
 
 	return func() {
-		once.Do(func() {
-			controller.lock.Lock()
-			defer controller.lock.Unlock()
+		for {
+			current := controller.suppressed.Load()
 
-			if controller.suppressed == 0 {
+			if current <= 0 {
 				return
 			}
 
-			controller.suppressed--
-		})
+			if controller.suppressed.CompareAndSwap(current, current-1) {
+				return
+			}
+		}
 	}
 }
 
@@ -66,8 +54,5 @@ func (controller *LogController) Suppressed() bool {
 		return false
 	}
 
-	controller.lock.Lock()
-	defer controller.lock.Unlock()
-
-	return controller.suppressed > 0
+	return controller.suppressed.Load() > 0
 }

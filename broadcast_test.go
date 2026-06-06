@@ -2,7 +2,6 @@ package qpool
 
 import (
 	"testing"
-	"time"
 
 	. "github.com/smartystreets/goconvey/convey"
 )
@@ -14,7 +13,7 @@ func TestNewBroadcaster(test *testing.T) {
 		Convey("It should create an empty subscriber set", func() {
 			So(broadcaster, ShouldNotBeNil)
 			So(broadcaster.subscribers, ShouldNotBeNil)
-			So(len(broadcaster.subscribers), ShouldEqual, 0)
+			So(broadcasterSubscriberCount(broadcaster), ShouldEqual, 0)
 		})
 	})
 }
@@ -79,10 +78,10 @@ func TestSubscription_Close(test *testing.T) {
 		Convey("It should close the event channel and unregister the subscriber", func() {
 			subscription.Close()
 
-			_, channelOpen := <-subscription.Events()
+			_, open := subscription.Poll()
 
-			So(channelOpen, ShouldBeFalse)
-			So(len(broadcaster.subscribers), ShouldEqual, 0)
+			So(open, ShouldBeFalse)
+			So(broadcasterSubscriberCount(broadcaster), ShouldEqual, 0)
 		})
 	})
 }
@@ -99,11 +98,3 @@ func BenchmarkBroadcaster_Publish(benchmark *testing.B) {
 	}
 }
 
-func receiveBroadcastEvent(subscription *Subscription) Event {
-	select {
-	case event := <-subscription.Events():
-		return event
-	case <-time.After(time.Second):
-		return Event{Message: "timeout"}
-	}
-}

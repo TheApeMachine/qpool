@@ -1,9 +1,8 @@
 package qpool
 
 import (
-	"context"
-	"fmt"
-	"runtime/debug"
+	"sync"
+	"sync/atomic"
 )
 
 /*
@@ -12,94 +11,159 @@ executor. It returns the result directly on a lock-free handle and does not
 store results in QSpace, publish telemetry, apply retries, dependencies,
 regulators, circuit breakers, TTLs, or scaler accounting.
 */
-func (q *Q[T]) ScheduleFast(
-	ctx context.Context,
-	fn func(context.Context) (T, error),
-) *ResultWait[T] {
-	slot := newResultSlot()
-
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	if q == nil {
-		slot.Close()
-
-		return errorResultWait[T](fmt.Errorf("qpool: pool closed"))
-	}
-
-	if fn == nil {
-		slot.Close()
-
-		return errorResultWait[T](fmt.Errorf("qpool: nil fast job"))
-	}
-
-	if err := ctx.Err(); err != nil {
-		slot.Close()
-
-		return errorResultWait[T](err)
-	}
-
-	if q.stopping.Load() {
-		slot.Close()
-
-		return errorResultWait[T](fmt.Errorf("qpool: pool closed"))
-	}
-
-	if err := q.ctx.Err(); err != nil {
-		slot.Close()
-
-		return errorResultWait[T](fmt.Errorf("qpool: pool closed: %w", err))
-	}
-
-	if q.fastQueue == nil {
-		slot.Close()
-
-		return errorResultWait[T](fmt.Errorf("qpool: disruptor queue unavailable"))
-	}
-
-	work := fastDisruptorWork{
-		ctx: ctx,
-		fn: func(ctx context.Context) (interface{}, error) {
-			return fn(ctx)
-		},
-		result: slot,
-	}
-
-	err := q.fastQueue.publishFast(ctx, work)
-	if err != nil {
-		slot.Close()
-
-		return errorResultWait[T](fmt.Errorf("qpool: schedule fast job: %w", err))
-	}
-
-	return pendingResultWait[T](slot)
-}
-
-func finishFast(slot *resultSlot, value erasedAny, err error) {
-	if slot == nil {
-		return
-	}
-
-	qvalue, qvalueErr := NewQValue[erasedAny]("", "", value, 0)
-	if qvalueErr != nil {
-		err = qvalueErr
-	}
-
-	qvalue.Error = err
-	slot.Deliver(qvalue)
-}
-
-func invokeFastFnOnce(
-	ctx context.Context,
-	fn func(context.Context) (any, error),
-) (res any, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			res = nil
-			err = fmt.Errorf("qpool: panic in fast job: %v\n%s", r, debug.Stack())
+// Invoke invokes the pre-defined method in PoolWithFunc by assigning the data to an already existing worker
+// or spawning a new worker given queue size is in limits
+func (self *Q[T]) Invoke(value T) {
+	var s *slotFunc[T]
+	for {
+		if s = self.fnPop(); s != nil {
+			s.data = value
+			safe_ready(s.threadPtr)
+			return
+		} else if atomic.AddUint64(&self.workerCount, 1) <= uint64(self.maxWorkers) {
+			s = &slotFunc[T]{data: value}
+			go self.fnLoopQ(s)
+			return
+		} else {
+			atomic.AddUint64(&self.workerCount, uint64SubtractionConstant)
+			mcall(gosched_m)
 		}
-	}()
+	}
+}
 
-	return fn(ctx)
+// represents the infinite loop for a worker goroutine
+func (self *Q[T]) fnLoopQ(d *slotFunc[T]) {
+	d.threadPtr = GetG()
+	for {
+		self.task(d.data)
+		self.fnPush(d)
+		mcall(fast_park)
+	}
+}
+
+// pop pops value from the top of the stack
+func (self *Q[T]) fnPop() (value *slotFunc[T]) {
+	var top, next *dataItem[T]
+	for {
+		top = self.fnTop.Load()
+		if top == nil {
+			return
+		}
+		next = top.next.Load()
+		if self.fnTop.CompareAndSwap(top, next) {
+			value = top.value
+			top.value = nil
+			top.next.Store(nil)
+			self.free(top)
+			return
+		}
+	}
+}
+
+// push pushes a value on top of the stack
+func (self *Q[T]) fnPush(v *slotFunc[T]) {
+	var (
+		top  *dataItem[T]
+		item = self.alloc().(*dataItem[T])
+	)
+
+	item.value = v
+
+	for {
+		top = self.fnTop.Load()
+		item.next.Store(top)
+
+		if self.fnTop.CompareAndSwap(top, item) {
+			return
+		}
+	}
+}
+
+// Submit submits a new task to the pool
+// it first tries to use already parked goroutines from the stack if any
+// if there are no available worker goroutines, it tries to add a
+// new goroutine to the pool if the pool capacity is not exceeded
+// in case the pool capacity hit its maximum limit, this function yields the processor to other
+// goroutines and loops again for finding available workers
+func (self *Q[T]) ScheduleFast(task func()) {
+	var s *slot
+	for {
+		if s = self.pop(); s != nil {
+			s.task = task
+			safe_ready(s.threadPtr)
+			return
+		} else if atomic.AddUint64(&self.workerCount, 1) <= uint64(self.maxWorkers) {
+			s = &slot{task: task}
+			go self.loopQ(s)
+			return
+		} else {
+			atomic.AddUint64(&self.workerCount, uint64SubtractionConstant)
+			mcall(gosched_m)
+		}
+	}
+}
+
+// loopQ is the looping function for every worker goroutine
+func (self *Q[T]) loopQ(s *slot) {
+	// store self goroutine pointer
+	s.threadPtr = GetG()
+	for {
+		// exec task
+		s.task()
+		// notify availability by pushing self reference into stack
+		self.push(s)
+		// park and wait for call
+		mcall(fast_park)
+	}
+}
+
+// global memory pool for all items used in Pool
+var (
+	itemPool  = sync.Pool{New: func() any { return new(node) }}
+	itemAlloc = itemPool.Get
+	itemFree  = itemPool.Put
+)
+
+// internal lock-free stack implementation for parking and waking up goroutines
+// Credits -> https://github.com/golang-design/lockfree
+
+// a single node in this stack
+type node struct {
+	next  atomic.Pointer[node]
+	value *slot
+}
+
+// pop pops value from the top of the stack
+func (self *Q[T]) pop() (value *slot) {
+	var top, next *node
+	for {
+		top = self.top.Load()
+		if top == nil {
+			return
+		}
+		next = top.next.Load()
+		if self.top.CompareAndSwap(top, next) {
+			value = top.value
+			top.value = nil
+			top.next.Store(nil)
+			itemFree(top)
+			return
+		}
+	}
+}
+
+// push pushes a value on top of the stack
+func (self *Q[T]) push(v *slot) {
+	var (
+		top  *node
+		item = itemAlloc().(*node)
+	)
+	item.value = v
+	for {
+		top = self.top.Load()
+		item.next.Store(top)
+		if self.top.CompareAndSwap(top, item) {
+			return
+		}
+	}
 }

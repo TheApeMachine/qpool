@@ -11,6 +11,11 @@ import (
 )
 
 type (
+	slot struct {
+		threadPtr unsafe.Pointer
+		task      func()
+	}
+
 	slotFunc[T any] struct {
 		threadPtr unsafe.Pointer
 		data      T
@@ -26,29 +31,31 @@ type (
 Q combines a disruptor-backed job queue, fixed worker set, optional regulators, and result tracking via QSpace.
 */
 type Q[T any] struct {
-	ctx        context.Context
-	cancel     context.CancelFunc
-	_p1        [cacheLinePadSize - unsafe.Sizeof(uint64(0))]byte
-	alloc      func() any
-	free       func(any)
-	task       func(T)
-	_p2        [cacheLinePadSize - unsafe.Sizeof(uint64(0)) - 3*unsafe.Sizeof(func() {})]byte
-	top        atomic.Pointer[dataItem[T]]
-	_p3        [cacheLinePadSize - unsafe.Sizeof(atomic.Pointer[dataItem[T]]{})]byte
-	deps       atomicWaitGroup
-	scalerWG   atomicWaitGroup
-	jobQueue   *jobDisruptorQueue
-	fastQueue  *jobDisruptorQueue
-	stopping   atomic.Bool
-	minWorkers int
-	maxWorkers int
-	space      *QSpace
-	scaler     *Scaler
-	metrics    *Metrics
-	breakers   *circuitBreakerCache
-	registry   *workerRegistry
-	nextWorker atomic.Uint64
-	config     *Config
+	ctx         context.Context
+	cancel      context.CancelFunc
+	_p1         [cacheLinePadSize - unsafe.Sizeof(uint64(0))]byte
+	alloc       func() any
+	free        func(any)
+	task        func(T)
+	_p2         [cacheLinePadSize - unsafe.Sizeof(uint64(0)) - 3*unsafe.Sizeof(func() {})]byte
+	fnTop       atomic.Pointer[dataItem[T]]
+	top         atomic.Pointer[node]
+	_p3         [cacheLinePadSize - unsafe.Sizeof(atomic.Pointer[dataItem[T]]{})]byte
+	workerCount uint64
+	deps        atomicWaitGroup
+	scalerWG    atomicWaitGroup
+	jobQueue    *jobDisruptorQueue
+	fastQueue   *jobDisruptorQueue
+	stopping    atomic.Bool
+	minWorkers  int
+	maxWorkers  int
+	space       *QSpace
+	scaler      *Scaler
+	metrics     *Metrics
+	breakers    *circuitBreakerCache
+	registry    *workerRegistry
+	nextWorker  atomic.Uint64
+	config      *Config
 }
 
 /*

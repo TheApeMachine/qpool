@@ -21,8 +21,7 @@ const (
 
 type jobDisruptorQueue struct {
 	disruptor     disruptor.Disruptor
-	ring          []jobDisruptorSlot
-	mask          int64
+	ring          RingBuffer[jobDisruptorSlot]
 	pool          *Q[any]
 	wg            *WaitGroup
 	closed        atomic.Bool
@@ -49,30 +48,32 @@ func newJobDisruptorQueue(
 		maxWorkers = 1
 	}
 
-	capacity := nextPowerOfTwo(max(1, queueCapacity+maxWorkers))
+	capacity := max(1, queueCapacity+maxWorkers)
 	queue := &jobDisruptorQueue{
-		ring: make([]jobDisruptorSlot, capacity),
-		mask: int64(capacity - 1),
+		ring: NewRingBuffer[jobDisruptorSlot](capacity),
 		pool: pool,
+		wg:   &WaitGroup{},
 	}
 
-	for i := range queue.ring {
-		queue.ring[i].worker.Store(unassignedDisruptorWorker)
+	for sequence := int64(0); sequence < int64(queue.ring.Capacity()); sequence++ {
+		queue.ring.Slot(sequence).worker.Store(unassignedDisruptorWorker)
 	}
 
 	handlers := make([]disruptor.Handler, maxWorkers)
-	for i := range handlers {
-		handlers[i] = &jobDisruptorHandler{
+
+	for index := range handlers {
+		handlers[index] = &jobDisruptorHandler{
 			queue:       queue,
-			workerIndex: int64(i),
+			workerIndex: int64(index),
 		}
 	}
 
 	instance, err := disruptor.New(
-		disruptor.Options.BufferCapacity(uint32(capacity)),
+		disruptor.Options.BufferCapacity(uint32(queue.ring.Capacity())),
 		disruptor.Options.WriterCount(2),
 		disruptor.Options.NewHandlerGroup(handlers...),
 	)
+
 	if err != nil {
 		return nil, fmt.Errorf("qpool: initialize disruptor job queue: %w", err)
 	}
@@ -123,14 +124,15 @@ func (queue *jobDisruptorQueue) publish(
 		}
 
 		upper := queue.disruptor.TryReserve(1)
+
 		switch upper {
 		case disruptor.ErrCapacityUnavailable:
-			backoffDisruptorReservation(spin)
+			queue.backoffReservation(spin)
 			continue
 		case disruptor.ErrReservationSize:
 			return fmt.Errorf("qpool: invalid disruptor reservation")
 		default:
-			slot := &queue.ring[upper&queue.mask]
+			slot := queue.ring.Slot(upper)
 			slot.worker.Store(unassignedDisruptorWorker)
 			slot.kind = kind
 			slot.job = job
@@ -144,6 +146,16 @@ func (queue *jobDisruptorQueue) publish(
 			return nil
 		}
 	}
+}
+
+func (queue *jobDisruptorQueue) backoffReservation(spin int) {
+	if spin < 64 {
+		runtime.Gosched()
+
+		return
+	}
+
+	time.Sleep(100 * time.Microsecond)
 }
 
 func (queue *jobDisruptorQueue) Close() {
@@ -161,7 +173,7 @@ func (queue *jobDisruptorQueue) Close() {
 
 func (handler *jobDisruptorHandler) Handle(lowerSequence, upperSequence int64) {
 	for sequence := lowerSequence; sequence <= upperSequence; sequence++ {
-		slot := &handler.queue.ring[sequence&handler.queue.mask]
+		slot := handler.queue.ring.Slot(sequence)
 		assignedWorker := handler.assignedWorker(slot, sequence)
 
 		if assignedWorker != handler.workerIndex {
@@ -183,7 +195,6 @@ func (handler *jobDisruptorHandler) handleJob(slot *jobDisruptorSlot) {
 
 	func() {
 		defer handler.queue.pool.metrics.decBusyWorker()
-
 		processJob(handler.queue.pool, handler.queue.pool.ctx, slot.job)
 	}()
 }
@@ -194,38 +205,16 @@ func (handler *jobDisruptorHandler) assignedWorker(
 ) int64 {
 	for {
 		assigned := slot.worker.Load()
+
 		if assigned != unassignedDisruptorWorker {
 			return assigned
 		}
 
 		activeWorkers := max(handler.queue.activeWorkers.Load(), 1)
-
 		worker := sequence % activeWorkers
+
 		if slot.worker.CompareAndSwap(unassignedDisruptorWorker, worker) {
 			return worker
 		}
 	}
-}
-
-func backoffDisruptorReservation(spin int) {
-	if spin < 64 {
-		runtime.Gosched()
-		return
-	}
-
-	time.Sleep(100 * time.Microsecond)
-}
-
-func nextPowerOfTwo(value int) int {
-	if value <= 1 {
-		return 1
-	}
-
-	power := 1
-
-	for power < value {
-		power <<= 1
-	}
-
-	return power
 }

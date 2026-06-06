@@ -1,9 +1,6 @@
 package qpool
 
-import (
-	"hash/fnv"
-	"sync/atomic"
-)
+import "sync/atomic"
 
 type GroupRegistryEntry struct {
 	keyHash uint64
@@ -12,9 +9,24 @@ type GroupRegistryEntry struct {
 	next    atomic.Pointer[GroupRegistryEntry]
 }
 
+type groupRegistryShard struct {
+	entries IntrusiveList[GroupRegistryEntry]
+}
+
 type GroupRegistry struct {
-	shards [registryShardCount]struct {
-		head atomic.Pointer[GroupRegistryEntry]
+	shards [registryShardCount]groupRegistryShard
+}
+
+func (registry *GroupRegistry) init() {
+	for shardIndex := range registry.shards {
+		registry.shards[shardIndex].entries.bind(
+			func(entry *GroupRegistryEntry) *GroupRegistryEntry {
+				return entry.next.Load()
+			},
+			func(entry, next *GroupRegistryEntry) {
+				entry.next.Store(next)
+			},
+		)
 	}
 }
 
@@ -23,8 +35,8 @@ func (registry *GroupRegistry) store(key string, group *BroadcastGroup) {
 		return
 	}
 
-	shard := &registry.shards[groupShardIndex(key)]
-	keyHash := fnvHash(key)
+	shard := &registry.shards[keyIndexer{}.shard(key)]
+	keyHash := keyIndexer{}.hash(key)
 
 	entry := &GroupRegistryEntry{
 		keyHash: keyHash,
@@ -33,14 +45,7 @@ func (registry *GroupRegistry) store(key string, group *BroadcastGroup) {
 
 	entry.group.Store(group)
 
-	for {
-		head := shard.head.Load()
-		entry.next.Store(head)
-
-		if shard.head.CompareAndSwap(head, entry) {
-			return
-		}
-	}
+	shard.entries.Prepend(entry)
 }
 
 func (registry *GroupRegistry) load(key string) *BroadcastGroup {
@@ -48,16 +53,18 @@ func (registry *GroupRegistry) load(key string) *BroadcastGroup {
 		return nil
 	}
 
-	shard := &registry.shards[groupShardIndex(key)]
-	keyHash := fnvHash(key)
+	shard := &registry.shards[keyIndexer{}.shard(key)]
+	keyHash := keyIndexer{}.hash(key)
 
-	for entry := shard.head.Load(); entry != nil; entry = entry.next.Load() {
-		if entry.keyHash == keyHash && entry.key == key {
-			return entry.group.Load()
-		}
+	entry := shard.entries.Find(func(entry *GroupRegistryEntry) bool {
+		return entry.keyHash == keyHash && entry.key == key
+	})
+
+	if entry == nil {
+		return nil
 	}
 
-	return nil
+	return entry.group.Load()
 }
 
 func (registry *GroupRegistry) closeAll() {
@@ -66,19 +73,10 @@ func (registry *GroupRegistry) closeAll() {
 	}
 
 	for shardIndex := range registry.shards {
-		shard := &registry.shards[shardIndex]
-
-		for entry := shard.head.Load(); entry != nil; entry = entry.next.Load() {
+		registry.shards[shardIndex].entries.Walk(func(entry *GroupRegistryEntry) {
 			if group := entry.group.Load(); group != nil {
 				group.Close()
 			}
-		}
+		})
 	}
-}
-
-func groupShardIndex(key string) uint64 {
-	hasher := fnv.New64a()
-	_, _ = hasher.Write([]byte(key))
-
-	return hasher.Sum64() % registryShardCount
 }

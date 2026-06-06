@@ -19,11 +19,21 @@ type workerStackNode struct {
 }
 
 type workerRegistry struct {
-	head atomic.Pointer[workerStackNode]
+	workers IntrusiveList[workerStackNode]
 }
 
 func newWorkerRegistry() *workerRegistry {
-	return &workerRegistry{}
+	registry := &workerRegistry{}
+	registry.workers.bind(
+		func(node *workerStackNode) *workerStackNode {
+			return node.next.Load()
+		},
+		func(node, next *workerStackNode) {
+			node.next.Store(next)
+		},
+	)
+
+	return registry
 }
 
 func (registry *workerRegistry) push(token *workerToken) {
@@ -31,16 +41,7 @@ func (registry *workerRegistry) push(token *workerToken) {
 		return
 	}
 
-	node := &workerStackNode{token: token}
-
-	for {
-		head := registry.head.Load()
-		node.next.Store(head)
-
-		if registry.head.CompareAndSwap(head, node) {
-			return
-		}
-	}
+	registry.workers.Prepend(&workerStackNode{token: token})
 }
 
 func (registry *workerRegistry) popLast() *workerToken {
@@ -48,52 +49,19 @@ func (registry *workerRegistry) popLast() *workerToken {
 		return nil
 	}
 
-	for {
-		head := registry.head.Load()
-		if head == nil {
-			return nil
-		}
+	node := registry.workers.PopHead()
 
-		next := head.next.Load()
-
-		if registry.head.CompareAndSwap(head, next) {
-			return head.token
-		}
+	if node == nil {
+		return nil
 	}
+
+	return node.token
 }
 
 func (registry *workerRegistry) remove(id uint64) {
-	if registry == nil {
-		return
-	}
-
-	for {
-		prev := (*workerStackNode)(nil)
-		current := registry.head.Load()
-
-		for current != nil {
-			next := current.next.Load()
-
-			if current.token != nil && current.token.id == id {
-				if prev == nil {
-					if registry.head.CompareAndSwap(current, next) {
-						return
-					}
-
-					break
-				}
-
-				prev.next.Store(next)
-
-				return
-			}
-
-			prev = current
-			current = next
-		}
-
-		return
-	}
+	registry.workers.Remove(func(node *workerStackNode) bool {
+		return node.token != nil && node.token.id == id
+	})
 }
 
 func (pool *Q[T]) startWorker() {
@@ -183,6 +151,7 @@ func (pool *Q[T]) closePool() {
 func (pool *Q[T]) deactivateWorkers() {
 	for {
 		token := pool.registry.popLast()
+
 		if token == nil {
 			return
 		}

@@ -16,20 +16,79 @@ const (
 
 var defaultTelemetryGroup *BroadcastGroup
 
-type groupRegistryEntryGlobal struct {
-	keyHash uint64
-	key     string
-	group   atomic.Pointer[BroadcastGroup]
-	next    atomic.Pointer[groupRegistryEntryGlobal]
+type subscriberEntry struct {
+	id         string
+	subscriber *Subscriber
+	next       atomic.Pointer[subscriberEntry]
 }
 
-var broadcastGroupHead atomic.Pointer[groupRegistryEntryGlobal]
+type subscriberEntryList struct {
+	list IntrusiveList[subscriberEntry]
+}
+
+func newSubscriberEntryList() subscriberEntryList {
+	entries := subscriberEntryList{}
+	entries.list.bind(
+		func(entry *subscriberEntry) *subscriberEntry {
+			return entry.next.Load()
+		},
+		func(entry, next *subscriberEntry) {
+			entry.next.Store(next)
+		},
+	)
+
+	return entries
+}
+
+func (entries *subscriberEntryList) Prepend(entry *subscriberEntry) {
+	entries.list.Prepend(entry)
+}
+
+func (entries *subscriberEntryList) Remove(id string) *subscriberEntry {
+	entry := entries.list.Find(func(entry *subscriberEntry) bool {
+		return entry.id == id
+	})
+
+	entries.list.Remove(func(entry *subscriberEntry) bool {
+		return entry.id == id
+	})
+
+	return entry
+}
+
+func (entries *subscriberEntryList) IsEmpty() bool {
+	return entries.list.Head() == nil
+}
+
+func (entries *subscriberEntryList) Find(id string) *subscriberEntry {
+	return entries.list.Find(func(entry *subscriberEntry) bool {
+		return entry.id == id
+	})
+}
+
+func (entries *subscriberEntryList) Walk(visitor func(*subscriberEntry)) {
+	entries.list.Walk(visitor)
+}
+
+func (entries *subscriberEntryList) Clear() {
+	entries.list.Clear()
+}
+
+func (entries *subscriberEntryList) count() int {
+	count := 0
+
+	entries.list.Walk(func(*subscriberEntry) {
+		count++
+	})
+
+	return count
+}
 
 /*
 BroadcastConsumer receives values from a broadcast group without channels.
 */
 type BroadcastConsumer struct {
-	ring *spscQValueRing
+	ring *SpscQValueRing
 }
 
 /*
@@ -95,13 +154,7 @@ type BroadcastGroup struct {
 	ID               string
 	nextSubscriberID atomic.Uint64
 	dropOldestOnFull bool
-	subscribers      atomic.Pointer[subscriberEntry]
-}
-
-type subscriberEntry struct {
-	id         string
-	subscriber *Subscriber
-	next       atomic.Pointer[subscriberEntry]
+	subscribers      subscriberEntryList
 }
 
 /*
@@ -118,6 +171,7 @@ func newStandaloneBroadcastGroup(dropOldestOnFull bool) *BroadcastGroup {
 		ctx:              ctx,
 		cancel:           cancel,
 		dropOldestOnFull: dropOldestOnFull,
+		subscribers:      newSubscriberEntryList(),
 	}
 }
 
@@ -129,6 +183,7 @@ func initDefaultTelemetryGroup() *BroadcastGroup {
 		cancel:           cancel,
 		ID:               telemetryGroupID,
 		dropOldestOnFull: true,
+		subscribers:      newSubscriberEntryList(),
 	}
 }
 
@@ -145,19 +200,16 @@ NewBroadcastGroup starts a group that owns subscriber registrations.
 func NewBroadcastGroup(
 	ctx context.Context, id string, ttl time.Duration,
 ) (*BroadcastGroup, error) {
-	if existing := findBroadcastGroup(id); existing != nil {
-		return existing, nil
-	}
+	_ = ttl
 
 	ctx, cancel := context.WithCancel(ctx)
 
 	bg := &BroadcastGroup{
-		ctx:    ctx,
-		cancel: cancel,
-		ID:     id,
+		ctx:         ctx,
+		cancel:      cancel,
+		ID:          id,
+		subscribers: newSubscriberEntryList(),
 	}
-
-	bg.store()
 
 	return bg, errnie.Require(
 		map[string]any{
@@ -166,73 +218,6 @@ func NewBroadcastGroup(
 			"id":     bg.ID,
 		},
 	)
-}
-
-func findBroadcastGroup(id string) *BroadcastGroup {
-	keyHash := fnvHash(id)
-
-	for entry := broadcastGroupHead.Load(); entry != nil; entry = entry.next.Load() {
-		if entry.keyHash == keyHash && entry.key == id {
-			return entry.group.Load()
-		}
-	}
-
-	return nil
-}
-
-func (bg *BroadcastGroup) store() {
-	entry := &groupRegistryEntryGlobal{
-		keyHash: fnvHash(bg.ID),
-		key:     bg.ID,
-	}
-
-	entry.group.Store(bg)
-
-	for {
-		head := broadcastGroupHead.Load()
-		entry.next.Store(head)
-
-		if broadcastGroupHead.CompareAndSwap(head, entry) {
-			return
-		}
-	}
-}
-
-func (bg *BroadcastGroup) delete() {
-	keyHash := fnvHash(bg.ID)
-
-	for {
-		prev := (*groupRegistryEntryGlobal)(nil)
-		current := broadcastGroupHead.Load()
-		retry := false
-
-		for current != nil {
-			next := current.next.Load()
-
-			if current.keyHash == keyHash && current.key == bg.ID {
-				if prev == nil {
-					if broadcastGroupHead.CompareAndSwap(current, next) {
-						return
-					}
-
-					retry = true
-
-					break
-				}
-
-				prev.next.Store(next)
-
-				return
-			}
-
-			prev = current
-			current = next
-		}
-
-		if !retry {
-			return
-		}
-	}
 }
 
 /*
@@ -260,7 +245,7 @@ func (bg *BroadcastGroup) Subscribe(
 	}
 
 	consumer := &BroadcastConsumer{
-		ring: newSPSCQValueRing(bufferSize, bg.dropOldestOnFull),
+		ring: NewSPSCRing[QValue[erasedAny]](bufferSize, bg.dropOldestOnFull),
 	}
 	subscriber := &Subscriber{
 		ID:       subscriberID,
@@ -272,14 +257,9 @@ func (bg *BroadcastGroup) Subscribe(
 		subscriber: subscriber,
 	}
 
-	for {
-		head := bg.subscribers.Load()
-		entry.next.Store(head)
+	bg.subscribers.Prepend(entry)
 
-		if bg.subscribers.CompareAndSwap(head, entry) {
-			return consumer
-		}
-	}
+	return consumer
 }
 
 /*
@@ -318,16 +298,16 @@ func (bg *BroadcastGroup) Publish(event Event) {
 	default:
 	}
 
-	for entry := bg.subscribers.Load(); entry != nil; entry = entry.next.Load() {
+	bg.subscribers.Walk(func(entry *subscriberEntry) {
 		if entry.subscriber == nil || entry.subscriber.consumer == nil {
-			continue
+			return
 		}
 
 		cloned := event.clone()
 		value := &QValue[erasedAny]{Value: cloned}
 
 		entry.subscriber.consumer.ring.Push(value)
-	}
+	})
 }
 
 /*
@@ -378,45 +358,10 @@ func (bg *BroadcastGroup) Unsubscribe(subscriberID string) {
 	default:
 	}
 
-	for {
-		prev := (*subscriberEntry)(nil)
-		current := bg.subscribers.Load()
-		retry := false
+	entry := bg.subscribers.Remove(subscriberID)
 
-		for current != nil {
-			next := current.next.Load()
-
-			if current.id == subscriberID {
-				if prev == nil {
-					if bg.subscribers.CompareAndSwap(current, next) {
-						if current.subscriber != nil && current.subscriber.consumer != nil {
-							current.subscriber.consumer.ring.Close()
-						}
-
-						return
-					}
-
-					retry = true
-
-					break
-				}
-
-				prev.next.Store(next)
-
-				if current.subscriber != nil && current.subscriber.consumer != nil {
-					current.subscriber.consumer.ring.Close()
-				}
-
-				return
-			}
-
-			prev = current
-			current = next
-		}
-
-		if !retry {
-			return
-		}
+	if entry != nil && entry.subscriber != nil && entry.subscriber.consumer != nil {
+		entry.subscriber.consumer.ring.Close()
 	}
 }
 
@@ -435,32 +380,26 @@ func (bg *BroadcastGroup) Send(qv *QValue[erasedAny]) {
 	}
 
 	if qv.ReceiverID != "" {
-		for entry := bg.subscribers.Load(); entry != nil; entry = entry.next.Load() {
-			if entry.id != qv.ReceiverID {
-				continue
-			}
+		entry := bg.subscribers.Find(qv.ReceiverID)
 
-			if entry.subscriber != nil && entry.subscriber.consumer != nil {
-				entry.subscriber.consumer.ring.Push(qv)
-			}
-
-			return
+		if entry != nil && entry.subscriber != nil && entry.subscriber.consumer != nil {
+			entry.subscriber.consumer.ring.Push(qv)
 		}
 
 		return
 	}
 
-	for entry := bg.subscribers.Load(); entry != nil; entry = entry.next.Load() {
+	bg.subscribers.Walk(func(entry *subscriberEntry) {
 		if entry.subscriber == nil || entry.subscriber.consumer == nil {
-			continue
+			return
 		}
 
 		if entry.id == qv.SenderID {
-			continue
+			return
 		}
 
 		entry.subscriber.consumer.ring.Push(qv)
-	}
+	})
 }
 
 /*
@@ -479,12 +418,11 @@ func (bg *BroadcastGroup) Close() {
 
 	bg.cancel()
 
-	for entry := bg.subscribers.Load(); entry != nil; entry = entry.next.Load() {
+	bg.subscribers.Walk(func(entry *subscriberEntry) {
 		if entry.subscriber != nil && entry.subscriber.consumer != nil {
 			entry.subscriber.consumer.ring.Close()
 		}
-	}
+	})
 
-	bg.subscribers.Store(nil)
-	bg.delete()
+	bg.subscribers.Clear()
 }

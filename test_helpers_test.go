@@ -25,13 +25,7 @@ func broadcastGroupSubscriberCount(group *BroadcastGroup) int {
 		return 0
 	}
 
-	count := 0
-
-	for entry := group.subscribers.Load(); entry != nil; entry = entry.next.Load() {
-		count++
-	}
-
-	return count
+	return group.subscribers.count()
 }
 
 func receiveBroadcastEvent(subscription *Subscription) Event {

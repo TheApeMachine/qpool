@@ -26,7 +26,7 @@ type Config struct {
 /*
 NewConfig returns defaults including an enabled periodic scaler.
 
-Set Scaler to nil to disable the built-in scaling goroutine (for example when using AdaptiveScalerRegulator alone).
+Set Scaler to nil to disable the built-in scaling goroutine.
 */
 func NewConfig() *Config {
 	return &Config{

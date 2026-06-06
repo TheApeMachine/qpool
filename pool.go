@@ -79,7 +79,7 @@ func NewQ[T any](ctx context.Context, minWorkers, maxWorkers int, config *Config
 
 	ctx, cancel := context.WithCancel(ctx)
 
-	capacity := maxWorkers * 10
+	capacity := config.Scaler.jobQueueCapacity(maxWorkers)
 
 	if config.JobChannelCapacity > 0 {
 		capacity = config.JobChannelCapacity
@@ -90,6 +90,8 @@ func NewQ[T any](ctx context.Context, minWorkers, maxWorkers int, config *Config
 		cancel:     cancel,
 		minWorkers: minWorkers,
 		maxWorkers: maxWorkers,
+		deps:       &WaitGroup{},
+		scalerWG:   &WaitGroup{},
 		space:      NewQSpace(),
 		metrics:    NewMetrics(),
 		breakers:   newCircuitBreakerCache(config.CircuitBreakerLimit),
@@ -257,18 +259,30 @@ func (q *Q[T]) Schedule(
 		opt(&job)
 	}
 
-	if q.config != nil && len(q.config.Regulators) > 0 {
+	if q.scaler != nil || (q.config != nil && len(q.config.Regulators) > 0) {
 		reading := q.metrics.CollectReading()
 
-		for _, reg := range q.config.Regulators {
-			reg.Observe(reading)
-		}
+		if q.scaler != nil {
+			q.scaler.Observe(reading)
 
-		for _, reg := range q.config.Regulators {
-			if reg.Limit() {
+			if q.scaler.Limit() {
 				q.metrics.incThrottled()
 
-				return errorResultWait[T](fmt.Errorf("qpool: regulator rejected schedule"))
+				return errorResultWait[T](fmt.Errorf("qpool: pool saturated"))
+			}
+		}
+
+		if q.config != nil {
+			for _, regulator := range q.config.Regulators {
+				regulator.Observe(reading)
+			}
+
+			for _, regulator := range q.config.Regulators {
+				if regulator.Limit() {
+					q.metrics.incThrottled()
+
+					return errorResultWait[T](fmt.Errorf("qpool: regulator rejected schedule"))
+				}
 			}
 		}
 	}

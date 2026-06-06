@@ -4,33 +4,52 @@ import (
 	"sync/atomic"
 )
 
-type SpscQValueRing struct {
-	slots            []atomic.Pointer[QValue[erasedAny]]
+/*
+SPSCRing is a single-producer single-consumer queue backed by atomic slots.
+Broadcast subscribers poll values from one of these rings.
+*/
+type SPSCRing[T any] struct {
+	slots            []atomic.Pointer[T]
 	mask             uint64
 	head             atomic.Uint64
 	tail             atomic.Uint64
 	dropOldestOnFull bool
 }
 
-func NewSPSCQValueRing(capacity int, dropOldestOnFull bool) *SpscQValueRing {
-	if capacity < 1 {
-		capacity = 1
-	}
+/*
+SpscQValueRing carries broadcast payloads for a single subscriber.
+*/
+type SpscQValueRing = SPSCRing[QValue[erasedAny]]
 
-	if !dropOldestOnFull && capacity < 2 {
-		capacity = 2
-	}
+/*
+NewSPSCRing allocates a single-producer single-consumer queue.
+*/
+func NewSPSCRing[T any](capacity int, dropOldestOnFull bool) *SPSCRing[T] {
+	prototype := &SPSCRing[T]{dropOldestOnFull: dropOldestOnFull}
+	capacity = prototype.normalizeCapacity(capacity)
 
-	capacity = nextPowerOfTwo(capacity)
-
-	return &SpscQValueRing{
-		slots:            make([]atomic.Pointer[QValue[erasedAny]], capacity),
+	return &SPSCRing[T]{
+		slots:            make([]atomic.Pointer[T], capacity),
 		mask:             uint64(capacity - 1),
 		dropOldestOnFull: dropOldestOnFull,
 	}
 }
 
-func (ring *SpscQValueRing) Push(value *QValue[erasedAny]) bool {
+func (ring *SPSCRing[T]) normalizeCapacity(capacity int) int {
+	if capacity < 1 {
+		capacity = 1
+	}
+
+	if !ring.dropOldestOnFull && capacity < 2 {
+		capacity = 2
+	}
+
+	normalizer := RingBuffer[T]{}
+
+	return normalizer.next(capacity)
+}
+
+func (ring *SPSCRing[T]) Push(value *T) bool {
 	if ring == nil || value == nil {
 		return false
 	}
@@ -63,7 +82,7 @@ func (ring *SpscQValueRing) Push(value *QValue[erasedAny]) bool {
 	}
 }
 
-func (ring *SpscQValueRing) Pop() *QValue[erasedAny] {
+func (ring *SPSCRing[T]) Pop() *T {
 	if ring == nil {
 		return nil
 	}
@@ -91,7 +110,7 @@ func (ring *SpscQValueRing) Pop() *QValue[erasedAny] {
 	}
 }
 
-func (ring *SpscQValueRing) Close() {
+func (ring *SPSCRing[T]) Close() {
 	if ring == nil {
 		return
 	}

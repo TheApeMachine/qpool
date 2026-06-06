@@ -12,7 +12,7 @@ func TestNewBroadcaster(test *testing.T) {
 
 		Convey("It should create an empty subscriber set", func() {
 			So(broadcaster, ShouldNotBeNil)
-			So(broadcaster.subscribers.Load(), ShouldBeNil)
+			So(broadcaster.subscribers.IsEmpty(), ShouldBeTrue)
 			So(broadcastGroupSubscriberCount(broadcaster), ShouldEqual, 0)
 		})
 	})

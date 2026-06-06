@@ -1,0 +1,5 @@
+{
+	"go.buildFlags": ["-ldflags=-checklinkname=0"],
+	"go.testFlags": ["-ldflags=-checklinkname=0"],
+	"go.testTimeout": "30s"
+}

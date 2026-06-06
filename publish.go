@@ -8,8 +8,10 @@ import (
 var Publish func(Event)
 
 func init() {
+	defaultTelemetryGroup = initDefaultTelemetryGroup()
+
 	Publish = func(event Event) {
-		defaultBroadcaster.Publish(event)
+		defaultTelemetryGroup.Publish(event)
 
 		if defaultLogController.Suppressed() {
 			return

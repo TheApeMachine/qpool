@@ -315,3 +315,11 @@ A very subtle failure mode you will encounter is that you will look at the git h
 ## dropg Linker Error
 
 Read the Makefile!
+
+YOU ARE NOT ALLOWED TO TOUCH:
+
+- lib_runtime_linkage.go
+- Any and ALL Assembly (.s) files
+- fastpath.go
+
+AND YOU ARE NOT ALLOWED TO IGNORE ANY CODE FOR CERTAIN GO VERSIONS!

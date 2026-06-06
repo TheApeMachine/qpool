@@ -12,8 +12,8 @@ func TestNewBroadcaster(test *testing.T) {
 
 		Convey("It should create an empty subscriber set", func() {
 			So(broadcaster, ShouldNotBeNil)
-			So(broadcaster.subscribers, ShouldNotBeNil)
-			So(broadcasterSubscriberCount(broadcaster), ShouldEqual, 0)
+			So(broadcaster.subscribers.Load(), ShouldBeNil)
+			So(broadcastGroupSubscriberCount(broadcaster), ShouldEqual, 0)
 		})
 	})
 }
@@ -21,7 +21,7 @@ func TestNewBroadcaster(test *testing.T) {
 func TestBroadcaster_Subscribe(test *testing.T) {
 	Convey("Given Broadcaster Subscribe", test, func() {
 		broadcaster := NewBroadcaster()
-		subscription := broadcaster.Subscribe(1)
+		subscription := broadcaster.SubscribeEvents(1)
 		defer subscription.Close()
 
 		Convey("It should receive published events", func() {
@@ -47,8 +47,8 @@ func TestBroadcaster_Subscribe(test *testing.T) {
 func TestBroadcaster_Publish(test *testing.T) {
 	Convey("Given Broadcaster Publish", test, func() {
 		broadcaster := NewBroadcaster()
-		firstSubscription := broadcaster.Subscribe(1)
-		secondSubscription := broadcaster.Subscribe(1)
+		firstSubscription := broadcaster.SubscribeEvents(1)
+		secondSubscription := broadcaster.SubscribeEvents(1)
 		defer firstSubscription.Close()
 		defer secondSubscription.Close()
 
@@ -73,7 +73,7 @@ func TestBroadcaster_Publish(test *testing.T) {
 func TestSubscription_Close(test *testing.T) {
 	Convey("Given Subscription Close", test, func() {
 		broadcaster := NewBroadcaster()
-		subscription := broadcaster.Subscribe(1)
+		subscription := broadcaster.SubscribeEvents(1)
 
 		Convey("It should close the event channel and unregister the subscriber", func() {
 			subscription.Close()
@@ -81,14 +81,14 @@ func TestSubscription_Close(test *testing.T) {
 			_, open := subscription.Poll()
 
 			So(open, ShouldBeFalse)
-			So(broadcasterSubscriberCount(broadcaster), ShouldEqual, 0)
+			So(broadcastGroupSubscriberCount(broadcaster), ShouldEqual, 0)
 		})
 	})
 }
 
 func BenchmarkBroadcaster_Publish(benchmark *testing.B) {
 	broadcaster := NewBroadcaster()
-	subscription := broadcaster.Subscribe(64)
+	subscription := broadcaster.SubscribeEvents(64)
 	defer subscription.Close()
 
 	event := NewInfoEvent("component", "op", "message", nil)
@@ -97,4 +97,3 @@ func BenchmarkBroadcaster_Publish(benchmark *testing.B) {
 		broadcaster.Publish(event)
 	}
 }
-

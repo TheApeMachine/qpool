@@ -2,11 +2,19 @@ package qpool
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"time"
 
 	"github.com/theapemachine/errnie"
 )
+
+const (
+	defaultBroadcastBuffer = 128
+	telemetryGroupID       = "__qpool.telemetry__"
+)
+
+var defaultTelemetryGroup *BroadcastGroup
 
 type groupRegistryEntryGlobal struct {
 	keyHash uint64
@@ -68,20 +76,67 @@ type Subscriber struct {
 }
 
 /*
+Subscription receives telemetry events from a BroadcastGroup.
+*/
+type Subscription struct {
+	group        *BroadcastGroup
+	subscriberID string
+	consumer     *BroadcastConsumer
+	closed       atomic.Bool
+}
+
+/*
 BroadcastGroup routes publisher messages to subscribers without mutexes or channels.
 */
 type BroadcastGroup struct {
-	ctx         context.Context
-	cancel      context.CancelFunc
-	err         error
-	ID          string
-	subscribers atomic.Pointer[subscriberEntry]
+	ctx              context.Context
+	cancel           context.CancelFunc
+	err              error
+	ID               string
+	nextSubscriberID atomic.Uint64
+	dropOldestOnFull bool
+	subscribers      atomic.Pointer[subscriberEntry]
 }
 
 type subscriberEntry struct {
 	id         string
 	subscriber *Subscriber
 	next       atomic.Pointer[subscriberEntry]
+}
+
+/*
+NewBroadcaster creates a standalone broadcast group for telemetry-style fan-out.
+*/
+func NewBroadcaster() *BroadcastGroup {
+	return newStandaloneBroadcastGroup(true)
+}
+
+func newStandaloneBroadcastGroup(dropOldestOnFull bool) *BroadcastGroup {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	return &BroadcastGroup{
+		ctx:              ctx,
+		cancel:           cancel,
+		dropOldestOnFull: dropOldestOnFull,
+	}
+}
+
+func initDefaultTelemetryGroup() *BroadcastGroup {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	return &BroadcastGroup{
+		ctx:              ctx,
+		cancel:           cancel,
+		ID:               telemetryGroupID,
+		dropOldestOnFull: true,
+	}
+}
+
+/*
+Subscribe registers a listener on the default qpool telemetry stream.
+*/
+func Subscribe(buffer int) *Subscription {
+	return defaultTelemetryGroup.SubscribeEvents(buffer)
 }
 
 /*
@@ -102,7 +157,7 @@ func NewBroadcastGroup(
 		ID:     id,
 	}
 
-	storeBroadcastGroup(id, bg)
+	bg.store()
 
 	return bg, errnie.Require(
 		map[string]any{
@@ -125,13 +180,13 @@ func findBroadcastGroup(id string) *BroadcastGroup {
 	return nil
 }
 
-func storeBroadcastGroup(id string, group *BroadcastGroup) {
+func (bg *BroadcastGroup) store() {
 	entry := &groupRegistryEntryGlobal{
-		keyHash: fnvHash(id),
-		key:     id,
+		keyHash: fnvHash(bg.ID),
+		key:     bg.ID,
 	}
 
-	entry.group.Store(group)
+	entry.group.Store(bg)
 
 	for {
 		head := broadcastGroupHead.Load()
@@ -143,21 +198,24 @@ func storeBroadcastGroup(id string, group *BroadcastGroup) {
 	}
 }
 
-func deleteBroadcastGroup(id string) {
-	keyHash := fnvHash(id)
+func (bg *BroadcastGroup) delete() {
+	keyHash := fnvHash(bg.ID)
 
 	for {
 		prev := (*groupRegistryEntryGlobal)(nil)
 		current := broadcastGroupHead.Load()
+		retry := false
 
 		for current != nil {
 			next := current.next.Load()
 
-			if current.keyHash == keyHash && current.key == id {
+			if current.keyHash == keyHash && current.key == bg.ID {
 				if prev == nil {
 					if broadcastGroupHead.CompareAndSwap(current, next) {
 						return
 					}
+
+					retry = true
 
 					break
 				}
@@ -171,7 +229,9 @@ func deleteBroadcastGroup(id string) {
 			current = next
 		}
 
-		return
+		if !retry {
+			return
+		}
 	}
 }
 
@@ -191,7 +251,17 @@ func (bg *BroadcastGroup) Subscribe(
 	default:
 	}
 
-	consumer := &BroadcastConsumer{ring: newSPSCQValueRing(bufferSize)}
+	if subscriberID == "" {
+		subscriberID = fmt.Sprintf("%d", bg.nextSubscriberID.Add(1))
+	}
+
+	if bufferSize < 1 {
+		bufferSize = defaultBroadcastBuffer
+	}
+
+	consumer := &BroadcastConsumer{
+		ring: newSPSCQValueRing(bufferSize, bg.dropOldestOnFull),
+	}
 	subscriber := &Subscriber{
 		ID:       subscriberID,
 		consumer: consumer,
@@ -213,6 +283,88 @@ func (bg *BroadcastGroup) Subscribe(
 }
 
 /*
+SubscribeEvents registers a telemetry listener with an auto-assigned subscriber id.
+*/
+func (bg *BroadcastGroup) SubscribeEvents(buffer int) *Subscription {
+	if bg == nil {
+		return nil
+	}
+
+	subscriberID := fmt.Sprintf("%d", bg.nextSubscriberID.Add(1))
+	consumer := bg.Subscribe(subscriberID, buffer)
+
+	if consumer == nil {
+		return nil
+	}
+
+	return &Subscription{
+		group:        bg,
+		subscriberID: subscriberID,
+		consumer:     consumer,
+	}
+}
+
+/*
+Publish broadcasts a telemetry event to every subscriber.
+*/
+func (bg *BroadcastGroup) Publish(event Event) {
+	if bg == nil {
+		return
+	}
+
+	select {
+	case <-bg.ctx.Done():
+		return
+	default:
+	}
+
+	for entry := bg.subscribers.Load(); entry != nil; entry = entry.next.Load() {
+		if entry.subscriber == nil || entry.subscriber.consumer == nil {
+			continue
+		}
+
+		cloned := event.clone()
+		value := &QValue[erasedAny]{Value: cloned}
+
+		entry.subscriber.consumer.ring.Push(value)
+	}
+}
+
+/*
+Poll returns the next telemetry event when one is available.
+*/
+func (subscription *Subscription) Poll() (Event, bool) {
+	if subscription == nil || subscription.consumer == nil {
+		return Event{}, false
+	}
+
+	value := subscription.consumer.Poll()
+
+	if value == nil {
+		return Event{}, false
+	}
+
+	event, ok := value.Value.(Event)
+
+	return event, ok
+}
+
+/*
+Close unregisters the subscription and releases its ring.
+*/
+func (subscription *Subscription) Close() {
+	if subscription == nil || subscription.closed.Swap(true) {
+		return
+	}
+
+	subscription.group.Unsubscribe(subscription.subscriberID)
+
+	if subscription.consumer != nil && subscription.consumer.ring != nil {
+		subscription.consumer.ring.Close()
+	}
+}
+
+/*
 Unsubscribe removes a subscriber.
 */
 func (bg *BroadcastGroup) Unsubscribe(subscriberID string) {
@@ -229,6 +381,7 @@ func (bg *BroadcastGroup) Unsubscribe(subscriberID string) {
 	for {
 		prev := (*subscriberEntry)(nil)
 		current := bg.subscribers.Load()
+		retry := false
 
 		for current != nil {
 			next := current.next.Load()
@@ -242,6 +395,8 @@ func (bg *BroadcastGroup) Unsubscribe(subscriberID string) {
 
 						return
 					}
+
+					retry = true
 
 					break
 				}
@@ -259,7 +414,9 @@ func (bg *BroadcastGroup) Unsubscribe(subscriberID string) {
 			current = next
 		}
 
-		return
+		if !retry {
+			return
+		}
 	}
 }
 
@@ -329,5 +486,5 @@ func (bg *BroadcastGroup) Close() {
 	}
 
 	bg.subscribers.Store(nil)
-	deleteBroadcastGroup(bg.ID)
+	bg.delete()
 }

@@ -20,14 +20,14 @@ func receiveResultWait[T any](test *testing.T, wait *ResultWait[T]) *QValue[T] {
 	return result
 }
 
-func broadcasterSubscriberCount(broadcaster *Broadcaster) int {
-	if broadcaster == nil {
+func broadcastGroupSubscriberCount(group *BroadcastGroup) int {
+	if group == nil {
 		return 0
 	}
 
 	count := 0
 
-	for entry := broadcaster.subscribers.Load(); entry != nil; entry = entry.next.Load() {
+	for entry := group.subscribers.Load(); entry != nil; entry = entry.next.Load() {
 		count++
 	}
 

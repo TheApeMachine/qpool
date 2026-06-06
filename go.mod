@@ -31,5 +31,4 @@ require (
 	github.com/phuslu/log v1.0.124
 	github.com/smarty/assertions v1.16.0 // indirect
 	github.com/theapemachine/errnie v1.2.3
-	golang.org/x/sync v0.20.0
 )

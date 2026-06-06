@@ -4,27 +4,33 @@ import (
 	"sync/atomic"
 )
 
-type spscQValueRing struct {
-	slots []atomic.Pointer[QValue[erasedAny]]
-	mask  uint64
-	head  atomic.Uint64
-	tail  atomic.Uint64
+type SpscQValueRing struct {
+	slots            []atomic.Pointer[QValue[erasedAny]]
+	mask             uint64
+	head             atomic.Uint64
+	tail             atomic.Uint64
+	dropOldestOnFull bool
 }
 
-func newSPSCQValueRing(capacity int) *spscQValueRing {
-	if capacity < 2 {
+func NewSPSCQValueRing(capacity int, dropOldestOnFull bool) *SpscQValueRing {
+	if capacity < 1 {
+		capacity = 1
+	}
+
+	if !dropOldestOnFull && capacity < 2 {
 		capacity = 2
 	}
 
 	capacity = nextPowerOfTwo(capacity)
 
-	return &spscQValueRing{
-		slots: make([]atomic.Pointer[QValue[erasedAny]], capacity),
-		mask:  uint64(capacity - 1),
+	return &SpscQValueRing{
+		slots:            make([]atomic.Pointer[QValue[erasedAny]], capacity),
+		mask:             uint64(capacity - 1),
+		dropOldestOnFull: dropOldestOnFull,
 	}
 }
 
-func (ring *spscQValueRing) Push(value *QValue[erasedAny]) bool {
+func (ring *SpscQValueRing) Push(value *QValue[erasedAny]) bool {
 	if ring == nil || value == nil {
 		return false
 	}
@@ -34,6 +40,12 @@ func (ring *spscQValueRing) Push(value *QValue[erasedAny]) bool {
 		tail := ring.tail.Load()
 
 		if head-tail >= uint64(len(ring.slots)) {
+			if ring.dropOldestOnFull {
+				ring.Pop()
+
+				continue
+			}
+
 			return false
 		}
 
@@ -51,7 +63,7 @@ func (ring *spscQValueRing) Push(value *QValue[erasedAny]) bool {
 	}
 }
 
-func (ring *spscQValueRing) Pop() *QValue[erasedAny] {
+func (ring *SpscQValueRing) Pop() *QValue[erasedAny] {
 	if ring == nil {
 		return nil
 	}
@@ -79,7 +91,7 @@ func (ring *spscQValueRing) Pop() *QValue[erasedAny] {
 	}
 }
 
-func (ring *spscQValueRing) Close() {
+func (ring *SpscQValueRing) Close() {
 	if ring == nil {
 		return
 	}

@@ -190,6 +190,16 @@ func (event *Event) WithOp(op string) *Event {
 	return event
 }
 
+func (event Event) clone() Event {
+	if len(event.Fields) == 0 {
+		return event
+	}
+
+	event.Fields = append([]Field(nil), event.Fields...)
+
+	return event
+}
+
 /*
 keyValues.
 */

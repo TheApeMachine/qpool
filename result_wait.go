@@ -18,7 +18,7 @@ const (
 var errResultClosed = errors.New("qpool: result closed")
 
 type waiterNode struct {
-	gp   uintptr
+	gp   unsafe.Pointer
 	next atomic.Pointer[waiterNode]
 }
 
@@ -37,7 +37,7 @@ func (slot *resultSlot) pushWaiter(gp unsafe.Pointer) {
 		return
 	}
 
-	node := &waiterNode{gp: uintptr(gp)}
+	node := &waiterNode{gp: gp}
 
 	for {
 		head := slot.waiters.Load()
@@ -53,8 +53,8 @@ func (slot *resultSlot) wakeWaiters() {
 	head := slot.waiters.Swap(nil)
 
 	for node := head; node != nil; node = node.next.Load() {
-		if node.gp != 0 {
-			safe_ready(unsafe.Pointer(node.gp))
+		if node.gp != nil {
+			safe_ready(node.gp)
 		}
 	}
 }

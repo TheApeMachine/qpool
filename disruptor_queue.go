@@ -3,6 +3,7 @@ package qpool
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"runtime"
 	"sync/atomic"
 	"time"
@@ -155,7 +156,7 @@ func (queue *jobDisruptorQueue) backoffReservation(spin int) {
 		return
 	}
 
-	time.Sleep(100 * time.Microsecond)
+	time.Sleep(time.Duration(50+rand.Intn(101)) * time.Microsecond)
 }
 
 func (queue *jobDisruptorQueue) Close() {

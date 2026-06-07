@@ -26,6 +26,9 @@ func (registry *GroupRegistry) init() {
 			func(entry, next *GroupRegistryEntry) {
 				entry.next.Store(next)
 			},
+			func(prev, current, next *GroupRegistryEntry) bool {
+				return prev.next.CompareAndSwap(current, next)
+			},
 		)
 	}
 }
@@ -35,8 +38,8 @@ func (registry *GroupRegistry) store(key string, group *BroadcastGroup) {
 		return
 	}
 
-	shard := &registry.shards[keyIndexer{}.shard(key)]
 	keyHash := keyIndexer{}.hash(key)
+	shard := &registry.shards[keyIndexer{}.shardFromHash(keyHash)]
 
 	entry := &GroupRegistryEntry{
 		keyHash: keyHash,
@@ -53,8 +56,8 @@ func (registry *GroupRegistry) load(key string) *BroadcastGroup {
 		return nil
 	}
 
-	shard := &registry.shards[keyIndexer{}.shard(key)]
 	keyHash := keyIndexer{}.hash(key)
+	shard := &registry.shards[keyIndexer{}.shardFromHash(keyHash)]
 
 	entry := shard.entries.Find(func(entry *GroupRegistryEntry) bool {
 		return entry.keyHash == keyHash && entry.key == key

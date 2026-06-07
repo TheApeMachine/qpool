@@ -19,15 +19,12 @@ func TestSPSCRing_NewSPSCRing(test *testing.T) {
 
 func TestSPSCRing_normalizeCapacity(test *testing.T) {
 	Convey("Given SPSCRing normalizeCapacity", test, func() {
-		dropOldestRing := &SPSCRing[int]{dropOldestOnFull: true}
-		rejectRing := &SPSCRing[int]{dropOldestOnFull: false}
-
 		Convey("It should allow single-slot rings when dropping oldest", func() {
-			So(dropOldestRing.normalizeCapacity(1), ShouldEqual, 1)
+			So(normalizeSPSCCapacity(1, true), ShouldEqual, 1)
 		})
 
 		Convey("It should enforce at least two slots when rejecting on full", func() {
-			So(rejectRing.normalizeCapacity(1), ShouldEqual, 2)
+			So(normalizeSPSCCapacity(1, false), ShouldEqual, 2)
 		})
 	})
 }
@@ -62,6 +59,18 @@ func TestSPSCRing_Pop(test *testing.T) {
 			So(ring.Push(value), ShouldBeTrue)
 
 			So(ring.Pop(), ShouldEqual, value)
+			So(ring.Pop(), ShouldBeNil)
+		})
+
+		Convey("It should return values in FIFO order", func() {
+			first := &QValue[erasedAny]{Value: "first"}
+			second := &QValue[erasedAny]{Value: "second"}
+
+			So(ring.Push(first), ShouldBeTrue)
+			So(ring.Push(second), ShouldBeTrue)
+
+			So(ring.Pop(), ShouldEqual, first)
+			So(ring.Pop(), ShouldEqual, second)
 			So(ring.Pop(), ShouldBeNil)
 		})
 	})

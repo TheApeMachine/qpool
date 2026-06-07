@@ -25,8 +25,7 @@ type SpscQValueRing = SPSCRing[QValue[erasedAny]]
 NewSPSCRing allocates a single-producer single-consumer queue.
 */
 func NewSPSCRing[T any](capacity int, dropOldestOnFull bool) *SPSCRing[T] {
-	prototype := &SPSCRing[T]{dropOldestOnFull: dropOldestOnFull}
-	capacity = prototype.normalizeCapacity(capacity)
+	capacity = normalizeSPSCCapacity(capacity, dropOldestOnFull)
 
 	return &SPSCRing[T]{
 		slots:            make([]atomic.Pointer[T], capacity),
@@ -35,16 +34,16 @@ func NewSPSCRing[T any](capacity int, dropOldestOnFull bool) *SPSCRing[T] {
 	}
 }
 
-func (ring *SPSCRing[T]) normalizeCapacity(capacity int) int {
+func normalizeSPSCCapacity(capacity int, dropOldestOnFull bool) int {
 	if capacity < 1 {
 		capacity = 1
 	}
 
-	if !ring.dropOldestOnFull && capacity < 2 {
+	if !dropOldestOnFull && capacity < 2 {
 		capacity = 2
 	}
 
-	normalizer := RingBuffer[T]{}
+	normalizer := RingBuffer[int]{}
 
 	return normalizer.next(capacity)
 }

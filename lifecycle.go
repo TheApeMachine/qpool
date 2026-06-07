@@ -31,6 +31,9 @@ func newWorkerRegistry() *workerRegistry {
 		func(node, next *workerStackNode) {
 			node.next.Store(next)
 		},
+		func(prev, current, next *workerStackNode) bool {
+			return prev.next.CompareAndSwap(current, next)
+		},
 	)
 
 	return registry
@@ -59,6 +62,10 @@ func (registry *workerRegistry) popLast() *workerToken {
 }
 
 func (registry *workerRegistry) remove(id uint64) {
+	if registry == nil {
+		return
+	}
+
 	registry.workers.Remove(func(node *workerStackNode) bool {
 		return node.token != nil && node.token.id == id
 	})

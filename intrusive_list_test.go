@@ -24,6 +24,9 @@ func bindTestListNode(list *IntrusiveList[testListNode]) {
 		func(node, next *testListNode) {
 			node.next.Store(next)
 		},
+		func(prev, current, next *testListNode) bool {
+			return prev.next.CompareAndSwap(current, next)
+		},
 	)
 }
 

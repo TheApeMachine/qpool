@@ -26,14 +26,17 @@ type subscriberEntryList struct {
 	list IntrusiveList[subscriberEntry]
 }
 
-func newSubscriberEntryList() subscriberEntryList {
-	entries := subscriberEntryList{}
+func newSubscriberEntryList() *subscriberEntryList {
+	entries := &subscriberEntryList{}
 	entries.list.bind(
 		func(entry *subscriberEntry) *subscriberEntry {
 			return entry.next.Load()
 		},
 		func(entry, next *subscriberEntry) {
 			entry.next.Store(next)
+		},
+		func(prev, current, next *subscriberEntry) bool {
+			return prev.next.CompareAndSwap(current, next)
 		},
 	)
 
@@ -45,15 +48,9 @@ func (entries *subscriberEntryList) Prepend(entry *subscriberEntry) {
 }
 
 func (entries *subscriberEntryList) Remove(id string) *subscriberEntry {
-	entry := entries.list.Find(func(entry *subscriberEntry) bool {
+	return entries.list.RemoveReturning(func(entry *subscriberEntry) bool {
 		return entry.id == id
 	})
-
-	entries.list.Remove(func(entry *subscriberEntry) bool {
-		return entry.id == id
-	})
-
-	return entry
 }
 
 func (entries *subscriberEntryList) IsEmpty() bool {
@@ -154,7 +151,7 @@ type BroadcastGroup struct {
 	ID               string
 	nextSubscriberID atomic.Uint64
 	dropOldestOnFull bool
-	subscribers      subscriberEntryList
+	subscribers      *subscriberEntryList
 }
 
 /*

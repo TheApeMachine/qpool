@@ -217,7 +217,8 @@ func (qspace *QSpace) CreateBroadcastGroup(id string, ttl time.Duration) *Broadc
 
 	if qspace.stopped.Load() {
 		group.Close()
-		return group
+
+		return nil
 	}
 
 	qspace.groups.store(id, group)
@@ -267,7 +268,10 @@ func (qspace *QSpace) cleanup(now time.Time) {
 				return
 			}
 
-			entry.stored.Store(nil)
+			if !entry.stored.CompareAndSwap(value, nil) {
+				return
+			}
+
 			qspace.entries.removeExpired(entry.key)
 			qspace.entries.pruneDependencyEdges(entry.key)
 		})

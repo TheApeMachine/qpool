@@ -18,7 +18,11 @@ func (indexer keyIndexer) hash(key string) uint64 {
 }
 
 func (indexer keyIndexer) shard(key string) uint64 {
-	return indexer.hash(key) % registryShardCount
+	return indexer.shardFromHash(indexer.hash(key))
+}
+
+func (indexer keyIndexer) shardFromHash(hash uint64) uint64 {
+	return hash % registryShardCount
 }
 
 type RegistryShard struct {
@@ -34,8 +38,8 @@ type depEdgeList struct {
 	edges IntrusiveList[depEdge]
 }
 
-func newDepEdgeList() depEdgeList {
-	list := depEdgeList{}
+func newDepEdgeList() *depEdgeList {
+	list := &depEdgeList{}
 	list.edges.bind(
 		func(edge *depEdge) *depEdge {
 			return edge.next.Load()
@@ -43,12 +47,21 @@ func newDepEdgeList() depEdgeList {
 		func(edge, next *depEdge) {
 			edge.next.Store(next)
 		},
+		func(prev, current, next *depEdge) bool {
+			return prev.next.CompareAndSwap(current, next)
+		},
 	)
 
 	return list
 }
 
 func (list *depEdgeList) Push(id string) {
+	if list.edges.Find(func(edge *depEdge) bool {
+		return edge.id == id
+	}) != nil {
+		return
+	}
+
 	list.edges.Prepend(&depEdge{id: id})
 }
 
@@ -79,8 +92,8 @@ type RegistryEntry struct {
 	key      string
 	value    atomic.Pointer[resultSlot]
 	stored   atomic.Pointer[QValue[erasedAny]]
-	children depEdgeList
-	parents  depEdgeList
+	children *depEdgeList
+	parents  *depEdgeList
 	next     atomic.Pointer[RegistryEntry]
 }
 
@@ -99,6 +112,9 @@ func NewRegistry() *Registry {
 			func(entry, next *RegistryEntry) {
 				entry.next.Store(next)
 			},
+			func(prev, current, next *RegistryEntry) bool {
+				return prev.next.CompareAndSwap(current, next)
+			},
 		)
 	}
 
@@ -110,8 +126,8 @@ func (registry *Registry) find(key string) *RegistryEntry {
 		return nil
 	}
 
-	shard := &registry.shards[keyIndexer{}.shard(key)]
 	keyHash := keyIndexer{}.hash(key)
+	shard := &registry.shards[keyIndexer{}.shardFromHash(keyHash)]
 
 	return shard.entries.Find(func(entry *RegistryEntry) bool {
 		return entry.keyHash == keyHash && entry.key == key
@@ -127,8 +143,8 @@ func (registry *Registry) getOrCreate(key string) *RegistryEntry {
 		return entry
 	}
 
-	shard := &registry.shards[keyIndexer{}.shard(key)]
 	keyHash := keyIndexer{}.hash(key)
+	shard := &registry.shards[keyIndexer{}.shardFromHash(keyHash)]
 
 	newEntry := &RegistryEntry{
 		keyHash:  keyHash,
@@ -146,6 +162,10 @@ func (registry *Registry) getOrCreate(key string) *RegistryEntry {
 
 		if shard.entries.prependOnce(newEntry) {
 			if existing := registry.find(key); existing != nil && existing != newEntry {
+				shard.entries.Remove(func(entry *RegistryEntry) bool {
+					return entry == newEntry
+				})
+
 				return existing
 			}
 
@@ -159,8 +179,8 @@ func (registry *Registry) removeExpired(key string) {
 		return
 	}
 
-	shard := &registry.shards[keyIndexer{}.shard(key)]
 	keyHash := keyIndexer{}.hash(key)
+	shard := &registry.shards[keyIndexer{}.shardFromHash(keyHash)]
 
 	shard.entries.Remove(func(entry *RegistryEntry) bool {
 		return entry.keyHash == keyHash && entry.key == key

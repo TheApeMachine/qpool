@@ -109,6 +109,16 @@ func (ring *SPSCRing[T]) Pop() *T {
 	}
 }
 
+// Empty reports whether the ring currently holds no values. Read-only hint used
+// by the broadcast consumer's idle park path; Push and Pop are untouched.
+func (ring *SPSCRing[T]) Empty() bool {
+	if ring == nil {
+		return true
+	}
+
+	return ring.tail.Load() >= ring.head.Load()
+}
+
 func (ring *SPSCRing[T]) Close() {
 	if ring == nil {
 		return

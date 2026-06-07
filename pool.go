@@ -152,8 +152,7 @@ func (q *Q[T]) WorkerBounds() (minWorkers, maxWorkers int) {
 
 /*
 PeriodicScalerConfigured reports whether NewQ wired the built-in
-interval scaler. Adaptive admission regulators may resize the pool
-independently; those are not mirrored here.
+interval scaler goroutine.
 */
 func (q *Q[T]) PeriodicScalerConfigured() bool {
 	return q != nil && q.config != nil && q.config.Scaler != nil
@@ -190,10 +189,6 @@ func (q *Q[T]) enqueueJob(ctx context.Context, job Job) error {
 		return fmt.Errorf("qpool: pool closed")
 	}
 
-	if q.stopping.Load() {
-		return fmt.Errorf("qpool: pool closed")
-	}
-
 	if err := q.ctx.Err(); err != nil {
 		return fmt.Errorf("qpool: pool closed: %w", err)
 	}
@@ -220,7 +215,7 @@ func (q *Q[T]) enqueueJob(ctx context.Context, job Job) error {
 		Op:        "schedule",
 		Message:   fmt.Sprintf("job scheduled: %s", job.ID),
 		Time:      time.Now(),
-		Level:     log.InfoLevel,
+		Level:     log.DebugLevel,
 	})
 
 	return nil
@@ -259,30 +254,22 @@ func (q *Q[T]) Schedule(
 		opt(&job)
 	}
 
-	if q.scaler != nil || (q.config != nil && len(q.config.Regulators) > 0) {
-		reading := q.metrics.CollectReading()
+	reading := q.metrics.CollectReading()
 
-		if q.scaler != nil {
-			q.scaler.Observe(reading)
+	if q.scaler != nil {
+		q.scaler.Observe(reading)
+	}
 
-			if q.scaler.Limit() {
-				q.metrics.incThrottled()
-
-				return errorResultWait[T](fmt.Errorf("qpool: pool saturated"))
-			}
+	if q.config != nil && len(q.config.Regulators) > 0 {
+		for _, regulator := range q.config.Regulators {
+			regulator.Observe(reading)
 		}
 
-		if q.config != nil {
-			for _, regulator := range q.config.Regulators {
-				regulator.Observe(reading)
-			}
+		for _, regulator := range q.config.Regulators {
+			if regulator.Limit() {
+				q.metrics.incThrottled()
 
-			for _, regulator := range q.config.Regulators {
-				if regulator.Limit() {
-					q.metrics.incThrottled()
-
-					return errorResultWait[T](fmt.Errorf("qpool: regulator rejected schedule"))
-				}
+				return errorResultWait[T](fmt.Errorf("qpool: regulator rejected schedule"))
 			}
 		}
 	}

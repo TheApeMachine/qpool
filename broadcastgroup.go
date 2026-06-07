@@ -85,7 +85,78 @@ func (entries *subscriberEntryList) count() int {
 BroadcastConsumer receives values from a broadcast group without channels.
 */
 type BroadcastConsumer struct {
-	ring *SpscQValueRing
+	ring     *SpscQValueRing
+	sema     uint32
+	wantWake atomic.Bool
+}
+
+/*
+wake releases the consumer if it is blocked in Wait. It uses the runtime
+semaphore (the same GC-safe primitive sync.Mutex uses) rather than manual
+goroutine-state manipulation. The steady-state fast path is a single
+uncontended atomic load (false when the consumer is keeping up), so it adds no
+measurable cost to Send/Push. The CAS gates exactly one Semrelease per arm, so
+the semaphore count never drifts.
+*/
+func (consumer *BroadcastConsumer) wake() {
+	if !consumer.wantWake.Load() {
+		return
+	}
+
+	if consumer.wantWake.CompareAndSwap(true, false) {
+		runtime_Semrelease(&consumer.sema, false, 0)
+	}
+}
+
+/*
+park blocks the single consumer goroutine until a producer pushes or ctx is
+canceled. It arms wantWake, re-checks the ring to close the lost-wakeup window,
+then blocks on the runtime semaphore; the producer's wake (or the ctx watcher)
+releases it. All of this runs only on the idle path (empty ring), so it costs
+nothing while data is flowing.
+*/
+func (consumer *BroadcastConsumer) park(ctx context.Context) {
+	consumer.wantWake.Store(true)
+
+	// A producer may have pushed (and tried to wake) between Wait's Pop and the
+	// arm above. If we reclaim our own arm, return so Wait's next Pop takes the
+	// value. If a producer already claimed it, a Semrelease is in flight, so
+	// absorb it with exactly one acquire to keep the count balanced.
+	if !consumer.ring.Empty() {
+		if consumer.wantWake.CompareAndSwap(true, false) {
+			return
+		}
+
+		runtime_Semacquire(&consumer.sema)
+
+		return
+	}
+
+	if err := ctx.Err(); err != nil {
+		if consumer.wantWake.CompareAndSwap(true, false) {
+			return
+		}
+
+		runtime_Semacquire(&consumer.sema)
+
+		return
+	}
+
+	stopped := make(chan struct{})
+
+	if done := ctx.Done(); done != nil {
+		go func() {
+			select {
+			case <-done:
+				consumer.wake()
+			case <-stopped:
+			}
+		}()
+	}
+
+	runtime_Semacquire(&consumer.sema)
+
+	close(stopped)
 }
 
 /*
@@ -116,7 +187,7 @@ func (consumer *BroadcastConsumer) Wait(ctx context.Context) (*QValue[erasedAny]
 			return nil, err
 		}
 
-		mcall(fast_park)
+		consumer.park(ctx)
 	}
 }
 
@@ -301,6 +372,7 @@ func (bg *BroadcastGroup) Publish(event Event) {
 		value := &QValue[erasedAny]{Value: cloned}
 
 		entry.subscriber.consumer.ring.Push(value)
+		entry.subscriber.consumer.wake()
 	})
 }
 
@@ -378,6 +450,7 @@ func (bg *BroadcastGroup) Send(qv *QValue[erasedAny]) {
 
 		if entry != nil && entry.subscriber != nil && entry.subscriber.consumer != nil {
 			entry.subscriber.consumer.ring.Push(qv)
+			entry.subscriber.consumer.wake()
 		}
 
 		return
@@ -393,6 +466,7 @@ func (bg *BroadcastGroup) Send(qv *QValue[erasedAny]) {
 		}
 
 		entry.subscriber.consumer.ring.Push(qv)
+		entry.subscriber.consumer.wake()
 	})
 }
 

@@ -26,7 +26,7 @@ func processJob(q *Q[any], workerCtx context.Context, job Job) {
 		Op:        "job-start",
 		Message:   fmt.Sprintf("job started: %s", job.ID),
 		Time:      startedAt,
-		Level:     log.InfoLevel,
+		Level:     log.DebugLevel,
 		Fields: []Field{
 			{Key: "job", Value: job.ID},
 		},
@@ -79,7 +79,7 @@ func processJob(q *Q[any], workerCtx context.Context, job Job) {
 		Op:        "job-complete",
 		Message:   fmt.Sprintf("job completed: %s in %s", job.ID, latency.Round(time.Millisecond)),
 		Time:      time.Now(),
-		Level:     log.InfoLevel,
+		Level:     log.DebugLevel,
 		Fields: []Field{
 			{Key: "job", Value: job.ID},
 			{Key: "duration_ms", Value: latency.Milliseconds()},

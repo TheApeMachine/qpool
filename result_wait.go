@@ -18,6 +18,7 @@ var errResultClosed = errors.New("qpool: result closed")
 
 type waiterNode struct {
 	gp   unsafe.Pointer
+	sema uint32
 	next atomic.Pointer[waiterNode]
 }
 
@@ -31,12 +32,10 @@ func newResultSlot() *resultSlot {
 	return &resultSlot{}
 }
 
-func (slot *resultSlot) pushWaiter(gp unsafe.Pointer) {
-	if gp == nil {
+func (slot *resultSlot) pushWaiter(node *waiterNode) {
+	if node == nil {
 		return
 	}
-
-	node := &waiterNode{gp: gp}
 
 	for {
 		head := slot.waiters.Load()
@@ -51,10 +50,12 @@ func (slot *resultSlot) pushWaiter(gp unsafe.Pointer) {
 func (slot *resultSlot) wakeWaiters() {
 	head := slot.waiters.Swap(nil)
 
+	// Each waiter has its own semaphore, so a Semrelease that races the ctx
+	// watcher is harmless (a leaked count on a discarded node) rather than a
+	// fatal double goready. This is the GC-safe counterpart to the worker pool's
+	// park/unpark, without manual goroutine-status manipulation.
 	for node := head; node != nil; node = node.next.Load() {
-		if node.gp != nil {
-			safe_ready(node.gp)
-		}
+		runtime_Semrelease(&node.sema, false, 0)
 	}
 }
 
@@ -132,9 +133,10 @@ func (slot *resultSlot) parkForWait(ctx context.Context) {
 	}
 
 	gp := GetG()
+	node := &waiterNode{gp: gp}
 	stopped := make(chan struct{})
 
-	slot.pushWaiter(gp)
+	slot.pushWaiter(node)
 
 	if slot.state.Load() != slotPending {
 		slot.removeWaiter(gp)
@@ -146,13 +148,13 @@ func (slot *resultSlot) parkForWait(ctx context.Context) {
 		go func() {
 			select {
 			case <-ctxDone:
-				safe_ready(gp)
+				runtime_Semrelease(&node.sema, false, 0)
 			case <-stopped:
 			}
 		}()
 	}
 
-	mcall(fast_park)
+	runtime_Semacquire(&node.sema)
 	slot.removeWaiter(gp)
 	close(stopped)
 }

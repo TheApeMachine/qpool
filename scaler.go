@@ -9,7 +9,8 @@ import (
 )
 
 /*
-Scaler periodically evaluates queue depth and implements Regulator for schedule-time scaling.
+Scaler periodically evaluates queue depth and scales worker count on load.
+It does not reject Schedule; back-pressure is the disruptor queue and optional Regulators.
 */
 type Scaler struct {
 	pool               *Q[any]
@@ -20,7 +21,7 @@ type Scaler struct {
 	scaleDownThreshold float64
 	cooldown           time.Duration
 	evalInterval       time.Duration
-	lastScaleUnixNano  atomic.Int64
+	lastScaleDownNano  atomic.Int64
 	reading            atomic.Pointer[MetricReading]
 }
 
@@ -59,7 +60,7 @@ func (config *ScalerConfig) jobQueueCapacity(maxWorkers int) int {
 }
 
 /*
-Observe refreshes metrics and may scale the worker count.
+Observe refreshes metrics and may scale the worker count up immediately.
 */
 func (scaler *Scaler) Observe(reading *MetricReading) {
 	if scaler == nil {
@@ -74,37 +75,21 @@ func (scaler *Scaler) Observe(reading *MetricReading) {
 }
 
 /*
-Limit rejects schedules when the pool is saturated at max workers.
+Limit is always false: the scaler grows worker count instead of rejecting schedules.
 */
 func (scaler *Scaler) Limit() bool {
-	if scaler == nil {
-		return false
-	}
-
-	read := scaler.reading.Load()
-
-	if read == nil {
-		return false
-	}
-
-	if read.WorkerCount < scaler.maxWorkers {
-		return false
-	}
-
-	load := float64(read.JobQueueSize) / float64(max(1, read.WorkerCount))
-
-	return load > scaler.scaleUpThreshold
+	return false
 }
 
 /*
-Renormalize retries scaling evaluation after the cooldown window.
+Renormalize retries scale-down evaluation after the cooldown window.
 */
 func (scaler *Scaler) Renormalize() {
 	if scaler == nil {
 		return
 	}
 
-	last := scaler.lastScaleUnixNano.Load()
+	last := scaler.lastScaleDownNano.Load()
 
 	if time.Since(time.Unix(0, last)) >= scaler.cooldown {
 		scaler.evaluate()
@@ -123,12 +108,6 @@ func (scaler *Scaler) evaluate() {
 		scaler.reading.Store(read)
 	}
 
-	last := time.Unix(0, scaler.lastScaleUnixNano.Load())
-
-	if time.Since(last) < scaler.cooldown {
-		return
-	}
-
 	workers := read.WorkerCount
 
 	if workers <= 0 {
@@ -143,18 +122,24 @@ func (scaler *Scaler) evaluate() {
 
 	currentLoad := float64(read.JobQueueSize) / float64(workers)
 
-	switch {
-	case currentLoad > scaler.scaleUpThreshold && read.WorkerCount < scaler.maxWorkers:
+	if currentLoad > scaler.scaleUpThreshold && read.WorkerCount < scaler.maxWorkers {
 		needed := int(math.Ceil(float64(read.JobQueueSize) / targetLoad))
 		delta := max(0, needed-read.WorkerCount)
 		toAdd := min(scaler.maxWorkers-read.WorkerCount, delta)
 
 		if toAdd > 0 {
 			scaler.scaleUp(toAdd)
-			scaler.noteScale(toAdd, "scale-up", "scaled worker pool up")
+			scaler.noteScaleUp(toAdd)
 		}
+	}
 
-	case currentLoad < scaler.scaleDownThreshold && read.WorkerCount > scaler.minWorkers:
+	last := time.Unix(0, scaler.lastScaleDownNano.Load())
+
+	if time.Since(last) < scaler.cooldown {
+		return
+	}
+
+	if currentLoad < scaler.scaleDownThreshold && read.WorkerCount > scaler.minWorkers {
 		needed := max(int(math.Ceil(float64(read.JobQueueSize)/targetLoad)), scaler.minWorkers)
 
 		toRemove := min(
@@ -164,7 +149,7 @@ func (scaler *Scaler) evaluate() {
 
 		if toRemove > 0 {
 			scaler.pool.scaleDownWorkers(toRemove)
-			scaler.noteScale(toRemove, "scale-down", "scaled worker pool down")
+			scaler.noteScaleDown(toRemove)
 		}
 	}
 }
@@ -182,16 +167,34 @@ func (scaler *Scaler) scaleUp(count int) {
 	}
 }
 
-func (scaler *Scaler) noteScale(delta int, op, message string) {
+func (scaler *Scaler) noteScaleUp(delta int) {
 	now := time.Now()
 
-	scaler.lastScaleUnixNano.Store(now.UnixNano())
 	scaler.pool.metrics.NoteLastScale(now)
 
 	scaler.pool.publishTelemetry(Event{
 		Component: "qpool",
-		Op:        op,
-		Message:   message,
+		Op:        "scale-up",
+		Message:   "scaled worker pool up",
+		Time:      now,
+		Level:     log.DebugLevel,
+		Fields: []Field{
+			{Key: "delta", Value: delta},
+			{Key: "workers", Value: scaler.pool.metrics.workerCount.Load()},
+		},
+	})
+}
+
+func (scaler *Scaler) noteScaleDown(delta int) {
+	now := time.Now()
+
+	scaler.lastScaleDownNano.Store(now.UnixNano())
+	scaler.pool.metrics.NoteLastScale(now)
+
+	scaler.pool.publishTelemetry(Event{
+		Component: "qpool",
+		Op:        "scale-down",
+		Message:   "scaled worker pool down",
 		Time:      now,
 		Level:     log.DebugLevel,
 		Fields: []Field{
@@ -246,7 +249,7 @@ func NewScaler(pool *Q[any], minWorkers, maxWorkers int, config *ScalerConfig) *
 		evalInterval:       config.Interval,
 	}
 
-	scaler.lastScaleUnixNano.Store(time.Now().UnixNano())
+	scaler.lastScaleDownNano.Store(time.Now().UnixNano())
 
 	pool.scalerWG.Add(1)
 

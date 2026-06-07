@@ -30,14 +30,89 @@ func newCircuitBreakerCache(limit int) *circuitBreakerCache {
 	return &circuitBreakerCache{limit: limit}
 }
 
-func (cache *circuitBreakerCache) find(id string) *CircuitBreaker {
+func (cache *circuitBreakerCache) findNode(id string) *breakerCacheNode {
 	for node := cache.head.Load(); node != nil; node = node.next.Load() {
 		if node.entry != nil && node.entry.id == id {
-			return node.entry.breaker
+			return node
 		}
 	}
 
 	return nil
+}
+
+func (cache *circuitBreakerCache) find(id string) *CircuitBreaker {
+	node := cache.findNode(id)
+
+	if node == nil {
+		return nil
+	}
+
+	cache.promote(node)
+
+	return node.entry.breaker
+}
+
+func (cache *circuitBreakerCache) promote(node *breakerCacheNode) {
+	if node == nil {
+		return
+	}
+
+	for {
+		if cache.head.Load() == node {
+			return
+		}
+
+		if !cache.detach(node) {
+			continue
+		}
+
+		for {
+			head := cache.head.Load()
+			node.next.Store(head)
+
+			if cache.head.CompareAndSwap(head, node) {
+				return
+			}
+		}
+	}
+}
+
+func (cache *circuitBreakerCache) detach(node *breakerCacheNode) bool {
+	for {
+		head := cache.head.Load()
+
+		if head == node {
+			next := node.next.Load()
+
+			if cache.head.CompareAndSwap(head, next) {
+				node.next.Store(nil)
+
+				return true
+			}
+
+			continue
+		}
+
+		for prev := head; prev != nil; {
+			next := prev.next.Load()
+
+			if next == node {
+				rest := node.next.Load()
+
+				if prev.next.CompareAndSwap(node, rest) {
+					node.next.Store(nil)
+
+					return true
+				}
+
+				return false
+			}
+
+			prev = next
+		}
+
+		return false
+	}
 }
 
 func (cache *circuitBreakerCache) getOrCreate(
@@ -83,15 +158,50 @@ func (cache *circuitBreakerCache) getOrCreate(
 
 func (cache *circuitBreakerCache) evictOverflow() {
 	for cache.count.Load() > int64(cache.limit) {
-		head := cache.head.Load()
-		if head == nil {
+		if !cache.evictTail() {
 			return
 		}
+	}
+}
 
-		next := head.next.Load()
+func (cache *circuitBreakerCache) evictTail() bool {
+	for {
+		head := cache.head.Load()
 
-		if cache.head.CompareAndSwap(head, next) {
-			cache.count.Add(-1)
+		if head == nil {
+			return false
+		}
+
+		if head.next.Load() == nil {
+			if cache.head.CompareAndSwap(head, nil) {
+				cache.count.Add(-1)
+
+				return true
+			}
+
+			continue
+		}
+
+		prev := head
+
+		for {
+			next := prev.next.Load()
+
+			if next == nil {
+				return false
+			}
+
+			if next.next.Load() == nil {
+				if prev.next.CompareAndSwap(next, nil) {
+					cache.count.Add(-1)
+
+					return true
+				}
+
+				return false
+			}
+
+			prev = next
 		}
 	}
 }

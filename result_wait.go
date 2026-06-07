@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"runtime"
 	"sync/atomic"
 	"unsafe"
 )
@@ -76,9 +75,6 @@ func (slot *resultSlot) Wait(ctx context.Context) (*QValue[erasedAny], error) {
 			return nil, err
 		}
 
-		gp := GetG()
-		slot.pushWaiter(gp)
-
 		switch slot.state.Load() {
 		case slotReady:
 			if value := slot.value.Load(); value != nil {
@@ -88,12 +84,8 @@ func (slot *resultSlot) Wait(ctx context.Context) (*QValue[erasedAny], error) {
 			return nil, errResultClosed
 		}
 
-		if gp != nil {
-			fast_park(gp)
-			continue
-		}
-
-		runtime.Gosched()
+		slot.pushWaiter(GetG())
+		mcall(fast_park)
 	}
 }
 

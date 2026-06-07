@@ -116,10 +116,7 @@ func (consumer *BroadcastConsumer) Wait(ctx context.Context) (*QValue[erasedAny]
 			return nil, err
 		}
 
-		gp := GetG()
-		if gp != nil {
-			fast_park(gp)
-		}
+		mcall(fast_park)
 	}
 }
 

@@ -84,9 +84,77 @@ func (slot *resultSlot) Wait(ctx context.Context) (*QValue[erasedAny], error) {
 			return nil, errResultClosed
 		}
 
-		slot.pushWaiter(GetG())
-		mcall(fast_park)
+		slot.parkForWait(ctx)
 	}
+}
+
+func (slot *resultSlot) removeWaiter(gp unsafe.Pointer) {
+	if gp == nil {
+		return
+	}
+
+	for {
+		head := slot.waiters.Load()
+
+		if head == nil {
+			return
+		}
+
+		if head.gp == gp {
+			if slot.waiters.CompareAndSwap(head, head.next.Load()) {
+				return
+			}
+
+			continue
+		}
+
+		prev := head
+
+		for node := head.next.Load(); node != nil; node = node.next.Load() {
+			if node.gp == gp {
+				if prev.next.CompareAndSwap(node, node.next.Load()) {
+					return
+				}
+
+				break
+			}
+
+			prev = node
+		}
+
+		return
+	}
+}
+
+func (slot *resultSlot) parkForWait(ctx context.Context) {
+	if slot.state.Load() != slotPending {
+		return
+	}
+
+	gp := GetG()
+	stopped := make(chan struct{})
+
+	slot.pushWaiter(gp)
+
+	if slot.state.Load() != slotPending {
+		slot.removeWaiter(gp)
+
+		return
+	}
+
+	if ctxDone := ctx.Done(); ctxDone != nil {
+		go func() {
+			select {
+			case <-ctxDone:
+				safe_ready(gp)
+			case <-stopped:
+			}
+		}()
+	}
+
+	mcall(fast_park)
+	slot.removeWaiter(gp)
+	close(stopped)
 }
 
 func (slot *resultSlot) Deliver(value *QValue[erasedAny]) {

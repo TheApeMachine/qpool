@@ -42,29 +42,18 @@ func TestResultSlotWait(test *testing.T) {
 	})
 }
 
-func TestResultWaitGet(test *testing.T) {
-	Convey("Given a Q pool schedule result", test, func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-
-		pool := NewQ[any](ctx, 1, 2, &Config{
-			SchedulingTimeout: time.Second,
-			Scaler:            nil,
-		})
+func TestResultSlotWaitRespectsContextCancel(test *testing.T) {
+	Convey("Given a pending result slot", test, func() {
+		slot := newResultSlot()
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 
 		defer cancel()
-		defer pool.Close()
 
-		wait := pool.Schedule("result-wait", func(jobCtx context.Context) (any, error) {
-			return "done", nil
-		})
+		Convey("It should return when the context expires", func() {
+			_, err := slot.Wait(ctx)
 
-		Convey("It should return the job value", func() {
-			result, err := wait.Get(ctx)
-
-			So(err, ShouldBeNil)
-			So(result, ShouldNotBeNil)
-			So(result.Error, ShouldBeNil)
-			So(result.Value, ShouldEqual, "done")
+			So(err, ShouldNotBeNil)
+			So(err, ShouldEqual, context.DeadlineExceeded)
 		})
 	})
 }

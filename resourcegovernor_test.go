@@ -14,7 +14,7 @@ func TestResourceGovernorObserveAndThresholds(t *testing.T) {
 	Convey("ResourceGovernor reads CPU hint from MetricReading", t, func() {
 		rg := NewResourceGovernorRegulator(0.8, 0.99, time.Second)
 
-		rg.Observe(&MetricReading{ResourceUtilization: 0.5})
+		rg.Observe(MetricReading{ResourceUtilization: 0.5})
 
 		cpu, mem := rg.GetResourceUsage()
 
@@ -38,7 +38,7 @@ func TestResourceGovernorObserveAndThresholds(t *testing.T) {
 
 		expected := float64(ms.Alloc) / total
 
-		rg.Observe(&MetricReading{ResourceUtilization: 0.11})
+		rg.Observe(MetricReading{ResourceUtilization: 0.11})
 
 		_, mem := rg.GetResourceUsage()
 
@@ -48,11 +48,11 @@ func TestResourceGovernorObserveAndThresholds(t *testing.T) {
 	Convey("Observe refreshes CPU while throttling repeated MemStats when interval is set", t, func() {
 		rg := NewResourceGovernorRegulator(0.9, 0.99, 200*time.Millisecond)
 
-		rg.Observe(&MetricReading{ResourceUtilization: 0.2})
+		rg.Observe(MetricReading{ResourceUtilization: 0.2})
 
 		_, mem1 := rg.GetResourceUsage()
 
-		rg.Observe(&MetricReading{ResourceUtilization: 0.35})
+		rg.Observe(MetricReading{ResourceUtilization: 0.35})
 
 		cpu, mem2 := rg.GetResourceUsage()
 
@@ -70,8 +70,8 @@ func TestResourceGovernorObserveAndThresholds(t *testing.T) {
 			memStats.Alloc = 25
 		}
 
-		rg.Observe(&MetricReading{ResourceUtilization: 0.2})
-		rg.Observe(&MetricReading{ResourceUtilization: 0.3})
+		rg.Observe(MetricReading{ResourceUtilization: 0.2})
+		rg.Observe(MetricReading{ResourceUtilization: 0.3})
 
 		cpu, memory := rg.GetResourceUsage()
 
@@ -101,7 +101,7 @@ func TestResourceGovernorObserveAndThresholds(t *testing.T) {
 	Convey("Limit triggers when CPU exceeds threshold", t, func() {
 		rg := NewResourceGovernorRegulator(0.5, 0.999, 0)
 
-		rg.Observe(&MetricReading{ResourceUtilization: 0.51})
+		rg.Observe(MetricReading{ResourceUtilization: 0.51})
 
 		So(rg.Limit(), ShouldBeTrue)
 	})
@@ -109,7 +109,7 @@ func TestResourceGovernorObserveAndThresholds(t *testing.T) {
 	Convey("Limit triggers when memory exceeds threshold", t, func() {
 		rg := NewResourceGovernorRegulator(0.999, 0.0000001, 0)
 
-		rg.Observe(nil)
+		rg.Observe(MetricReading{})
 
 		So(rg.Limit(), ShouldBeTrue)
 	})
@@ -117,7 +117,7 @@ func TestResourceGovernorObserveAndThresholds(t *testing.T) {
 	Convey("Renormalize does not observe twice inside check interval", t, func() {
 		rg := NewResourceGovernorRegulator(0.99, 0.99, 500*time.Millisecond)
 
-		read := &MetricReading{ResourceUtilization: 0.42}
+		read := MetricReading{ResourceUtilization: 0.42}
 
 		rg.Observe(read)
 

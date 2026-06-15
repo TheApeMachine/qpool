@@ -3,16 +3,23 @@ package qpool
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/google/uuid"
+	"github.com/theapemachine/datura"
 )
 
 /*
 QSpace stores job results, waits, broadcast groups, and dependency edges.
 */
 type QSpace struct {
+	ID              string
+	ctx             context.Context
+	cancel          context.CancelFunc
 	entries         Registry
-	groups          GroupRegistry
+	groups          sync.Map
 	stopped         atomic.Bool
 	cleanupInterval time.Duration
 	maintDone       atomic.Bool
@@ -21,16 +28,18 @@ type QSpace struct {
 /*
 NewQSpace starts the expiration loop.
 */
-func NewQSpace() *QSpace {
+func NewQSpace(ctx context.Context) *QSpace {
+	ctx, cancel := context.WithCancel(context.Background())
+
 	qspace := &QSpace{
+		ID:              uuid.New().String(),
+		ctx:             ctx,
+		cancel:          cancel,
 		cleanupInterval: time.Minute,
 		entries:         *NewRegistry(),
 	}
 
-	qspace.groups.init()
-
 	go qspace.loop()
-
 	return qspace
 }
 
@@ -55,18 +64,16 @@ func (qspace *QSpace) loop() {
 /*
 Store persists a completed value and fulfills waiters.
 */
-func (qspace *QSpace) Store(id string, value interface{}, ttl time.Duration) {
+func (qspace *QSpace) Store(id string, value any, ttl time.Duration) {
 	if qspace.stopped.Load() {
 		return
 	}
 
-	qvalue, err := NewQValue("", "", value, ttl)
+	artifact, err := newResultArtifact(id, value, ttl)
 
 	if err != nil {
 		return
 	}
-
-	qvalue.TTL = ttl
 
 	entry := qspace.entries.getOrCreate(id)
 
@@ -74,10 +81,10 @@ func (qspace *QSpace) Store(id string, value interface{}, ttl time.Duration) {
 		return
 	}
 
-	entry.stored.Store(qvalue)
+	entry.stored.Store(artifact)
 
 	if slot := entry.value.Load(); slot != nil {
-		slot.Deliver(qvalue)
+		slot.Deliver(artifact)
 	}
 }
 
@@ -118,24 +125,24 @@ func (qspace *QSpace) Await(id string) *ResultWait[erasedAny] {
 PeekResult returns (nil, false) when id has no stored completion, when
 the entry was removed by TTL cleanup, or when the space is stopped.
 */
-func (qspace *QSpace) PeekResult(id string) (*QValue[erasedAny], bool) {
+func (qspace *QSpace) PeekResult(id string) (*datura.Artifact, bool) {
 	if qspace.stopped.Load() {
 		return nil, false
 	}
 
 	entry := qspace.entries.find(id)
+
 	if entry == nil {
 		return nil, false
 	}
 
 	value := entry.stored.Load()
+
 	if value == nil {
 		return nil, false
 	}
 
-	copied := *value
-
-	return &copied, true
+	return cloneArtifact(value), true
 }
 
 /*
@@ -154,28 +161,27 @@ func (qspace *QSpace) Exists(id string) bool {
 /*
 StoreError stores a terminal error result for id.
 */
-func (qspace *QSpace) StoreError(id string, err error, ttl time.Duration) {
+func (qspace *QSpace) StoreError(id string, terminalErr error, ttl time.Duration) {
 	if qspace.stopped.Load() {
 		return
 	}
 
-	qvalue, qvalueErr := NewQValue[erasedAny]("", "", nil, 0)
-	if qvalueErr != nil {
+	artifact, err := newErrorArtifact(id, terminalErr, ttl)
+
+	if err != nil {
 		return
 	}
 
-	qvalue.Error = err
-	qvalue.TTL = ttl
-
 	entry := qspace.entries.getOrCreate(id)
+
 	if entry == nil || qspace.stopped.Load() {
 		return
 	}
 
-	entry.stored.Store(qvalue)
+	entry.stored.Store(artifact)
 
 	if slot := entry.value.Load(); slot != nil {
-		slot.Deliver(qvalue)
+		slot.Deliver(artifact)
 	}
 }
 
@@ -204,43 +210,25 @@ func (qspace *QSpace) RegisterDependent(depID, jobID string) {
 /*
 CreateBroadcastGroup registers a pub/sub group owned by this space.
 */
-func (qspace *QSpace) CreateBroadcastGroup(id string, ttl time.Duration) *BroadcastGroup {
-	if existing := qspace.groups.load(id); existing != nil {
-		return existing
+func (qspace *QSpace) CreateBroadcastGroup(id string) (existing *BroadcastGroup) {
+	if existing, ok := qspace.groups.LoadOrStore(
+		id, NewBroadcastGroup(qspace.ctx, id, time.Minute),
+	); ok {
+		return existing.(*BroadcastGroup)
 	}
 
-	group, err := NewBroadcastGroup(context.Background(), id, ttl)
-
-	if err != nil {
-		return nil
-	}
-
-	if qspace.stopped.Load() {
-		group.Close()
-
-		return nil
-	}
-
-	qspace.groups.store(id, group)
-
-	return group
+	return existing
 }
 
 /*
 Subscribe attaches to a broadcast group by id.
 */
-func (qspace *QSpace) Subscribe(groupID string) *BroadcastConsumer {
-	if qspace.stopped.Load() {
-		return nil
-	}
-
-	group := qspace.groups.load(groupID)
-
-	if group == nil {
-		return nil
-	}
-
-	return group.Subscribe("", 10)
+func (qspace *QSpace) Subscribe(
+	groupID string, callback func(*datura.Artifact) error,
+) (consumer *BroadcastConsumer) {
+	return qspace.CreateBroadcastGroup(groupID).Acquire(
+		uuid.New().String(), callback,
+	)
 }
 
 /*
@@ -256,19 +244,33 @@ func (qspace *QSpace) Close() {
 	}
 
 	qspace.entries.closeAll()
-	qspace.groups.closeAll()
+
+	qspace.groups.Range(func(key, value any) bool {
+		value.(*BroadcastGroup).Close()
+		return true
+	})
 }
 
 func (qspace *QSpace) cleanup(now time.Time) {
 	for shardIndex := range qspace.entries.shards {
-		qspace.entries.shards[shardIndex].entries.Walk(func(entry *RegistryEntry) {
+		qspace.entries.shards[shardIndex].entries.Walk(func(
+			entry *RegistryEntry,
+		) {
 			value := entry.stored.Load()
 
-			if value == nil || value.TTL <= 0 || now.Sub(time.Unix(0, value.CreatedAt)) <= value.TTL {
+			if value == nil {
 				return
 			}
 
-			if !entry.stored.CompareAndSwap(value, nil) {
+			ttl := artifactTTL(value)
+
+			if ttl <= 0 {
+				return
+			}
+
+			if now.Sub(
+				time.Unix(0, value.Timestamp()),
+			) <= ttl || !entry.stored.CompareAndSwap(value, nil) {
 				return
 			}
 

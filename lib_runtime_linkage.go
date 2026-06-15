@@ -1,7 +1,6 @@
 package qpool
 
 import (
-	"runtime"
 	"unsafe"
 	_ "unsafe"
 
@@ -12,8 +11,6 @@ const (
 	cacheLinePadSize          = constants.CacheLinePadSize
 	uint64SubtractionConstant = ^uint64(0)
 )
-
-type cacheLinePadding struct{ _ [cacheLinePadSize]byte }
 
 // Linking ZenQ with golang internal runtime library to allow usage of scheduling primitives
 // like goready(), mcall() etc to allow low-level scheduling of goroutines
@@ -156,9 +153,6 @@ func fast_park(gp unsafe.Pointer) {
 	casgstatus(gp, _Grunning, _Gwaiting)
 	schedule()
 }
-
-// whether the system has multiple cores or a single core
-var multicore = runtime.NumCPU() > 1
 
 // call ready after ensuring the goroutine is parked
 func safe_ready(gp unsafe.Pointer) {

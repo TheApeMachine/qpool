@@ -2,11 +2,12 @@ package qpool
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"runtime/debug"
 	"time"
 
-	"github.com/phuslu/log"
+	"github.com/theapemachine/datura"
 )
 
 func processJob(q *Q[any], workerCtx context.Context, job Job) {
@@ -21,16 +22,27 @@ func processJob(q *Q[any], workerCtx context.Context, job Job) {
 
 	startedAt := time.Now()
 
-	q.publishTelemetry(Event{
-		Component: "qpool",
-		Op:        "job-start",
-		Message:   fmt.Sprintf("job started: %s", job.ID),
-		Time:      startedAt,
-		Level:     log.DebugLevel,
-		Fields: []Field{
-			{Key: "job", Value: job.ID},
-		},
+	startedEvent := datura.Acquire(
+		"qpool",
+		datura.Artifact_TypeFromString("debug"),
+	)
+	payload, err := json.Marshal(map[string]any{
+		"job": job.ID,
 	})
+
+	if err != nil {
+		er, err := datura.NewArtifact_Error(startedEvent.Segment())
+		if err != nil {
+			return
+		}
+		er.SetType(datura.Artifact_Error_Type(datura.Artifact_Type_json))
+		er.SetTimestamp(time.Now().Unix())
+		startedEvent.SetError(er)
+	}
+
+	startedEvent.SetPayload(payload)
+	startedEvent.SetTimestamp(startedAt.Unix())
+	q.publishTelemetry(startedEvent)
 
 	result, err := runJobWithRetries(execCtx, job)
 
@@ -41,25 +53,21 @@ func processJob(q *Q[any], workerCtx context.Context, job Job) {
 		q.metrics.RecordJobOutcome(latency, false)
 
 		if job.CircuitID != "" {
-			if cb := q.breakerForJob(&job); cb != nil {
+			if cb := q.breakerForJob(job); cb != nil {
 				cb.RecordFailure()
 			}
 		}
 
-		q.publishTelemetry(Event{
-			Component: "qpool",
-			Op:        "job-error",
-			Message:   fmt.Sprintf("job failed: %s (%v)", job.ID, err),
-			Time:      time.Now(),
-			Level:     log.ErrorLevel,
-			Err:       err,
-			Fields: []Field{
-				{Key: "job", Value: job.ID},
-				{Key: "phase", Value: "execution"},
-				{Key: "duration_ms", Value: latency.Milliseconds()},
-				{Key: "exec_duration_ms", Value: execDur.Milliseconds()},
-			},
-		})
+		artifact := datura.Acquire(
+			"qpool",
+			datura.Artifact_TypeFromString("error"),
+		)
+
+		er, err := datura.NewArtifact_Error(artifact.Segment())
+		artifact.SetError(er)
+		artifact.SetTimestamp(time.Now().Unix())
+
+		q.publishTelemetry(artifact)
 
 		q.space.StoreError(job.ID, err, job.TTL)
 
@@ -69,23 +77,27 @@ func processJob(q *Q[any], workerCtx context.Context, job Job) {
 	q.metrics.RecordJobOutcome(latency, true)
 
 	if job.CircuitID != "" {
-		if cb := q.breakerForJob(&job); cb != nil {
+		if cb := q.breakerForJob(job); cb != nil {
 			cb.RecordSuccess()
 		}
 	}
 
-	q.publishTelemetry(Event{
-		Component: "qpool",
-		Op:        "job-complete",
-		Message:   fmt.Sprintf("job completed: %s in %s", job.ID, latency.Round(time.Millisecond)),
-		Time:      time.Now(),
-		Level:     log.DebugLevel,
-		Fields: []Field{
-			{Key: "job", Value: job.ID},
-			{Key: "duration_ms", Value: latency.Milliseconds()},
-			{Key: "exec_duration_ms", Value: execDur.Milliseconds()},
-		},
+	completeEvent := datura.Acquire(
+		"qpool",
+		datura.Artifact_TypeFromString("debug"),
+	)
+	payload, err = json.Marshal(map[string]any{
+		"job":              job.ID,
+		"duration_ms":      latency.Milliseconds(),
+		"exec_duration_ms": execDur.Milliseconds(),
 	})
+
+	if err != nil {
+		return
+	}
+	completeEvent.SetPayload(payload)
+	completeEvent.SetTimestamp(time.Now().Unix())
+	q.publishTelemetry(completeEvent)
 
 	q.space.Store(job.ID, result, job.TTL)
 }

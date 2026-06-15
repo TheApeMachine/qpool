@@ -2,6 +2,8 @@ package qpool
 
 import (
 	"time"
+
+	"github.com/theapemachine/datura"
 )
 
 /*
@@ -20,7 +22,7 @@ type Config struct {
 		TelemetryPublish forwards pool-originated events into the app’s telemetry
 		sink (for example telemetry.Publish) without qpool importing telemetry.
 	*/
-	TelemetryPublish func(Event)
+	TelemetryPublish func(*datura.Artifact) error
 }
 
 /*

@@ -3,11 +3,13 @@ package qpool
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
 
-	"github.com/phuslu/log"
+	"github.com/theapemachine/datura"
+	"github.com/theapemachine/errnie"
 )
 
 type (
@@ -33,6 +35,7 @@ Q combines a disruptor-backed job queue, fixed worker set, optional regulators, 
 type Q[T any] struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
+	err         error
 	_p1         [cacheLinePadSize - unsafe.Sizeof(uint64(0))]byte
 	alloc       func() any
 	free        func(any)
@@ -60,22 +63,18 @@ type Q[T any] struct {
 /*
 NewQ constructs a pool with minWorkers..maxWorkers active disruptor workers.
 */
-func NewQ[T any](ctx context.Context, minWorkers, maxWorkers int, config *Config) *Q[T] {
+func NewQ[T any](
+	ctx context.Context,
+	minWorkers, maxWorkers int,
+	config *Config,
+) *Q[T] {
 	if config == nil {
 		config = NewConfig()
 	}
 
-	if maxWorkers < 1 {
-		maxWorkers = 1
-	}
-
-	if minWorkers < 1 {
-		minWorkers = 1
-	}
-
-	if minWorkers > maxWorkers {
-		minWorkers = maxWorkers
-	}
+	maxWorkers = max(1, maxWorkers)
+	minWorkers = max(1, minWorkers)
+	minWorkers = min(minWorkers, maxWorkers)
 
 	ctx, cancel := context.WithCancel(ctx)
 
@@ -92,27 +91,32 @@ func NewQ[T any](ctx context.Context, minWorkers, maxWorkers int, config *Config
 		maxWorkers: maxWorkers,
 		deps:       &WaitGroup{},
 		scalerWG:   &WaitGroup{},
-		space:      NewQSpace(),
+		space:      NewQSpace(ctx),
 		metrics:    NewMetrics(),
 		breakers:   newCircuitBreakerCache(config.CircuitBreakerLimit),
 		registry:   newWorkerRegistry(),
 		config:     config,
 	}
 
-	jobQueue, err := newJobDisruptorQueue(qAny(q), capacity, maxWorkers)
-	if err != nil {
+	if q.jobQueue, q.err = newJobDisruptorQueue(
+		qAny(q), capacity, maxWorkers,
+	); q.err != nil {
 		cancel()
-		panic(err)
+		errnie.Error(errnie.Err(
+			errnie.IO,
+			"qpool: initialize disruptor job queue",
+			q.err,
+		))
 	}
 
-	q.jobQueue = jobQueue
-
-	for i := 0; i < minWorkers; i++ {
+	for range minWorkers {
 		q.startWorker()
 	}
 
 	if config.Scaler != nil {
-		q.scaler = NewScaler(qAny(q), minWorkers, maxWorkers, config.Scaler)
+		q.scaler = NewScaler(
+			ctx, qAny(q), minWorkers, maxWorkers, config.Scaler,
+		)
 	}
 
 	return q
@@ -134,9 +138,7 @@ func (q *Q[T]) MetricSnapshot() MetricReading {
 		return MetricReading{}
 	}
 
-	r := q.metrics.CollectReading()
-
-	return *r
+	return q.metrics.CollectReading()
 }
 
 /*
@@ -158,14 +160,14 @@ func (q *Q[T]) PeriodicScalerConfigured() bool {
 	return q != nil && q.config != nil && q.config.Scaler != nil
 }
 
-func (q *Q[T]) publishTelemetry(ev Event) {
+func (q *Q[T]) publishTelemetry(artifact *datura.Artifact) error {
 	if q != nil && q.config != nil && q.config.TelemetryPublish != nil {
-		q.config.TelemetryPublish(ev)
+		q.config.TelemetryPublish(artifact)
 
-		return
+		return nil
 	}
 
-	Publish(ev)
+	return nil
 }
 
 func (q *Q[T]) schedulingTimeout() time.Duration {
@@ -210,15 +212,27 @@ func (q *Q[T]) enqueueJob(ctx context.Context, job Job) error {
 		return fmt.Errorf("qpool: schedule job: %w", err)
 	}
 
-	q.publishTelemetry(Event{
-		Component: "qpool",
-		Op:        "schedule",
-		Message:   fmt.Sprintf("job scheduled: %s", job.ID),
-		Time:      time.Now(),
-		Level:     log.DebugLevel,
-	})
+	artifact := datura.Acquire("qpool", datura.Artifact_Type_json)
+	artifact.SetRole("job-scheduled")
+	artifact.SetScope(job.ID)
+	artifact.SetPayload([]byte(fmt.Sprintf("job scheduled: %s", job.ID)))
+	artifact.SetTimestamp(time.Now().UnixNano())
 
-	return nil
+	return q.publishTelemetry(artifact)
+}
+
+var jobPool = sync.Pool{
+	New: func() any {
+		return Job{
+			StartTime: time.Now(),
+			RetryPolicy: &RetryPolicy{
+				MaxAttempts: 1,
+				Strategy: &ExponentialBackoff{
+					Initial: time.Second,
+				},
+			},
+		}
+	},
 }
 
 /*
@@ -233,21 +247,17 @@ func (q *Q[T]) Schedule(
 	fn func(context.Context) (T, error),
 	opts ...JobOption,
 ) *ResultWait[T] {
-	ctx, cancel := context.WithTimeout(q.ctx, q.schedulingTimeout())
+	ctx, cancel := context.WithTimeout(
+		q.ctx, q.schedulingTimeout(),
+	)
 	defer cancel()
 
-	startTime := time.Now()
+	job := jobPool.Get().(Job)
+	defer jobPool.Put(job)
 
-	job := Job{
-		ID: id,
-		Fn: func(ctx context.Context) (any, error) {
-			return fn(ctx)
-		},
-		StartTime: startTime,
-		RetryPolicy: &RetryPolicy{
-			MaxAttempts: 1,
-			Strategy:    &ExponentialBackoff{Initial: time.Second},
-		},
+	job.ID = id
+	job.Fn = func(ctx context.Context) (any, error) {
+		return fn(ctx)
 	}
 
 	for _, opt := range opts {
@@ -269,16 +279,24 @@ func (q *Q[T]) Schedule(
 			if regulator.Limit() {
 				q.metrics.incThrottled()
 
-				return errorResultWait[T](fmt.Errorf("qpool: regulator rejected schedule"))
+				return errorResultWait[T](errnie.Err(
+					errnie.IO,
+					"qpool: regulator rejected schedule",
+					nil,
+				))
 			}
 		}
 	}
 
 	if job.CircuitID != "" {
-		breaker := q.breakerFor(&job)
+		breaker := q.breakerFor(job)
 
 		if breaker != nil && !breaker.Allow() {
-			return errorResultWait[T](fmt.Errorf("circuit breaker %s is open", job.CircuitID))
+			return errorResultWait[T](errnie.Err(
+				errnie.IO,
+				fmt.Sprintf("circuit breaker %s is open", job.CircuitID),
+				nil,
+			))
 		}
 
 		if breaker != nil {
@@ -287,7 +305,11 @@ func (q *Q[T]) Schedule(
 	}
 
 	if q.stopping.Load() {
-		return errorResultWait[T](fmt.Errorf("qpool: pool closed"))
+		return errorResultWait[T](errnie.Err(
+			errnie.IO,
+			"qpool: pool closed",
+			nil,
+		))
 	}
 
 	if len(job.Dependencies) > 0 {
@@ -308,33 +330,29 @@ func (q *Q[T]) Schedule(
 /*
 CreateBroadcastGroup allocates a group stored inside QSpace.
 */
-func (q *Q[T]) CreateBroadcastGroup(id string, ttl time.Duration) *BroadcastGroup {
-	return q.space.CreateBroadcastGroup(id, ttl)
+func (q *Q[T]) CreateBroadcastGroup(id string) *BroadcastGroup {
+	return q.space.CreateBroadcastGroup(id)
 }
 
 /*
 Subscribe returns the broadcast group's lock-free consumer for groupID.
 */
-func (q *Q[T]) Subscribe(groupID string) *BroadcastConsumer {
-	return q.space.Subscribe(groupID)
+func (q *Q[T]) Subscribe(
+	groupID string, callback func(*datura.Artifact) error,
+) *BroadcastConsumer {
+	return q.space.Subscribe(groupID, callback)
 }
 
 /*
-PeekResult returns a shallow copy of the stored QValue for job id when QSpace holds
-a non-expired result. It returns (nil, false) when no result is stored for id, when
-TTL expiration or eviction removed the entry, or when the pool or space cannot serve
-the query (including during shutdown). The returned *QValue points at a new struct
-value copied from the actor's map entry; see QSpace.PeekResult for concurrency and
-read-only semantics versus nested reference fields in QValue.
+PeekResult returns a shallow copy of the stored artifact for job id when QSpace
+holds a non-expired result.
 */
-func (q *Q[T]) PeekResult(id string) (*QValue[T], bool) {
+func (q *Q[T]) PeekResult(id string) (*datura.Artifact, bool) {
 	if q == nil {
 		return nil, false
 	}
 
-	v, ok := q.space.PeekResult(id)
-
-	return qValuePtr[T](v), ok
+	return q.space.PeekResult(id)
 }
 
 /*
@@ -342,8 +360,8 @@ WithTTL sets how long QSpace retains the job result before expiration
 cleanup. It does not cap execution time; use WithExecTimeout for that.
 */
 func WithTTL(ttl time.Duration) JobOption {
-	return func(j *Job) {
-		j.TTL = ttl
+	return func(job *Job) {
+		job.TTL = ttl
 	}
 }
 
@@ -352,8 +370,8 @@ WithExecTimeout sets the per-invocation deadline passed to Fn. Zero selects
 the pool Config.SchedulingTimeout default (when positive) or five seconds.
 */
 func WithExecTimeout(duration time.Duration) JobOption {
-	return func(j *Job) {
-		j.ExecTimeout = duration
+	return func(job *Job) {
+		job.ExecTimeout = duration
 	}
 }
 

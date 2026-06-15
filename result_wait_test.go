@@ -6,12 +6,13 @@ import (
 	"time"
 
 	. "github.com/smartystreets/goconvey/convey"
+	"github.com/theapemachine/datura"
 )
 
 func TestResultSlotWait(test *testing.T) {
 	Convey("Given a pending result slot", test, func() {
 		slot := newResultSlot()
-		waitDone := make(chan *QValue[erasedAny], 1)
+		waitDone := make(chan *datura.Artifact, 1)
 
 		go func() {
 			value, err := slot.Wait(context.Background())
@@ -25,7 +26,7 @@ func TestResultSlotWait(test *testing.T) {
 		}()
 
 		Convey("It should deliver after Store races ahead of the waiter", func() {
-			delivered, err := NewQValue[erasedAny]("", "", "ok", 0)
+			delivered, err := newResultArtifact("job", "ok", 0)
 
 			So(err, ShouldBeNil)
 
@@ -34,7 +35,11 @@ func TestResultSlotWait(test *testing.T) {
 			select {
 			case result := <-waitDone:
 				So(result, ShouldNotBeNil)
-				So(result.Value, ShouldEqual, "ok")
+
+				payload, payloadErr := result.Payload()
+
+				So(payloadErr, ShouldBeNil)
+				So(string(payload), ShouldEqual, "ok")
 			case <-time.After(time.Second):
 				test.Fatal("timed out waiting for result slot delivery")
 			}

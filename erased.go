@@ -12,11 +12,3 @@ type erasedAny = interface{}
 func qAny[T any](q *Q[T]) *Q[erasedAny] {
 	return (*Q[erasedAny])(unsafe.Pointer(q))
 }
-
-func qValuePtr[T any](v *QValue[erasedAny]) *QValue[T] {
-	if v == nil {
-		return nil
-	}
-
-	return (*QValue[T])(unsafe.Pointer(v))
-}

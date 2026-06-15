@@ -35,9 +35,9 @@ func (eb *ExponentialBackoff) NextDelay(attempt int) time.Duration {
 
 // WithCircuitBreaker configures circuit breaker for a job
 func WithCircuitBreaker(id string, maxFailures int, resetTimeout time.Duration) JobOption {
-	return func(j *Job) {
-		j.CircuitID = id
-		j.CircuitConfig = &CircuitBreakerConfig{
+	return func(job *Job) {
+		job.CircuitID = id
+		job.CircuitConfig = &CircuitBreakerConfig{
 			MaxFailures:  maxFailures,
 			ResetTimeout: resetTimeout,
 			HalfOpenMax:  2, // Default value, could be made configurable
@@ -47,8 +47,8 @@ func WithCircuitBreaker(id string, maxFailures int, resetTimeout time.Duration) 
 
 // WithRetry configures retry behavior for a job
 func WithRetry(attempts int, strategy RetryStrategy) JobOption {
-	return func(j *Job) {
-		j.RetryPolicy = &RetryPolicy{
+	return func(job *Job) {
+		job.RetryPolicy = &RetryPolicy{
 			MaxAttempts: attempts,
 			Strategy:    strategy,
 		}

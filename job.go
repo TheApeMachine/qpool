@@ -42,8 +42,8 @@ type CircuitBreakerConfig struct {
 WithDependencyRetry configures retry behavior for dependencies
 */
 func WithDependencyRetry(attempts int, strategy RetryStrategy) JobOption {
-	return func(j *Job) {
-		j.DependencyRetryPolicy = &RetryPolicy{
+	return func(job *Job) {
+		job.DependencyRetryPolicy = &RetryPolicy{
 			MaxAttempts: attempts,
 			Strategy:    strategy,
 		}
@@ -54,14 +54,14 @@ func WithDependencyRetry(attempts int, strategy RetryStrategy) JobOption {
 WithDependencies configures job dependencies
 */
 func WithDependencies(dependencies []string) JobOption {
-	return func(j *Job) {
+	return func(job *Job) {
 		if len(dependencies) == 0 {
-			j.Dependencies = nil
+			job.Dependencies = nil
 
 			return
 		}
 
-		j.Dependencies = append([]string(nil), dependencies...)
+		job.Dependencies = append([]string(nil), dependencies...)
 	}
 }
 
@@ -75,7 +75,7 @@ func DependenciesConfiguredByOption(opt JobOption) bool {
 		return false
 	}
 
-	var j Job
+	j := Job{}
 
 	opt(&j)
 

@@ -30,16 +30,22 @@ func TestQScheduleDependencyWaitDoesNotStarveWorkers(test *testing.T) {
 		Convey("It should run the dependency producer before the dependent job occupies the worker", func() {
 			parentValue := receiveResultWait(test, parentResult)
 
+			payload, err := parentValue.Payload()
+			So(err, ShouldBeNil)
+			So(string(payload), ShouldEqual, "parent")
+
 			So(parentValue, ShouldNotBeNil)
-			So(parentValue.Error, ShouldBeNil)
-			So(parentValue.Value, ShouldEqual, "parent")
+			So(ArtifactError(parentValue), ShouldBeNil)
 
 			childValue := receiveResultWait(test, childResult)
 
+			payload, err = childValue.Payload()
+			So(err, ShouldBeNil)
+			So(string(payload), ShouldEqual, "child")
+
 			So(childValue, ShouldNotBeNil)
-			So(childValue.Error, ShouldBeNil)
-			So(childValue.Value, ShouldEqual, "child")
+			So(err, ShouldBeNil)
+			So(string(payload), ShouldEqual, "child")
 		})
 	})
 }
-

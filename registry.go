@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"hash/fnv"
 	"sync/atomic"
+
+	"github.com/theapemachine/datura"
 )
 
 const registryShardCount = 256
@@ -15,10 +17,6 @@ func (indexer keyIndexer) hash(key string) uint64 {
 	_, _ = hasher.Write([]byte(key))
 
 	return hasher.Sum64()
-}
-
-func (indexer keyIndexer) shard(key string) uint64 {
-	return indexer.shardFromHash(indexer.hash(key))
 }
 
 func (indexer keyIndexer) shardFromHash(hash uint64) uint64 {
@@ -91,7 +89,7 @@ type RegistryEntry struct {
 	keyHash  uint64
 	key      string
 	value    atomic.Pointer[resultSlot]
-	stored   atomic.Pointer[QValue[erasedAny]]
+	stored   atomic.Pointer[datura.Artifact]
 	children *depEdgeList
 	parents  *depEdgeList
 	next     atomic.Pointer[RegistryEntry]

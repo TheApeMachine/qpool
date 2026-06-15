@@ -9,11 +9,10 @@ import (
 
 func TestQSpaceAwait(test *testing.T) {
 	Convey("Given QSpace Await on a pending id", test, func() {
-		qspace := NewQSpace()
+		qspace := NewQSpace(test.Context())
 		defer qspace.Close()
 
 		wait := qspace.Await("job")
-
 		qspace.Store("job", "ok", 0)
 
 		Convey("It should deliver one value", func() {
@@ -21,15 +20,19 @@ func TestQSpaceAwait(test *testing.T) {
 
 			So(err, ShouldBeNil)
 			So(result, ShouldNotBeNil)
-			So(result.Error, ShouldBeNil)
-			So(result.Value, ShouldEqual, "ok")
+			So(ArtifactError(result), ShouldBeNil)
+
+			payload, payloadErr := result.Payload()
+
+			So(payloadErr, ShouldBeNil)
+			So(string(payload), ShouldEqual, "ok")
 		})
 	})
 }
 
 func TestQSpaceStore(test *testing.T) {
 	Convey("Given QSpace Store", test, func() {
-		qspace := NewQSpace()
+		qspace := NewQSpace(test.Context())
 		defer qspace.Close()
 
 		qspace.Store("job", "ok", 0)
@@ -39,14 +42,18 @@ func TestQSpaceStore(test *testing.T) {
 
 			So(ok, ShouldBeTrue)
 			So(result, ShouldNotBeNil)
-			So(result.Value, ShouldEqual, "ok")
+
+			payload, err := result.Payload()
+
+			So(err, ShouldBeNil)
+			So(string(payload), ShouldEqual, "ok")
 		})
 	})
 }
 
 func TestQSpaceAddRelationship(test *testing.T) {
 	Convey("Given QSpace dependency relationships", test, func() {
-		qspace := NewQSpace()
+		qspace := NewQSpace(test.Context())
 		defer qspace.Close()
 
 		So(qspace.AddRelationship("a", "b"), ShouldBeNil)

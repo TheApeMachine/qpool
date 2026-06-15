@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"sync/atomic"
 	"unsafe"
+
+	"github.com/theapemachine/datura"
 )
 
 const (
@@ -24,7 +26,7 @@ type waiterNode struct {
 
 type resultSlot struct {
 	state   atomic.Uint32
-	value   atomic.Pointer[QValue[erasedAny]]
+	value   atomic.Pointer[datura.Artifact]
 	waiters atomic.Pointer[waiterNode]
 }
 
@@ -50,16 +52,12 @@ func (slot *resultSlot) pushWaiter(node *waiterNode) {
 func (slot *resultSlot) wakeWaiters() {
 	head := slot.waiters.Swap(nil)
 
-	// Each waiter has its own semaphore, so a Semrelease that races the ctx
-	// watcher is harmless (a leaked count on a discarded node) rather than a
-	// fatal double goready. This is the GC-safe counterpart to the worker pool's
-	// park/unpark, without manual goroutine-status manipulation.
 	for node := head; node != nil; node = node.next.Load() {
 		runtime_Semrelease(&node.sema, false, 0)
 	}
 }
 
-func (slot *resultSlot) Wait(ctx context.Context) (*QValue[erasedAny], error) {
+func (slot *resultSlot) Wait(ctx context.Context) (*datura.Artifact, error) {
 	for {
 		switch slot.state.Load() {
 		case slotReady:
@@ -134,7 +132,6 @@ func (slot *resultSlot) parkForWait(ctx context.Context) {
 
 	gp := GetG()
 	node := &waiterNode{gp: gp}
-	stopped := make(chan struct{})
 
 	slot.pushWaiter(node)
 
@@ -144,22 +141,23 @@ func (slot *resultSlot) parkForWait(ctx context.Context) {
 		return
 	}
 
-	if ctxDone := ctx.Done(); ctxDone != nil {
-		go func() {
-			select {
-			case <-ctxDone:
-				runtime_Semrelease(&node.sema, false, 0)
-			case <-stopped:
-			}
-		}()
+	var stopAfterFunc func() bool
+
+	if ctx.Done() != nil {
+		stopAfterFunc = context.AfterFunc(ctx, func() {
+			runtime_Semrelease(&node.sema, false, 0)
+		})
 	}
 
 	runtime_Semacquire(&node.sema)
 	slot.removeWaiter(gp)
-	close(stopped)
+
+	if stopAfterFunc != nil {
+		stopAfterFunc()
+	}
 }
 
-func (slot *resultSlot) Deliver(value *QValue[erasedAny]) {
+func (slot *resultSlot) Deliver(value *datura.Artifact) {
 	slot.value.Store(value)
 
 	if slot.state.CompareAndSwap(slotPending, slotReady) {
@@ -195,11 +193,11 @@ ResultWait is a lock-free, channel-free completion handle for scheduled work.
 */
 type ResultWait[T any] struct {
 	slot      *resultSlot
-	immediate *QValue[T]
+	immediate *datura.Artifact
 }
 
-func readyResultWait[T any](value *QValue[erasedAny]) *ResultWait[T] {
-	return &ResultWait[T]{immediate: qValuePtr[T](value)}
+func readyResultWait[T any](value *datura.Artifact) *ResultWait[T] {
+	return &ResultWait[T]{immediate: value}
 }
 
 func pendingResultWait[T any](slot *resultSlot) *ResultWait[T] {
@@ -212,27 +210,26 @@ func typedResultWait[T any](wait *ResultWait[erasedAny]) *ResultWait[T] {
 	}
 
 	if wait.immediate != nil {
-		return &ResultWait[T]{immediate: qValuePtr[T](wait.immediate)}
+		return &ResultWait[T]{immediate: wait.immediate}
 	}
 
 	return &ResultWait[T]{slot: wait.slot}
 }
 
 func errorResultWait[T any](err error) *ResultWait[T] {
-	value, qvalueErr := NewQValue[erasedAny]("", "", nil, 0)
-	if qvalueErr != nil {
-		value = &QValue[erasedAny]{Error: qvalueErr}
-	} else {
-		value.Error = err
+	artifact, artifactErr := newErrorArtifact("", err, 0)
+
+	if artifactErr != nil {
+		return readyResultWait[T](artifact)
 	}
 
-	return readyResultWait[T](value)
+	return readyResultWait[T](artifact)
 }
 
 /*
 Get blocks until the result is ready or ctx is canceled.
 */
-func (wait *ResultWait[T]) Get(ctx context.Context) (*QValue[T], error) {
+func (wait *ResultWait[T]) Get(ctx context.Context) (*datura.Artifact, error) {
 	if wait == nil {
 		return nil, errResultClosed
 	}
@@ -245,10 +242,5 @@ func (wait *ResultWait[T]) Get(ctx context.Context) (*QValue[T], error) {
 		return nil, errResultClosed
 	}
 
-	value, err := wait.slot.Wait(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	return qValuePtr[T](value), nil
+	return wait.slot.Wait(ctx)
 }

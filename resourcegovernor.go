@@ -40,13 +40,11 @@ Observe refreshes CPU from reading when present and updates the memory ratio fro
 
 When checkInterval is positive, ReadMemStats runs at most once per interval; intervening calls reuse the cached memory fraction while still applying CPU hints from the latest reading.
 */
-func (rg *ResourceGovernorRegulator) Observe(reading *MetricReading) {
-	if reading != nil {
-		rg.lastReading.Store(reading)
+func (rg *ResourceGovernorRegulator) Observe(reading MetricReading) {
+	rg.lastReading.Store(&reading)
 
-		if reading.ResourceUtilization > 0 {
-			rg.currentCPU.Store(math.Float64bits(reading.ResourceUtilization))
-		}
+	if reading.ResourceUtilization > 0 {
+		rg.currentCPU.Store(math.Float64bits(reading.ResourceUtilization))
 	}
 
 	now := time.Now().UnixNano()
@@ -114,7 +112,7 @@ func (rg *ResourceGovernorRegulator) Renormalize() {
 	}
 
 	if rg.checkIntervalNs <= 0 {
-		rg.Observe(read)
+		rg.Observe(*read)
 
 		return
 	}
@@ -130,7 +128,7 @@ func (rg *ResourceGovernorRegulator) Renormalize() {
 		return
 	}
 
-	rg.Observe(read)
+	rg.Observe(*read)
 }
 
 /*

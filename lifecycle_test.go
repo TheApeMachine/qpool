@@ -7,6 +7,7 @@ import (
 	"time"
 
 	. "github.com/smartystreets/goconvey/convey"
+	"github.com/theapemachine/datura"
 )
 
 func TestWorkerRegistryPushPopRemove(test *testing.T) {
@@ -59,24 +60,27 @@ func TestQCloseUnblocksBlockedSchedule(test *testing.T) {
 
 		So(runningStarted.Load(), ShouldBeTrue)
 
-		_ = pool.Schedule("queued", func(jobCtx context.Context) (any, error) {
+		_ = pool.Schedule("queued", func(
+			jobCtx context.Context,
+		) (any, error) {
 			return "queued", nil
 		})
 
 		var scheduleStarted atomic.Bool
-		var blockedResult atomic.Pointer[QValue[any]]
+		var blockedResult atomic.Pointer[datura.Artifact]
 
 		go func() {
 			scheduleStarted.Store(true)
 
-			wait := pool.Schedule("blocked", func(jobCtx context.Context) (any, error) {
+			wait := pool.Schedule("blocked", func(
+				jobCtx context.Context,
+			) (any, error) {
 				return "blocked", nil
 			})
 
 			result, err := wait.Get(context.Background())
 			if err != nil {
-				blockedResult.Store(&QValue[any]{Error: err})
-
+				blockedResult.Store(&datura.Artifact{})
 				return
 			}
 
@@ -119,8 +123,11 @@ func TestQCloseUnblocksBlockedSchedule(test *testing.T) {
 		result := blockedResult.Load()
 
 		So(result, ShouldNotBeNil)
-		So(result.Error, ShouldNotBeNil)
-		So(result.Error.Error(), ShouldNotContainSubstring, "scheduling timeout")
+
+		artifactErr := ArtifactError(result)
+
+		So(artifactErr, ShouldNotBeNil)
+		So(artifactErr.Error(), ShouldNotContainSubstring, "scheduling timeout")
 	})
 }
 

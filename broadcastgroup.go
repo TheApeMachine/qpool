@@ -2,261 +2,27 @@ package qpool
 
 import (
 	"context"
-	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/theapemachine/datura"
 	"github.com/theapemachine/errnie"
 )
 
-const (
-	defaultBroadcastBuffer = 128
-	telemetryGroupID       = "__qpool.telemetry__"
-)
-
-var defaultTelemetryGroup *BroadcastGroup
-
-type subscriberEntry struct {
-	id         string
-	subscriber *Subscriber
-	next       atomic.Pointer[subscriberEntry]
-}
-
-type subscriberEntryList struct {
-	list IntrusiveList[subscriberEntry]
-}
-
-func newSubscriberEntryList() *subscriberEntryList {
-	entries := &subscriberEntryList{}
-	entries.list.bind(
-		func(entry *subscriberEntry) *subscriberEntry {
-			return entry.next.Load()
-		},
-		func(entry, next *subscriberEntry) {
-			entry.next.Store(next)
-		},
-		func(prev, current, next *subscriberEntry) bool {
-			return prev.next.CompareAndSwap(current, next)
-		},
-	)
-
-	return entries
-}
-
-func (entries *subscriberEntryList) Prepend(entry *subscriberEntry) {
-	entries.list.Prepend(entry)
-}
-
-func (entries *subscriberEntryList) Remove(id string) *subscriberEntry {
-	return entries.list.RemoveReturning(func(entry *subscriberEntry) bool {
-		return entry.id == id
-	})
-}
-
-func (entries *subscriberEntryList) IsEmpty() bool {
-	return entries.list.Head() == nil
-}
-
-func (entries *subscriberEntryList) Find(id string) *subscriberEntry {
-	return entries.list.Find(func(entry *subscriberEntry) bool {
-		return entry.id == id
-	})
-}
-
-func (entries *subscriberEntryList) Walk(visitor func(*subscriberEntry)) {
-	entries.list.Walk(visitor)
-}
-
-func (entries *subscriberEntryList) Clear() {
-	entries.list.Clear()
-}
-
-func (entries *subscriberEntryList) count() int {
-	count := 0
-
-	entries.list.Walk(func(*subscriberEntry) {
-		count++
-	})
-
-	return count
-}
-
 /*
-BroadcastConsumer receives values from a broadcast group without channels.
-*/
-type BroadcastConsumer struct {
-	ring     *SpscQValueRing
-	sema     uint32
-	wantWake atomic.Bool
-}
-
-/*
-wake releases the consumer if it is blocked in Wait. It uses the runtime
-semaphore (the same GC-safe primitive sync.Mutex uses) rather than manual
-goroutine-state manipulation. The steady-state fast path is a single
-uncontended atomic load (false when the consumer is keeping up), so it adds no
-measurable cost to Send/Push. The CAS gates exactly one Semrelease per arm, so
-the semaphore count never drifts.
-*/
-func (consumer *BroadcastConsumer) wake() {
-	if !consumer.wantWake.Load() {
-		return
-	}
-
-	if consumer.wantWake.CompareAndSwap(true, false) {
-		runtime_Semrelease(&consumer.sema, false, 0)
-	}
-}
-
-/*
-park blocks the single consumer goroutine until a producer pushes or ctx is
-canceled. It arms wantWake, re-checks the ring to close the lost-wakeup window,
-then blocks on the runtime semaphore; the producer's wake (or the ctx watcher)
-releases it. All of this runs only on the idle path (empty ring), so it costs
-nothing while data is flowing.
-*/
-func (consumer *BroadcastConsumer) park(ctx context.Context) {
-	consumer.wantWake.Store(true)
-
-	// A producer may have pushed (and tried to wake) between Wait's Pop and the
-	// arm above. If we reclaim our own arm, return so Wait's next Pop takes the
-	// value. If a producer already claimed it, a Semrelease is in flight, so
-	// absorb it with exactly one acquire to keep the count balanced.
-	if !consumer.ring.Empty() {
-		if consumer.wantWake.CompareAndSwap(true, false) {
-			return
-		}
-
-		runtime_Semacquire(&consumer.sema)
-
-		return
-	}
-
-	if err := ctx.Err(); err != nil {
-		if consumer.wantWake.CompareAndSwap(true, false) {
-			return
-		}
-
-		runtime_Semacquire(&consumer.sema)
-
-		return
-	}
-
-	stopped := make(chan struct{})
-
-	if done := ctx.Done(); done != nil {
-		go func() {
-			select {
-			case <-done:
-				consumer.wake()
-			case <-stopped:
-			}
-		}()
-	}
-
-	runtime_Semacquire(&consumer.sema)
-
-	close(stopped)
-}
-
-/*
-Poll returns the next queued value when one is available.
-*/
-func (consumer *BroadcastConsumer) Poll() *QValue[erasedAny] {
-	if consumer == nil || consumer.ring == nil {
-		return nil
-	}
-
-	return consumer.ring.Pop()
-}
-
-/*
-Wait blocks until a value is available or ctx is canceled.
-*/
-func (consumer *BroadcastConsumer) Wait(ctx context.Context) (*QValue[erasedAny], error) {
-	if consumer == nil || consumer.ring == nil {
-		return nil, errResultClosed
-	}
-
-	for {
-		if value := consumer.ring.Pop(); value != nil {
-			return value, nil
-		}
-
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-
-		consumer.park(ctx)
-	}
-}
-
-/*
-Subscriber represents a broadcast group subscriber.
-*/
-type Subscriber struct {
-	ID       string
-	consumer *BroadcastConsumer
-}
-
-/*
-Subscription receives telemetry events from a BroadcastGroup.
-*/
-type Subscription struct {
-	group        *BroadcastGroup
-	subscriberID string
-	consumer     *BroadcastConsumer
-	closed       atomic.Bool
-}
-
-/*
-BroadcastGroup routes publisher messages to subscribers without mutexes or channels.
+BroadcastGroup routes publisher messages
+to subscribers without mutexes or channels.
 */
 type BroadcastGroup struct {
 	ctx              context.Context
 	cancel           context.CancelFunc
 	err              error
+	ttl              time.Duration
 	ID               string
 	nextSubscriberID atomic.Uint64
 	dropOldestOnFull bool
-	subscribers      *subscriberEntryList
-}
-
-/*
-NewBroadcaster creates a standalone broadcast group for telemetry-style fan-out.
-*/
-func NewBroadcaster() *BroadcastGroup {
-	return newStandaloneBroadcastGroup(true)
-}
-
-func newStandaloneBroadcastGroup(dropOldestOnFull bool) *BroadcastGroup {
-	ctx, cancel := context.WithCancel(context.Background())
-
-	return &BroadcastGroup{
-		ctx:              ctx,
-		cancel:           cancel,
-		dropOldestOnFull: dropOldestOnFull,
-		subscribers:      newSubscriberEntryList(),
-	}
-}
-
-func initDefaultTelemetryGroup() *BroadcastGroup {
-	ctx, cancel := context.WithCancel(context.Background())
-
-	return &BroadcastGroup{
-		ctx:              ctx,
-		cancel:           cancel,
-		ID:               telemetryGroupID,
-		dropOldestOnFull: true,
-		subscribers:      newSubscriberEntryList(),
-	}
-}
-
-/*
-Subscribe registers a listener on the default qpool telemetry stream.
-*/
-func Subscribe(buffer int) *Subscription {
-	return defaultTelemetryGroup.SubscribeEvents(buffer)
+	consumers        *sync.Map
 }
 
 /*
@@ -264,233 +30,203 @@ NewBroadcastGroup starts a group that owns subscriber registrations.
 */
 func NewBroadcastGroup(
 	ctx context.Context, id string, ttl time.Duration,
-) (*BroadcastGroup, error) {
-	_ = ttl
-
+) *BroadcastGroup {
 	ctx, cancel := context.WithCancel(ctx)
 
 	bg := &BroadcastGroup{
-		ctx:         ctx,
-		cancel:      cancel,
-		ID:          id,
-		subscribers: newSubscriberEntryList(),
+		ctx:              ctx,
+		cancel:           cancel,
+		ttl:              ttl,
+		ID:               id,
+		dropOldestOnFull: false,
+		consumers:        &sync.Map{},
 	}
 
-	return bg, errnie.Require(
+	if err := errnie.Error(errnie.Require(
 		map[string]any{
-			"ctx":    bg.ctx,
-			"cancel": bg.cancel,
-			"id":     bg.ID,
+			"ctx":              bg.ctx,
+			"cancel":           bg.cancel,
+			"ttl":              bg.ttl,
+			"id":               bg.ID,
+			"dropOldestOnFull": bg.dropOldestOnFull,
+			"consumers":        bg.consumers,
 		},
-	)
+	)); err != nil {
+		return nil
+	}
+
+	return bg
 }
 
 /*
-Subscribe registers a subscriber ring sized with bufferSize.
+Acquire registers a consumer ring sized with bufferSize.
 */
-func (bg *BroadcastGroup) Subscribe(
-	subscriberID string, bufferSize int,
+func (bg *BroadcastGroup) Acquire(
+	subscriberID string, callback func(*datura.Artifact) error,
 ) *BroadcastConsumer {
-	if bg == nil {
-		return nil
-	}
-
 	select {
 	case <-bg.ctx.Done():
 		return nil
 	default:
 	}
 
-	if subscriberID == "" {
-		subscriberID = fmt.Sprintf("%d", bg.nextSubscriberID.Add(1))
-	}
+	var (
+		existing any
+		ok       bool
+	)
 
-	if bufferSize < 1 {
-		bufferSize = defaultBroadcastBuffer
-	}
+	if existing, ok = bg.consumers.LoadOrStore(
+		subscriberID,
+		NewBroadcastConsumer(NewSPSCRing[datura.Artifact](
+			128, bg.dropOldestOnFull,
+		), callback),
+	); ok {
+		errnie.Error(errnie.Err(
+			errnie.Conflict,
+			"subscriber already exists",
+			nil,
+		))
 
-	consumer := &BroadcastConsumer{
-		ring: NewSPSCRing[QValue[erasedAny]](bufferSize, bg.dropOldestOnFull),
-	}
-	subscriber := &Subscriber{
-		ID:       subscriberID,
-		consumer: consumer,
-	}
-
-	entry := &subscriberEntry{
-		id:         subscriberID,
-		subscriber: subscriber,
-	}
-
-	bg.subscribers.Prepend(entry)
-
-	return consumer
-}
-
-/*
-SubscribeEvents registers a telemetry listener with an auto-assigned subscriber id.
-*/
-func (bg *BroadcastGroup) SubscribeEvents(buffer int) *Subscription {
-	if bg == nil {
 		return nil
 	}
 
-	subscriberID := fmt.Sprintf("%d", bg.nextSubscriberID.Add(1))
-	consumer := bg.Subscribe(subscriberID, buffer)
-
-	if consumer == nil {
-		return nil
-	}
-
-	return &Subscription{
-		group:        bg,
-		subscriberID: subscriberID,
-		consumer:     consumer,
-	}
+	return existing.(*BroadcastConsumer)
 }
 
 /*
-Publish broadcasts a telemetry event to every subscriber.
+Release releases a consumer ring.
 */
-func (bg *BroadcastGroup) Publish(event Event) {
-	if bg == nil {
-		return
+func (bg *BroadcastGroup) Release(subscriberID string) error {
+	var (
+		existing any
+		ok       bool
+	)
+
+	if existing, ok = bg.consumers.LoadAndDelete(subscriberID); !ok {
+		return errnie.Err(
+			errnie.NotFound,
+			"subscriber not found",
+			nil,
+		)
+	}
+
+	return errnie.Error(existing.(*BroadcastConsumer).ring.Close())
+
+}
+
+/*
+Poll returns the next artifact when one is available.
+*/
+func (bg *BroadcastGroup) Poll(subscriberID string) (*datura.Artifact, bool) {
+	var (
+		existing any
+		ok       bool
+	)
+
+	if existing, ok = bg.consumers.Load(subscriberID); !ok {
+		errnie.Error(errnie.Err(
+			errnie.NotFound,
+			"subscriber not found",
+			nil,
+		))
+
+		return nil, false
+	}
+
+	value := existing.(*BroadcastConsumer).Poll()
+	return value, value != nil
+}
+
+/*
+Send delivers artifact to consumers honoring filters and routing rules.
+*/
+func (bg *BroadcastGroup) Send(artifact *datura.Artifact) error {
+	if artifact == nil {
+		return errnie.Err(
+			errnie.Validation,
+			"artifact is nil",
+			nil,
+		)
 	}
 
 	select {
 	case <-bg.ctx.Done():
-		return
+		return errnie.Err(
+			errnie.IO,
+			"broadcast group context is done",
+			nil,
+		)
 	default:
 	}
 
-	bg.subscribers.Walk(func(entry *subscriberEntry) {
-		if entry.subscriber == nil || entry.subscriber.consumer == nil {
-			return
+	var (
+		destination string
+		err         error
+		existing    any
+		ok          bool
+	)
+
+	if destination, err = artifact.Destination(); err != nil || destination == "" {
+		if existing, ok = bg.consumers.Load(destination); !ok {
+			return errnie.Err(
+				errnie.NotFound,
+				"subscriber not found",
+				nil,
+			)
 		}
 
-		cloned := event.clone()
-		value := &QValue[erasedAny]{Value: cloned}
+		consumer := existing.(*BroadcastConsumer)
 
-		entry.subscriber.consumer.ring.Push(value)
-		entry.subscriber.consumer.wake()
+		if consumer.callback == nil {
+			consumer.ring.Push(artifact)
+			consumer.wake()
+			return nil
+		}
+
+		consumer.callback(artifact)
+		return nil
+	}
+
+	bg.consumers.Range(func(key, value any) bool {
+		consumer := value.(*BroadcastConsumer)
+
+		if consumer.callback == nil {
+			consumer.ring.Push(artifact)
+			consumer.wake()
+			return true
+		}
+
+		if err := consumer.callback(artifact); err != nil {
+			errnie.Error(err)
+			return true
+		}
+
+		return true
 	})
-}
 
-/*
-Poll returns the next telemetry event when one is available.
-*/
-func (subscription *Subscription) Poll() (Event, bool) {
-	if subscription == nil || subscription.consumer == nil {
-		return Event{}, false
-	}
-
-	value := subscription.consumer.Poll()
-
-	if value == nil {
-		return Event{}, false
-	}
-
-	event, ok := value.Value.(Event)
-
-	return event, ok
-}
-
-/*
-Close unregisters the subscription and releases its ring.
-*/
-func (subscription *Subscription) Close() {
-	if subscription == nil || subscription.closed.Swap(true) {
-		return
-	}
-
-	subscription.group.Unsubscribe(subscription.subscriberID)
-
-	if subscription.consumer != nil && subscription.consumer.ring != nil {
-		subscription.consumer.ring.Close()
-	}
-}
-
-/*
-Unsubscribe removes a subscriber.
-*/
-func (bg *BroadcastGroup) Unsubscribe(subscriberID string) {
-	if bg == nil {
-		return
-	}
-
-	select {
-	case <-bg.ctx.Done():
-		return
-	default:
-	}
-
-	entry := bg.subscribers.Remove(subscriberID)
-
-	if entry != nil && entry.subscriber != nil && entry.subscriber.consumer != nil {
-		entry.subscriber.consumer.ring.Close()
-	}
-}
-
-/*
-Send delivers qv to subscribers honoring filters and routing rules.
-*/
-func (bg *BroadcastGroup) Send(qv *QValue[erasedAny]) {
-	if bg == nil || qv == nil {
-		return
-	}
-
-	select {
-	case <-bg.ctx.Done():
-		return
-	default:
-	}
-
-	if qv.ReceiverID != "" {
-		entry := bg.subscribers.Find(qv.ReceiverID)
-
-		if entry != nil && entry.subscriber != nil && entry.subscriber.consumer != nil {
-			entry.subscriber.consumer.ring.Push(qv)
-			entry.subscriber.consumer.wake()
-		}
-
-		return
-	}
-
-	bg.subscribers.Walk(func(entry *subscriberEntry) {
-		if entry.subscriber == nil || entry.subscriber.consumer == nil {
-			return
-		}
-
-		if entry.id == qv.SenderID {
-			return
-		}
-
-		entry.subscriber.consumer.ring.Push(qv)
-		entry.subscriber.consumer.wake()
-	})
+	return nil
 }
 
 /*
 Close stops the group and releases subscriber rings.
 */
-func (bg *BroadcastGroup) Close() {
-	if bg == nil {
-		return
-	}
-
+func (bg *BroadcastGroup) Close() error {
 	select {
 	case <-bg.ctx.Done():
-		return
+		return errnie.Err(
+			errnie.IO,
+			"broadcast group context is done",
+			nil,
+		)
 	default:
 	}
 
 	bg.cancel()
 
-	bg.subscribers.Walk(func(entry *subscriberEntry) {
-		if entry.subscriber != nil && entry.subscriber.consumer != nil {
-			entry.subscriber.consumer.ring.Close()
-		}
+	bg.consumers.Range(func(key, value any) bool {
+		value.(*BroadcastConsumer).ring.Close()
+		return true
 	})
 
-	bg.subscribers.Clear()
+	return nil
 }

@@ -1,16 +1,19 @@
 package qpool
 
 import (
-	"runtime"
 	"sync/atomic"
 )
 
 type WaitGroup struct {
 	count atomic.Int64
+	sema  uint32
 }
 
 func (wg *WaitGroup) Add(delta int64) {
-	wg.count.Add(delta)
+	next := wg.count.Add(delta)
+	if next == 0 {
+		runtime_Semrelease(&wg.sema, false, 0)
+	}
 }
 
 func (wg *WaitGroup) Done() {
@@ -19,6 +22,6 @@ func (wg *WaitGroup) Done() {
 
 func (wg *WaitGroup) Wait() {
 	for wg.count.Load() > 0 {
-		runtime.Gosched()
+		runtime_Semacquire(&wg.sema)
 	}
 }

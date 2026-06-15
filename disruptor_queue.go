@@ -72,6 +72,7 @@ func newJobDisruptorQueue(
 	instance, err := disruptor.New(
 		disruptor.Options.BufferCapacity(uint32(queue.ring.Capacity())),
 		disruptor.Options.WriterCount(2),
+		disruptor.Options.WaitStrategy(&DisruptorIdleWaitStrategy{}),
 		disruptor.Options.NewHandlerGroup(handlers...),
 	)
 

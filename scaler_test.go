@@ -65,7 +65,7 @@ func TestScalerObserveScalesUpUnderLoad(test *testing.T) {
 
 				So(err, ShouldBeNil)
 				So(result, ShouldNotBeNil)
-				So(result.Error, ShouldBeNil)
+				So(ArtifactError(result), ShouldBeNil)
 			}
 		})
 	})
@@ -102,8 +102,8 @@ func TestScheduleWithScalerDoesNotReturnPoolSaturated(test *testing.T) {
 				So(err, ShouldBeNil)
 				So(result, ShouldNotBeNil)
 
-				if result.Error != nil {
-					So(result.Error.Error(), ShouldNotContainSubstring, "pool saturated")
+				if artifactErr := ArtifactError(result); artifactErr != nil {
+					So(artifactErr.Error(), ShouldNotContainSubstring, "pool saturated")
 				}
 			}
 		})

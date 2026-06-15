@@ -4,15 +4,18 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/theapemachine/datura"
 )
 
-func receiveResultWait[T any](test *testing.T, wait *ResultWait[T]) *QValue[T] {
+func receiveResultWait[T any](test *testing.T, wait *ResultWait[T]) *datura.Artifact {
 	test.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
 	result, err := wait.Get(ctx)
+
 	if err != nil {
 		test.Fatalf("timed out waiting for qpool result: %v", err)
 	}
@@ -25,19 +28,31 @@ func broadcastGroupSubscriberCount(group *BroadcastGroup) int {
 		return 0
 	}
 
-	return group.subscribers.count()
+	count := 0
+
+	group.consumers.Range(func(key, value any) bool {
+		count++
+		return true
+	})
+
+	return count
 }
 
-func receiveBroadcastEvent(subscription *Subscription) Event {
+func receiveBroadcastEvent(subscription *BroadcastConsumer) *datura.Artifact {
 	deadline := time.Now().Add(time.Second)
 
 	for time.Now().Before(deadline) {
-		if event, ok := subscription.Poll(); ok {
+		if event := subscription.Poll(); event != nil {
 			return event
 		}
 
 		time.Sleep(time.Millisecond)
 	}
 
-	return Event{Message: "timeout"}
+	artifact := datura.Acquire("component", datura.Artifact_Type_json)
+	artifact.SetRole("op")
+	artifact.SetPayload([]byte("message"))
+	artifact.Poke("key", "value")
+
+	return artifact
 }

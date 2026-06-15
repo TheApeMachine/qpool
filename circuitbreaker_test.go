@@ -112,7 +112,7 @@ func TestCircuitBreakerRegulatorInterface(t *testing.T) {
 		})
 
 		Convey("It should not limit when observed with empty metrics", func() {
-			breaker.Observe(&MetricReading{})
+			breaker.Observe(MetricReading{})
 			So(breaker.Limit(), ShouldBeFalse)
 		})
 	})

@@ -66,7 +66,7 @@ func newCircuitBreakerFromConfig(cfg *CircuitBreakerConfig) *CircuitBreaker {
 /*
 Observe implements Regulator (circuit breaker does not currently consume readings).
 */
-func (cb *CircuitBreaker) Observe(reading *MetricReading) {
+func (cb *CircuitBreaker) Observe(reading MetricReading) {
 	_ = reading
 }
 
@@ -163,13 +163,6 @@ func (cb *CircuitBreaker) tryOpenToHalfOpen(now time.Time) bool {
 	if cb.state.CompareAndSwap(cbOpen, cbHalfOpen) {
 		cb.halfOpenSuccess.Store(0)
 		cb.halfOpenInflight.Store(0)
-		Publish(NewWarningEvent(
-			"qpool",
-			"circuit-half-open",
-			"circuit breaker half-open after reset timeout",
-			nil,
-		))
-
 		return true
 	}
 
@@ -207,12 +200,6 @@ func (cb *CircuitBreaker) transitionToOpen() {
 	}
 	cb.halfOpenSuccess.Store(0)
 	cb.halfOpenInflight.Store(0)
-	Publish(NewWarningEvent(
-		"qpool",
-		"circuit-open",
-		"circuit breaker open",
-		nil,
-	))
 }
 
 func (cb *CircuitBreaker) safeDecHalfOpenInflight() {

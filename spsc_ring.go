@@ -2,6 +2,9 @@ package qpool
 
 import (
 	"sync/atomic"
+
+	"github.com/theapemachine/datura"
+	"github.com/theapemachine/errnie"
 )
 
 /*
@@ -17,35 +20,21 @@ type SPSCRing[T any] struct {
 }
 
 /*
-SpscQValueRing carries broadcast payloads for a single subscriber.
+SpscArtifactRing carries broadcast payloads for a single subscriber.
 */
-type SpscQValueRing = SPSCRing[QValue[erasedAny]]
+type SpscArtifactRing = SPSCRing[datura.Artifact]
 
 /*
 NewSPSCRing allocates a single-producer single-consumer queue.
 */
 func NewSPSCRing[T any](capacity int, dropOldestOnFull bool) *SPSCRing[T] {
-	capacity = normalizeSPSCCapacity(capacity, dropOldestOnFull)
-
 	return &SPSCRing[T]{
+		head:             atomic.Uint64{},
+		tail:             atomic.Uint64{},
 		slots:            make([]atomic.Pointer[T], capacity),
 		mask:             uint64(capacity - 1),
 		dropOldestOnFull: dropOldestOnFull,
 	}
-}
-
-func normalizeSPSCCapacity(capacity int, dropOldestOnFull bool) int {
-	if capacity < 1 {
-		capacity = 1
-	}
-
-	if !dropOldestOnFull && capacity < 2 {
-		capacity = 2
-	}
-
-	normalizer := RingBuffer[int]{}
-
-	return normalizer.next(capacity)
 }
 
 func (ring *SPSCRing[T]) Push(value *T) bool {
@@ -112,18 +101,21 @@ func (ring *SPSCRing[T]) Pop() *T {
 // Empty reports whether the ring currently holds no values. Read-only hint used
 // by the broadcast consumer's idle park path; Push and Pop are untouched.
 func (ring *SPSCRing[T]) Empty() bool {
-	if ring == nil {
-		return true
-	}
-
-	return ring.tail.Load() >= ring.head.Load()
+	return ring == nil || ring.tail.Load() >= ring.head.Load()
 }
 
-func (ring *SPSCRing[T]) Close() {
+func (ring *SPSCRing[T]) Close() error {
 	if ring == nil {
-		return
+		return errnie.Err(
+			errnie.Conflict,
+			"ring is nil",
+			nil,
+		)
 	}
 
-	for ring.Pop() != nil {
+	for value := ring.Pop(); value != nil; value = ring.Pop() {
+		value = nil
 	}
+
+	return nil
 }

@@ -33,12 +33,8 @@ func NewBackPressureRegulator(
 /*
 Observe recomputes pressure from the supplied reading.
 */
-func (bp *BackPressureRegulator) Observe(reading *MetricReading) {
-	if reading == nil {
-		return
-	}
-
-	bp.lastReading.Store(reading)
+func (bp *BackPressureRegulator) Observe(reading MetricReading) {
+	bp.lastReading.Store(&reading)
 
 	queuePressure := 0.0
 	if bp.maxQueueSize > 0 {

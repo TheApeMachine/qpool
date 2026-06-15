@@ -26,11 +26,11 @@ type MetricReading struct {
 /*
 Regulator defines optional admission control and tuning hooks for Q.
 
-Implementations must not retain the MetricReading pointer across goroutines without
-copying fields; the pool passes a freshly allocated reading per Schedule tick when needed.
+Implementations must not retain the MetricReading value across goroutines without
+copying fields; the pool passes a fresh reading per Schedule tick when needed.
 */
 type Regulator interface {
-	Observe(reading *MetricReading)
+	Observe(reading MetricReading)
 	Limit() bool
 	Renormalize()
 }

@@ -1,11 +1,13 @@
 package qpool
 
 import (
+	"context"
 	"math"
+	"strconv"
 	"sync/atomic"
 	"time"
 
-	"github.com/phuslu/log"
+	"github.com/theapemachine/datura"
 )
 
 /*
@@ -13,6 +15,8 @@ Scaler periodically evaluates queue depth and scales worker count on load.
 It does not reject Schedule; back-pressure is the disruptor queue and optional Regulators.
 */
 type Scaler struct {
+	ctx                context.Context
+	cancel             context.CancelFunc
 	pool               *Q[any]
 	minWorkers         int
 	maxWorkers         int
@@ -33,44 +37,29 @@ type ScalerConfig struct {
 	ScaleUpThreshold   float64
 	ScaleDownThreshold float64
 	Cooldown           time.Duration
-	/*
-		Interval is the ticker period for CollectReading and evaluate.
-
-		Zero defaults to one second inside NewScaler.
-	*/
+	// Interval is the ticker period for CollectReading and
+	// evaluate. Zero defaults to one second inside NewScaler.
 	Interval time.Duration
 }
 
 func (config *ScalerConfig) jobQueueCapacity(maxWorkers int) int {
-	if maxWorkers < 1 {
-		maxWorkers = 1
-	}
-
 	if config == nil {
-		return maxWorkers
+		return int(math.Max(1, float64(maxWorkers)))
 	}
 
-	threshold := config.ScaleUpThreshold
-
-	if threshold <= 0 {
-		threshold = 1
-	}
-
+	threshold := math.Max(1, config.ScaleUpThreshold)
 	return int(math.Ceil(float64(maxWorkers) * threshold))
 }
 
 /*
 Observe refreshes metrics and may scale the worker count up immediately.
 */
-func (scaler *Scaler) Observe(reading *MetricReading) {
+func (scaler *Scaler) Observe(reading MetricReading) {
 	if scaler == nil {
 		return
 	}
 
-	if reading != nil {
-		scaler.reading.Store(reading)
-	}
-
+	scaler.reading.Store(&reading)
 	scaler.evaluate()
 }
 
@@ -104,21 +93,13 @@ func (scaler *Scaler) evaluate() {
 	read := scaler.reading.Load()
 
 	if read == nil {
-		read = scaler.pool.metrics.CollectReading()
-		scaler.reading.Store(read)
+		reading := scaler.pool.metrics.CollectReading()
+		scaler.reading.Store(&reading)
+		read = &reading
 	}
 
-	workers := read.WorkerCount
-
-	if workers <= 0 {
-		workers = 1
-	}
-
-	targetLoad := scaler.targetLoad
-
-	if targetLoad <= 0 {
-		targetLoad = 1
-	}
+	workers := max(1, read.WorkerCount)
+	targetLoad := max(1, scaler.targetLoad)
 
 	currentLoad := float64(read.JobQueueSize) / float64(workers)
 
@@ -140,7 +121,9 @@ func (scaler *Scaler) evaluate() {
 	}
 
 	if currentLoad < scaler.scaleDownThreshold && read.WorkerCount > scaler.minWorkers {
-		needed := max(int(math.Ceil(float64(read.JobQueueSize)/targetLoad)), scaler.minWorkers)
+		needed := max(int(math.Ceil(
+			float64(read.JobQueueSize)/targetLoad,
+		)), scaler.minWorkers)
 
 		toRemove := min(
 			read.WorkerCount-scaler.minWorkers,
@@ -155,90 +138,56 @@ func (scaler *Scaler) evaluate() {
 }
 
 func (scaler *Scaler) scaleUp(count int) {
-	if count <= 0 {
-		return
-	}
-
-	currentWorkers := int(scaler.pool.metrics.workerCount.Load())
-	toAdd := min(scaler.maxWorkers-currentWorkers, count)
-
-	for range toAdd {
+	for range min(scaler.maxWorkers-int(
+		scaler.pool.metrics.workerCount.Load(),
+	), count) {
 		scaler.pool.startWorker()
 	}
 }
 
 func (scaler *Scaler) noteScaleUp(delta int) {
 	now := time.Now()
-
 	scaler.pool.metrics.NoteLastScale(now)
 
-	scaler.pool.publishTelemetry(Event{
-		Component: "qpool",
-		Op:        "scale-up",
-		Message:   "scaled worker pool up",
-		Time:      now,
-		Level:     log.DebugLevel,
-		Fields: []Field{
-			{Key: "delta", Value: delta},
-			{Key: "workers", Value: scaler.pool.metrics.workerCount.Load()},
-		},
-	})
+	artifact := datura.Acquire("qpool", datura.Artifact_Type_json)
+	artifact.SetRole("op")
+	artifact.SetPayload([]byte("scaled worker pool up"))
+	artifact.SetTimestamp(now.UnixNano())
+	artifact.SetScope("debug")
+	artifact.Poke("delta", strconv.Itoa(delta))
+	artifact.Poke("workers", strconv.FormatInt(scaler.pool.metrics.workerCount.Load(), 10))
+	scaler.pool.publishTelemetry(artifact)
 }
 
 func (scaler *Scaler) noteScaleDown(delta int) {
 	now := time.Now()
-
 	scaler.lastScaleDownNano.Store(now.UnixNano())
 	scaler.pool.metrics.NoteLastScale(now)
 
-	scaler.pool.publishTelemetry(Event{
-		Component: "qpool",
-		Op:        "scale-down",
-		Message:   "scaled worker pool down",
-		Time:      now,
-		Level:     log.DebugLevel,
-		Fields: []Field{
-			{Key: "delta", Value: delta},
-			{Key: "workers", Value: scaler.pool.metrics.workerCount.Load()},
-		},
-	})
-}
-
-func (scaler *Scaler) run() {
-	interval := scaler.evalInterval
-
-	if interval <= 0 {
-		interval = time.Second
-	}
-
-	for {
-		if scaler.pool.ctx.Err() != nil {
-			return
-		}
-
-		time.Sleep(interval)
-
-		read := scaler.pool.metrics.CollectReading()
-
-		if scaler.pool.config != nil {
-			for _, regulator := range scaler.pool.config.Regulators {
-				regulator.Renormalize()
-			}
-		}
-
-		scaler.Observe(read)
-	}
+	artifact := datura.Acquire("qpool", datura.Artifact_Type_json)
+	artifact.SetRole("op")
+	artifact.SetPayload([]byte("scaled worker pool down"))
+	artifact.SetTimestamp(now.UnixNano())
+	artifact.SetScope("debug")
+	artifact.Poke("delta", strconv.Itoa(delta))
+	artifact.Poke("workers", strconv.FormatInt(scaler.pool.metrics.workerCount.Load(), 10))
+	scaler.pool.publishTelemetry(artifact)
 }
 
 /*
 NewScaler starts the scaler loop when cfg is non-nil.
 */
-func NewScaler(pool *Q[any], minWorkers, maxWorkers int, config *ScalerConfig) *Scaler {
-	if config == nil {
-		return nil
-	}
+func NewScaler(
+	ctx context.Context,
+	pool *Q[any],
+	minWorkers, maxWorkers int,
+	config *ScalerConfig,
+) *Scaler {
+	ctx, cancel := context.WithCancel(ctx)
 
 	scaler := &Scaler{
+		ctx:                ctx,
+		cancel:             cancel,
 		pool:               pool,
 		minWorkers:         minWorkers,
 		maxWorkers:         maxWorkers,
@@ -250,13 +199,26 @@ func NewScaler(pool *Q[any], minWorkers, maxWorkers int, config *ScalerConfig) *
 	}
 
 	scaler.lastScaleDownNano.Store(time.Now().UnixNano())
-
 	pool.scalerWG.Add(1)
 
 	go func() {
-		defer pool.scalerWG.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
 
-		scaler.run()
+			time.Sleep(max(time.Second, scaler.evalInterval))
+
+			if scaler.pool.config != nil {
+				for _, regulator := range scaler.pool.config.Regulators {
+					regulator.Renormalize()
+				}
+			}
+
+			scaler.Observe(scaler.pool.metrics.CollectReading())
+		}
 	}()
 
 	return scaler

@@ -36,10 +36,8 @@ func NewLoadBalancer(workerCount, workerCapacity int) *LoadBalancer {
 /*
 Observe refreshes the reading used by Limit.
 */
-func (lb *LoadBalancer) Observe(reading *MetricReading) {
-	if reading != nil {
-		lb.lastReading.Store(reading)
-	}
+func (lb *LoadBalancer) Observe(reading MetricReading) {
+	lb.lastReading.Store(&reading)
 }
 
 /*

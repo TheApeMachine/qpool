@@ -3,6 +3,8 @@ package qpool
 import (
 	"context"
 	"testing"
+
+	"github.com/theapemachine/datura"
 )
 
 func BenchmarkQ_Schedule_simpleJob(b *testing.B) {
@@ -10,7 +12,7 @@ func BenchmarkQ_Schedule_simpleJob(b *testing.B) {
 
 	cfg := NewConfig()
 	cfg.Scaler = nil
-	cfg.TelemetryPublish = func(Event) {}
+	cfg.TelemetryPublish = func(*datura.Artifact) error { return nil }
 
 	q := NewQ[any](ctx, 4, 8, cfg)
 
@@ -31,11 +33,11 @@ func BenchmarkQ_Schedule_simpleJob(b *testing.B) {
 		}
 
 		if qv == nil {
-			b.Fatal("unexpected nil QValue")
+			b.Fatal("unexpected nil artifact")
 		}
 
-		if qv.Error != nil {
-			b.Fatalf("unexpected schedule error: %v", qv.Error)
+		if artifactErr := ArtifactError(qv); artifactErr != nil {
+			b.Fatalf("unexpected schedule error: %v", artifactErr)
 		}
 	}
 }
@@ -45,7 +47,7 @@ func BenchmarkQ_Schedule_parallel(b *testing.B) {
 
 	cfg := NewConfig()
 	cfg.Scaler = nil
-	cfg.TelemetryPublish = func(Event) {}
+	cfg.TelemetryPublish = func(*datura.Artifact) error { return nil }
 
 	q := NewQ[any](ctx, 4, 8, cfg)
 
@@ -67,11 +69,11 @@ func BenchmarkQ_Schedule_parallel(b *testing.B) {
 			}
 
 			if qv == nil {
-				b.Fatal("unexpected nil QValue")
+				b.Fatal("unexpected nil artifact")
 			}
 
-			if qv.Error != nil {
-				b.Fatalf("unexpected schedule error: %v", qv.Error)
+			if artifactErr := ArtifactError(qv); artifactErr != nil {
+				b.Fatalf("unexpected schedule error: %v", artifactErr)
 			}
 		}
 	})

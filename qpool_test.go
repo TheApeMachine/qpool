@@ -8,6 +8,7 @@ import (
 	"time"
 
 	. "github.com/smartystreets/goconvey/convey"
+	"github.com/theapemachine/datura"
 )
 
 func TestQPoolScheduleSimple(t *testing.T) {
@@ -36,8 +37,12 @@ func TestQPoolScheduleSimple(t *testing.T) {
 
 			So(err, ShouldBeNil)
 			So(result, ShouldNotBeNil)
-			So(result.Error, ShouldBeNil)
-			So(result.Value, ShouldEqual, "success")
+			So(ArtifactError(result), ShouldBeNil)
+
+			value, valueErr := ArtifactValue[string](result)
+
+			So(valueErr, ShouldBeNil)
+			So(value, ShouldEqual, "success")
 		})
 	})
 }
@@ -45,13 +50,15 @@ func TestQPoolScheduleSimple(t *testing.T) {
 func TestQPoolTelemetryPublish(t *testing.T) {
 	Convey("Given a Q pool with telemetry publisher", t, func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		events := make(chan Event, 8)
+		events := make(chan *datura.Artifact, 8)
 
 		q := NewQ[any](ctx, 1, 1, &Config{
 			SchedulingTimeout: time.Second,
 			Scaler:            nil,
-			TelemetryPublish: func(event Event) {
-				events <- event
+			TelemetryPublish: func(artifact *datura.Artifact) error {
+				events <- artifact
+
+				return nil
 			},
 		})
 
@@ -72,7 +79,7 @@ func TestQPoolTelemetryPublish(t *testing.T) {
 
 			So(err, ShouldBeNil)
 			So(result, ShouldNotBeNil)
-			So(result.Error, ShouldBeNil)
+			So(ArtifactError(result), ShouldBeNil)
 
 			observed := false
 
@@ -81,7 +88,12 @@ func TestQPoolTelemetryPublish(t *testing.T) {
 			for !observed && time.Now().Before(deadline) {
 				select {
 				case event := <-events:
-					observed = event.Component == "qpool"
+					origin, originErr := event.Origin()
+
+					So(originErr, ShouldBeNil)
+					So(origin, ShouldEqual, "qpool")
+
+					observed = true
 				default:
 					time.Sleep(time.Millisecond)
 				}
@@ -137,7 +149,7 @@ func TestSchedule_circuitBreakerOpenRejectsFurtherSchedules(t *testing.T) {
 
 					So(err, ShouldBeNil)
 					So(result, ShouldNotBeNil)
-					So(result.Error, ShouldNotBeNil)
+					So(ArtifactError(result), ShouldNotBeNil)
 				}
 
 				blockedWait := q.Schedule(fmt.Sprintf("%s-blocked", circuitID), func(jobCtx context.Context) (any, error) {
@@ -148,10 +160,10 @@ func TestSchedule_circuitBreakerOpenRejectsFurtherSchedules(t *testing.T) {
 
 				So(err, ShouldBeNil)
 				So(result, ShouldNotBeNil)
-				So(result.Error, ShouldNotBeNil)
-				So(result.Error.Error(), ShouldContainSubstring, "circuit breaker")
-				So(result.Error.Error(), ShouldContainSubstring, circuitID)
-				So(result.Error.Error(), ShouldContainSubstring, "open")
+				So(ArtifactError(result), ShouldNotBeNil)
+				So(ArtifactError(result).Error(), ShouldContainSubstring, "circuit breaker")
+				So(ArtifactError(result).Error(), ShouldContainSubstring, circuitID)
+				So(ArtifactError(result).Error(), ShouldContainSubstring, "open")
 			})
 		}
 	})

@@ -4,11 +4,22 @@ import (
 	"testing"
 
 	. "github.com/smartystreets/goconvey/convey"
+	"github.com/theapemachine/datura"
 )
+
+func testArtifact(payload string) *datura.Artifact {
+	artifact, err := newResultArtifact("test", payload, 0)
+
+	if err != nil {
+		panic(err)
+	}
+
+	return artifact
+}
 
 func TestSPSCRing_NewSPSCRing(test *testing.T) {
 	Convey("Given NewSPSCRing", test, func() {
-		ring := NewSPSCRing[QValue[erasedAny]](1, true)
+		ring := NewSPSCRing[datura.Artifact](1, true)
 
 		Convey("It should create a single-slot ring when dropping oldest", func() {
 			So(ring, ShouldNotBeNil)
@@ -17,23 +28,11 @@ func TestSPSCRing_NewSPSCRing(test *testing.T) {
 	})
 }
 
-func TestSPSCRing_normalizeCapacity(test *testing.T) {
-	Convey("Given SPSCRing normalizeCapacity", test, func() {
-		Convey("It should allow single-slot rings when dropping oldest", func() {
-			So(normalizeSPSCCapacity(1, true), ShouldEqual, 1)
-		})
-
-		Convey("It should enforce at least two slots when rejecting on full", func() {
-			So(normalizeSPSCCapacity(1, false), ShouldEqual, 2)
-		})
-	})
-}
-
 func TestSPSCRing_Push(test *testing.T) {
 	Convey("Given SPSCRing Push", test, func() {
-		ring := NewSPSCRing[QValue[erasedAny]](1, true)
-		first := &QValue[erasedAny]{Value: "first"}
-		second := &QValue[erasedAny]{Value: "second"}
+		ring := NewSPSCRing[datura.Artifact](1, true)
+		first := testArtifact("first")
+		second := testArtifact("second")
 
 		Convey("It should drop the oldest value when the ring is full", func() {
 			So(ring.Push(first), ShouldBeTrue)
@@ -48,8 +47,8 @@ func TestSPSCRing_Push(test *testing.T) {
 
 func TestSPSCRing_Pop(test *testing.T) {
 	Convey("Given SPSCRing Pop", test, func() {
-		ring := NewSPSCRing[QValue[erasedAny]](4, false)
-		value := &QValue[erasedAny]{Value: "payload"}
+		ring := NewSPSCRing[datura.Artifact](4, false)
+		value := testArtifact("payload")
 
 		Convey("It should return nil when the ring is empty", func() {
 			So(ring.Pop(), ShouldBeNil)
@@ -63,8 +62,8 @@ func TestSPSCRing_Pop(test *testing.T) {
 		})
 
 		Convey("It should return values in FIFO order", func() {
-			first := &QValue[erasedAny]{Value: "first"}
-			second := &QValue[erasedAny]{Value: "second"}
+			first := testArtifact("first")
+			second := testArtifact("second")
 
 			So(ring.Push(first), ShouldBeTrue)
 			So(ring.Push(second), ShouldBeTrue)
@@ -78,11 +77,11 @@ func TestSPSCRing_Pop(test *testing.T) {
 
 func TestSPSCRing_Close(test *testing.T) {
 	Convey("Given SPSCRing Close", test, func() {
-		ring := NewSPSCRing[QValue[erasedAny]](4, false)
+		ring := NewSPSCRing[datura.Artifact](4, false)
 
 		Convey("It should drain all queued values", func() {
-			_ = ring.Push(&QValue[erasedAny]{Value: "one"})
-			_ = ring.Push(&QValue[erasedAny]{Value: "two"})
+			_ = ring.Push(testArtifact("one"))
+			_ = ring.Push(testArtifact("two"))
 
 			ring.Close()
 
@@ -92,8 +91,8 @@ func TestSPSCRing_Close(test *testing.T) {
 }
 
 func BenchmarkSPSCRing_PushPop(benchmark *testing.B) {
-	ring := NewSPSCRing[QValue[erasedAny]](64, false)
-	value := &QValue[erasedAny]{Value: "payload"}
+	ring := NewSPSCRing[datura.Artifact](64, false)
+	value := testArtifact("payload")
 
 	for benchmark.Loop() {
 		_ = ring.Push(value)

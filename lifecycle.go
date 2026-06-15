@@ -2,10 +2,11 @@ package qpool
 
 import (
 	"fmt"
+	"strconv"
 	"sync/atomic"
 	"time"
 
-	"github.com/phuslu/log"
+	"github.com/theapemachine/datura"
 )
 
 type workerToken struct {
@@ -82,16 +83,13 @@ func (pool *Q[T]) startWorker() {
 	pool.registry.push(token)
 	pool.jobQueue.setActiveWorkers(pool.metrics.workerCount.Load())
 
-	pool.publishTelemetry(Event{
-		Component: "qpool",
-		Op:        "worker-start",
-		Message:   fmt.Sprintf("worker started; workers=%d", pool.metrics.workerCount.Load()),
-		Time:      time.Now(),
-		Level:     log.DebugLevel,
-		Fields: []Field{
-			{Key: "workers", Value: pool.metrics.workerCount.Load()},
-		},
-	})
+	artifact := datura.Acquire("qpool", datura.Artifact_Type_json)
+	artifact.SetRole("op")
+	artifact.SetPayload([]byte(fmt.Sprintf("worker started; workers=%d", pool.metrics.workerCount.Load())))
+	artifact.SetTimestamp(time.Now().UnixNano())
+	artifact.SetScope("debug")
+	artifact.Poke("workers", strconv.FormatInt(pool.metrics.workerCount.Load(), 10))
+	pool.publishTelemetry(artifact)
 }
 
 func (pool *Q[T]) scaleDownWorkers(count int) {
@@ -106,16 +104,13 @@ func (pool *Q[T]) scaleDownWorkers(count int) {
 		pool.metrics.decWorkerCount()
 		pool.jobQueue.setActiveWorkers(pool.metrics.workerCount.Load())
 
-		pool.publishTelemetry(Event{
-			Component: "qpool",
-			Op:        "worker-exit",
-			Message:   "worker deactivated",
-			Time:      time.Now(),
-			Level:     log.DebugLevel,
-			Fields: []Field{
-				{Key: "worker", Value: token.id},
-			},
-		})
+		artifact := datura.Acquire("qpool", datura.Artifact_Type_json)
+		artifact.SetRole("op")
+		artifact.SetPayload([]byte("worker deactivated"))
+		artifact.SetTimestamp(time.Now().UnixNano())
+		artifact.SetScope("debug")
+		artifact.Poke("worker", strconv.FormatUint(token.id, 10))
+		pool.publishTelemetry(artifact)
 	}
 }
 
@@ -124,13 +119,12 @@ func (pool *Q[T]) closePool() {
 		return
 	}
 
-	pool.publishTelemetry(Event{
-		Component: "qpool",
-		Op:        "close",
-		Message:   "closing Q pool",
-		Time:      time.Now(),
-		Level:     log.DebugLevel,
-	})
+	artifact := datura.Acquire("qpool", datura.Artifact_Type_json)
+	artifact.SetRole("op")
+	artifact.SetPayload([]byte("closing Q pool"))
+	artifact.SetTimestamp(time.Now().UnixNano())
+	artifact.SetScope("debug")
+	pool.publishTelemetry(artifact)
 
 	pool.stopping.Store(true)
 
@@ -146,13 +140,13 @@ func (pool *Q[T]) closePool() {
 	pool.deps.Wait()
 	pool.scalerWG.Wait()
 	pool.space.Close()
-	pool.publishTelemetry(Event{
-		Component: "qpool",
-		Op:        "closed",
-		Message:   "Q pool closed",
-		Time:      time.Now(),
-		Level:     log.DebugLevel,
-	})
+
+	artifact = datura.Acquire("qpool", datura.Artifact_Type_json)
+	artifact.SetRole("op")
+	artifact.SetPayload([]byte("Q pool closed"))
+	artifact.SetTimestamp(time.Now().UnixNano())
+	artifact.SetScope("debug")
+	pool.publishTelemetry(artifact)
 }
 
 func (pool *Q[T]) deactivateWorkers() {

@@ -42,8 +42,12 @@ func TestQScheduleJobLifecycle(t *testing.T) {
 
 		So(err, ShouldBeNil)
 		So(res, ShouldNotBeNil)
-		So(res.Error, ShouldBeNil)
-		So(res.Value, ShouldEqual, "ok")
+		So(ArtifactError(res), ShouldBeNil)
+
+		value, valueErr := ArtifactValue[string](res)
+
+		So(valueErr, ShouldBeNil)
+		So(value, ShouldEqual, "ok")
 	})
 }
 
@@ -69,8 +73,11 @@ func TestQScheduleRegulatorRejects(t *testing.T) {
 
 		So(err, ShouldBeNil)
 		So(res, ShouldNotBeNil)
-		So(res.Error, ShouldNotBeNil)
-		So(res.Error.Error(), ShouldContainSubstring, "rejected")
+
+		artifactErr := ArtifactError(res)
+
+		So(artifactErr, ShouldNotBeNil)
+		So(artifactErr.Error(), ShouldContainSubstring, "rejected")
 	})
 }
 
@@ -92,14 +99,18 @@ func TestPeekResultReadsStoredJob(t *testing.T) {
 
 		So(err, ShouldBeNil)
 		So(res, ShouldNotBeNil)
-		So(res.Error, ShouldBeNil)
+		So(ArtifactError(res), ShouldBeNil)
 
 		pv, ok := q.PeekResult("peek-src")
 
 		So(ok, ShouldBeTrue)
 		So(pv, ShouldNotBeNil)
-		So(pv.Error, ShouldBeNil)
-		So(pv.Value, ShouldEqual, 77)
+		So(ArtifactError(pv), ShouldBeNil)
+
+		peekValue, peekErr := ArtifactValue[int](pv)
+
+		So(peekErr, ShouldBeNil)
+		So(peekValue, ShouldEqual, 77)
 	})
 }
 
@@ -121,7 +132,10 @@ func TestDependencyFailureStoresError(t *testing.T) {
 
 		So(err, ShouldBeNil)
 		So(res, ShouldNotBeNil)
-		So(res.Error, ShouldNotBeNil)
-		So(res.Error.Error(), ShouldContainSubstring, "dependency missing")
+
+		artifactErr := ArtifactError(res)
+
+		So(artifactErr, ShouldNotBeNil)
+		So(artifactErr.Error(), ShouldContainSubstring, "dependency missing")
 	})
 }

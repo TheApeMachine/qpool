@@ -54,7 +54,7 @@ func TestLoadBalancer_Limit(t *testing.T) {
 				loadBalancer := NewLoadBalancer(99, row.capacity)
 
 				if row.reading != nil {
-					loadBalancer.Observe(row.reading)
+					loadBalancer.Observe(*row.reading)
 				}
 
 				So(loadBalancer.Limit(), ShouldEqual, row.wantLimit)
@@ -69,7 +69,7 @@ func TestLoadBalancerObserveAndLimit(t *testing.T) {
 
 		So(lb.Limit(), ShouldBeFalse)
 
-		lb.Observe(&MetricReading{WorkerCount: 2, JobQueueSize: 8})
+		lb.Observe(MetricReading{WorkerCount: 2, JobQueueSize: 8})
 
 		So(lb.Limit(), ShouldBeTrue)
 	})
@@ -122,7 +122,7 @@ func TestLoadBalancer_SelectWorker(t *testing.T) {
 				loadBalancer := NewLoadBalancer(9, 5)
 
 				if row.reading != nil {
-					loadBalancer.Observe(row.reading)
+					loadBalancer.Observe(*row.reading)
 				}
 
 				workerID, err := loadBalancer.SelectWorker()

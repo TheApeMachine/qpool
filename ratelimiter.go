@@ -42,7 +42,7 @@ func NewRateLimiter(maxTokens int, refillRate time.Duration) *RateLimiter {
 /*
 Observe implements Regulator (reserved for adaptive extensions).
 */
-func (rl *RateLimiter) Observe(reading *MetricReading) {
+func (rl *RateLimiter) Observe(reading MetricReading) {
 	_ = reading
 }
 

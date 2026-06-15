@@ -86,7 +86,7 @@ func TestRateLimiter_Observe_doesNotRefillTokens(t *testing.T) {
 		So(rl.Limit(), ShouldBeTrue)
 
 		Convey("Observe should not add tokens by itself", func() {
-			rl.Observe(&MetricReading{TotalJobs: 100, FailedJobs: 2, ThrottledJobs: 1})
+			rl.Observe(MetricReading{TotalJobs: 100, FailedJobs: 2, ThrottledJobs: 1})
 			So(rl.Limit(), ShouldBeTrue)
 		})
 	})

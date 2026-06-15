@@ -3,10 +3,11 @@ package qpool
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"sync/atomic"
 	"time"
 
-	"github.com/phuslu/log"
+	"github.com/theapemachine/datura"
 )
 
 func (q *Q[T]) startDependencyWait(job Job) error {
@@ -47,24 +48,20 @@ func (q *Q[T]) recordDependencyFailure(job Job, err error) {
 	q.metrics.RecordJobOutcome(latency, false)
 
 	if job.CircuitID != "" {
-		if breaker := q.breakerForJob(&job); breaker != nil {
+		if breaker := q.breakerForJob(job); breaker != nil {
 			breaker.RecordFailure()
 		}
 	}
 
-	q.publishTelemetry(Event{
-		Component: "qpool",
-		Op:        "job-error",
-		Message:   fmt.Sprintf("dependencies unmet: %s (%v)", job.ID, err),
-		Time:      time.Now(),
-		Level:     log.WarnLevel,
-		Err:       err,
-		Fields: []Field{
-			{Key: "job", Value: job.ID},
-			{Key: "phase", Value: "dependency"},
-			{Key: "duration_ms", Value: latency.Milliseconds()},
-		},
-	})
+	artifact := datura.Acquire("qpool", datura.Artifact_Type_json)
+	artifact.SetRole("op")
+	artifact.SetPayload([]byte(fmt.Sprintf("dependencies unmet: %s (%v)", job.ID, err)))
+	artifact.SetTimestamp(time.Now().UnixNano())
+	artifact.SetScope("debug")
+	artifact.Poke("job", job.ID)
+	artifact.Poke("phase", "dependency")
+	artifact.Poke("duration_ms", strconv.FormatInt(latency.Milliseconds(), 10))
+	q.publishTelemetry(artifact)
 
 	q.space.StoreError(job.ID, err, job.TTL)
 }
@@ -175,8 +172,8 @@ func (q *Q[T]) waitOneDependency(
 				continue
 			}
 
-			if result.Error != nil {
-				return fmt.Errorf("dependency %s: %w", dependencyID, result.Error)
+			if artifactErr := ArtifactError(result); artifactErr != nil {
+				return fmt.Errorf("dependency %s: %w", dependencyID, artifactErr)
 			}
 
 			return nil

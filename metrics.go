@@ -34,7 +34,7 @@ func NewMetrics() *Metrics {
 /*
 CollectReading builds a regulator-facing snapshot from current atomic counters.
 */
-func (m *Metrics) CollectReading() *MetricReading {
+func (m *Metrics) CollectReading() MetricReading {
 	jc := m.jobCount.Load()
 	fc := m.failureCount.Load()
 
@@ -72,7 +72,7 @@ func (m *Metrics) CollectReading() *MetricReading {
 		busy = 0
 	}
 
-	return &MetricReading{
+	return MetricReading{
 		WorkerCount:         wc,
 		BusyWorkers:         busy,
 		JobQueueSize:        int(m.jobQueueDepth.Load()),

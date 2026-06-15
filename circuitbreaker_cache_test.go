@@ -48,7 +48,7 @@ func TestQBreakerForJob(test *testing.T) {
 			HalfOpenMax:  1,
 		}
 
-		job := &Job{
+		job := Job{
 			CircuitID:     "first",
 			CircuitConfig: config,
 		}
@@ -56,7 +56,7 @@ func TestQBreakerForJob(test *testing.T) {
 		breaker := pool.breakerFor(job)
 		job.circuitBreaker = breaker
 
-		_ = pool.breakerFor(&Job{
+		_ = pool.breakerFor(Job{
 			CircuitID:     "second",
 			CircuitConfig: config,
 		})

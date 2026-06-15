@@ -14,7 +14,7 @@ func TestBackPressureObserveLimitRenormalize(t *testing.T) {
 
 		So(bp.Limit(), ShouldBeFalse)
 
-		bp.Observe(&MetricReading{
+		bp.Observe(MetricReading{
 			JobQueueSize:      80,
 			AverageJobLatency: 2 * time.Second,
 		})
@@ -27,14 +27,14 @@ func TestBackPressureObserveLimitRenormalize(t *testing.T) {
 	Convey("Renormalize bleeds pressure when readings calm down", t, func() {
 		bp := NewBackPressureRegulator(100, time.Second, time.Minute)
 
-		bp.Observe(&MetricReading{
+		bp.Observe(MetricReading{
 			JobQueueSize:      90,
 			AverageJobLatency: 2 * time.Second,
 		})
 
 		So(bp.Limit(), ShouldBeTrue)
 
-		bp.Observe(&MetricReading{
+		bp.Observe(MetricReading{
 			JobQueueSize:      10,
 			AverageJobLatency: time.Millisecond,
 		})

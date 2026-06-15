@@ -210,14 +210,12 @@ func (qspace *QSpace) RegisterDependent(depID, jobID string) {
 /*
 CreateBroadcastGroup registers a pub/sub group owned by this space.
 */
-func (qspace *QSpace) CreateBroadcastGroup(id string) (existing *BroadcastGroup) {
-	if existing, ok := qspace.groups.LoadOrStore(
+func (qspace *QSpace) CreateBroadcastGroup(id string) *BroadcastGroup {
+	stored, _ := qspace.groups.LoadOrStore(
 		id, NewBroadcastGroup(qspace.ctx, id, time.Minute),
-	); ok {
-		return existing.(*BroadcastGroup)
-	}
+	)
 
-	return existing
+	return stored.(*BroadcastGroup)
 }
 
 /*

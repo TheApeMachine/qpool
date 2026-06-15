@@ -38,7 +38,7 @@ func NewBroadcastGroup(
 		cancel:           cancel,
 		ttl:              ttl,
 		ID:               id,
-		dropOldestOnFull: false,
+		dropOldestOnFull: true,
 		consumers:        &sync.Map{},
 	}
 

@@ -8,6 +8,7 @@ replace (
 )
 
 require (
+	github.com/google/uuid v1.6.0
 	github.com/smarty/go-disruptor v0.5.0
 	github.com/smartystreets/goconvey v1.8.1
 )
@@ -24,7 +25,6 @@ require (
 	github.com/elastic/go-elasticsearch/v9 v9.4.1 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/klauspost/compress v1.18.6 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.9 // indirect
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect

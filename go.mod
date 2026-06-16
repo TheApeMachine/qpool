@@ -2,10 +2,9 @@ module github.com/theapemachine/qpool
 
 go 1.26.1
 
-replace (
-	github.com/theapemachine/datura => ../datura
-	github.com/theapemachine/errnie => ../errnie
-)
+// replace github.com/theapemachine/datura => ../datura
+
+// replace github.com/theapemachine/errnie => ../errnie
 
 require (
 	github.com/google/uuid v1.6.0
@@ -45,6 +44,6 @@ require (
 	github.com/jtolds/gls v4.20.0+incompatible // indirect
 	github.com/phuslu/log v1.0.124 // indirect
 	github.com/smarty/assertions v1.16.0 // indirect
-	github.com/theapemachine/datura v1.2.3
-	github.com/theapemachine/errnie v1.2.4
+	github.com/theapemachine/datura v1.2.4
+	github.com/theapemachine/errnie v1.2.5
 )

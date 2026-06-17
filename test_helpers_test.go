@@ -38,21 +38,3 @@ func broadcastGroupSubscriberCount(group *BroadcastGroup) int {
 	return count
 }
 
-func receiveBroadcastEvent(subscription *BroadcastConsumer) *datura.Artifact {
-	deadline := time.Now().Add(time.Second)
-
-	for time.Now().Before(deadline) {
-		if event := subscription.Poll(); event != nil {
-			return event
-		}
-
-		time.Sleep(time.Millisecond)
-	}
-
-	artifact := datura.Acquire("component", datura.Artifact_Type_json)
-	artifact.SetRole("op")
-	artifact.SetPayload([]byte("message"))
-	artifact.Poke("key", "value")
-
-	return artifact
-}

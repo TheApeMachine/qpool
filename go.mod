@@ -2,7 +2,7 @@ module github.com/theapemachine/qpool
 
 go 1.26.1
 
-// replace github.com/theapemachine/datura => ../datura
+replace github.com/theapemachine/datura => ../datura
 
 // replace github.com/theapemachine/errnie => ../errnie
 

@@ -55,11 +55,7 @@ func ArtifactValue[T any](artifact *datura.Artifact) (T, error) {
 		return zero, artifactErr
 	}
 
-	payload, err := artifact.DecryptPayload()
-
-	if err != nil {
-		return zero, err
-	}
+	payload := artifact.DecryptPayload()
 
 	switch any(zero).(type) {
 	case string:
@@ -262,12 +258,7 @@ func BusMessageValue(artifact *datura.Artifact) (any, error) {
 		return nil, errors.New("qpool: nil bus artifact")
 	}
 
-	payload, err := artifact.DecryptPayload()
-
-	if err != nil {
-		return nil, err
-	}
-
+	payload := artifact.DecryptPayload()
 	if len(payload) == 0 {
 		return nil, nil
 	}

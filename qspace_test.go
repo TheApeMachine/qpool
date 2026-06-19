@@ -22,9 +22,7 @@ func TestQSpaceAwait(test *testing.T) {
 			So(result, ShouldNotBeNil)
 			So(ArtifactError(result), ShouldBeNil)
 
-			payload, payloadErr := result.DecryptPayload()
-
-			So(payloadErr, ShouldBeNil)
+			payload := result.DecryptPayload()
 			So(string(payload), ShouldEqual, "ok")
 		})
 	})
@@ -43,9 +41,7 @@ func TestQSpaceStore(test *testing.T) {
 			So(ok, ShouldBeTrue)
 			So(result, ShouldNotBeNil)
 
-			payload, err := result.DecryptPayload()
-
-			So(err, ShouldBeNil)
+			payload := result.DecryptPayload()
 			So(string(payload), ShouldEqual, "ok")
 		})
 	})

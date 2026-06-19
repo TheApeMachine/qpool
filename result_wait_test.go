@@ -36,9 +36,7 @@ func TestResultSlotWait(test *testing.T) {
 			case result := <-waitDone:
 				So(result, ShouldNotBeNil)
 
-				payload, payloadErr := result.DecryptPayload()
-
-				So(payloadErr, ShouldBeNil)
+				payload := result.DecryptPayload()
 				So(string(payload), ShouldEqual, "ok")
 			case <-time.After(time.Second):
 				test.Fatal("timed out waiting for result slot delivery")

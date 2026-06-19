@@ -215,7 +215,7 @@ func (q *Q[T]) enqueueJob(ctx context.Context, job Job) error {
 	artifact := datura.Acquire("qpool", datura.Artifact_Type_json)
 	artifact.SetRole("job-scheduled")
 	artifact.SetScope(job.ID)
-	artifact.SetPayload([]byte(fmt.Sprintf("job scheduled: %s", job.ID)))
+	artifact.WithPayload([]byte(fmt.Sprintf("job scheduled: %s", job.ID)))
 	artifact.SetTimestamp(time.Now().UnixNano())
 
 	return q.publishTelemetry(artifact)

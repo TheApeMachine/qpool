@@ -85,7 +85,7 @@ func (pool *Q[T]) startWorker() {
 
 	artifact := datura.Acquire("qpool", datura.Artifact_Type_json)
 	artifact.SetRole("op")
-	artifact.SetPayload([]byte(fmt.Sprintf("worker started; workers=%d", pool.metrics.workerCount.Load())))
+	artifact.WithPayload([]byte(fmt.Sprintf("worker started; workers=%d", pool.metrics.workerCount.Load())))
 	artifact.SetTimestamp(time.Now().UnixNano())
 	artifact.SetScope("debug")
 	artifact.Poke("workers", strconv.FormatInt(pool.metrics.workerCount.Load(), 10))
@@ -106,7 +106,7 @@ func (pool *Q[T]) scaleDownWorkers(count int) {
 
 		artifact := datura.Acquire("qpool", datura.Artifact_Type_json)
 		artifact.SetRole("op")
-		artifact.SetPayload([]byte("worker deactivated"))
+		artifact.WithPayload([]byte("worker deactivated"))
 		artifact.SetTimestamp(time.Now().UnixNano())
 		artifact.SetScope("debug")
 		artifact.Poke("worker", strconv.FormatUint(token.id, 10))
@@ -121,7 +121,7 @@ func (pool *Q[T]) closePool() {
 
 	artifact := datura.Acquire("qpool", datura.Artifact_Type_json)
 	artifact.SetRole("op")
-	artifact.SetPayload([]byte("closing Q pool"))
+	artifact.WithPayload([]byte("closing Q pool"))
 	artifact.SetTimestamp(time.Now().UnixNano())
 	artifact.SetScope("debug")
 	pool.publishTelemetry(artifact)
@@ -143,7 +143,7 @@ func (pool *Q[T]) closePool() {
 
 	artifact = datura.Acquire("qpool", datura.Artifact_Type_json)
 	artifact.SetRole("op")
-	artifact.SetPayload([]byte("Q pool closed"))
+	artifact.WithPayload([]byte("Q pool closed"))
 	artifact.SetTimestamp(time.Now().UnixNano())
 	artifact.SetScope("debug")
 	pool.publishTelemetry(artifact)

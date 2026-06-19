@@ -40,7 +40,7 @@ func processJob(q *Q[any], workerCtx context.Context, job Job) {
 		startedEvent.SetError(er)
 	}
 
-	startedEvent.SetPayload(payload)
+	startedEvent.WithPayload(payload)
 	startedEvent.SetTimestamp(startedAt.Unix())
 	q.publishTelemetry(startedEvent)
 
@@ -95,7 +95,7 @@ func processJob(q *Q[any], workerCtx context.Context, job Job) {
 	if err != nil {
 		return
 	}
-	completeEvent.SetPayload(payload)
+	completeEvent.WithPayload(payload)
 	completeEvent.SetTimestamp(time.Now().Unix())
 	q.publishTelemetry(completeEvent)
 

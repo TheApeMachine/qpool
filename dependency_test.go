@@ -30,7 +30,7 @@ func TestQScheduleDependencyWaitDoesNotStarveWorkers(test *testing.T) {
 		Convey("It should run the dependency producer before the dependent job occupies the worker", func() {
 			parentValue := receiveResultWait(test, parentResult)
 
-			payload, err := parentValue.Payload()
+			payload, err := parentValue.DecryptPayload()
 			So(err, ShouldBeNil)
 			So(string(payload), ShouldEqual, "parent")
 
@@ -39,7 +39,7 @@ func TestQScheduleDependencyWaitDoesNotStarveWorkers(test *testing.T) {
 
 			childValue := receiveResultWait(test, childResult)
 
-			payload, err = childValue.Payload()
+			payload, err = childValue.DecryptPayload()
 			So(err, ShouldBeNil)
 			So(string(payload), ShouldEqual, "child")
 

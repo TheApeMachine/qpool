@@ -55,7 +55,7 @@ func ArtifactValue[T any](artifact *datura.Artifact) (T, error) {
 		return zero, artifactErr
 	}
 
-	payload, err := artifact.Payload()
+	payload, err := artifact.DecryptPayload()
 
 	if err != nil {
 		return zero, err
@@ -86,7 +86,7 @@ func artifactTTL(artifact *datura.Artifact) time.Duration {
 		return 0
 	}
 
-	raw := artifact.Peek(artifactAttrTTLNs)
+	raw := datura.Peek[string](artifact, artifactAttrTTLNs)
 
 	if raw == "" {
 		return 0
@@ -141,11 +141,7 @@ func newResultArtifact(
 		return nil, err
 	}
 
-	if err := artifact.SetPayload(payload); err != nil {
-		return nil, err
-	}
-
-	artifact.SetTimestamp(time.Now().UnixNano())
+	artifact.WithPayload(payload)
 	artifact.Poke(artifactAttrTTLNs, strconv.FormatInt(int64(ttl), 10))
 
 	return artifact, nil
@@ -199,7 +195,7 @@ func cloneArtifact(source *datura.Artifact) *datura.Artifact {
 		return nil
 	}
 
-	if cloned.Unmarshal(raw) == nil {
+	if err := cloned.SetAttributes(raw); err != nil {
 		return nil
 	}
 
@@ -255,7 +251,7 @@ func BusMessageType(artifact *datura.Artifact) string {
 		return messageType
 	}
 
-	return artifact.Peek(artifactAttrMessageType)
+	return datura.Peek[string](artifact, artifactAttrMessageType)
 }
 
 /*
@@ -266,7 +262,7 @@ func BusMessageValue(artifact *datura.Artifact) (any, error) {
 		return nil, errors.New("qpool: nil bus artifact")
 	}
 
-	payload, err := artifact.Payload()
+	payload, err := artifact.DecryptPayload()
 
 	if err != nil {
 		return nil, err

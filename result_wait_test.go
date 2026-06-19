@@ -36,7 +36,7 @@ func TestResultSlotWait(test *testing.T) {
 			case result := <-waitDone:
 				So(result, ShouldNotBeNil)
 
-				payload, payloadErr := result.Payload()
+				payload, payloadErr := result.DecryptPayload()
 
 				So(payloadErr, ShouldBeNil)
 				So(string(payload), ShouldEqual, "ok")

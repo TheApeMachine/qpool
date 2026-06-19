@@ -16,11 +16,7 @@ func testBroadcastArtifact(payload string) *datura.Artifact {
 		panic(err)
 	}
 
-	if err := artifact.SetPayload([]byte(payload)); err != nil {
-		panic(err)
-	}
-
-	return artifact
+	return artifact.WithPayload([]byte(payload))
 }
 
 func TestBroadcastGroupSendRingPush(test *testing.T) {

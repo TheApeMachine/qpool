@@ -55,8 +55,7 @@ func (q *Q[T]) recordDependencyFailure(job Job, err error) {
 
 	artifact := datura.Acquire("qpool", datura.Artifact_Type_json)
 	artifact.SetRole("op")
-	artifact.SetPayload([]byte(fmt.Sprintf("dependencies unmet: %s (%v)", job.ID, err)))
-	artifact.SetTimestamp(time.Now().UnixNano())
+	artifact.WithPayload([]byte(fmt.Sprintf("dependencies unmet: %s (%v)", job.ID, err)))
 	artifact.SetScope("debug")
 	artifact.Poke("job", job.ID)
 	artifact.Poke("phase", "dependency")

@@ -151,7 +151,7 @@ func (scaler *Scaler) noteScaleUp(delta int) {
 
 	artifact := datura.Acquire("qpool", datura.Artifact_Type_json)
 	artifact.SetRole("op")
-	artifact.SetPayload([]byte("scaled worker pool up"))
+	artifact.WithPayload([]byte("scaled worker pool up"))
 	artifact.SetTimestamp(now.UnixNano())
 	artifact.SetScope("debug")
 	artifact.Poke("delta", strconv.Itoa(delta))
@@ -166,7 +166,7 @@ func (scaler *Scaler) noteScaleDown(delta int) {
 
 	artifact := datura.Acquire("qpool", datura.Artifact_Type_json)
 	artifact.SetRole("op")
-	artifact.SetPayload([]byte("scaled worker pool down"))
+	artifact.WithPayload([]byte("scaled worker pool down"))
 	artifact.SetTimestamp(now.UnixNano())
 	artifact.SetScope("debug")
 	artifact.Poke("delta", strconv.Itoa(delta))

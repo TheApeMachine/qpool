@@ -185,13 +185,13 @@ func cloneArtifact(source *datura.Artifact) *datura.Artifact {
 		return nil
 	}
 
-	raw, err := source.Message().Marshal()
+	raw, err := source.MarshalPacked()
 
 	if err != nil {
 		return nil
 	}
 
-	if err := cloned.SetAttributes(raw); err != nil {
+	if _, err := cloned.Write(raw); err != nil {
 		return nil
 	}
 

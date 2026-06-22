@@ -62,16 +62,6 @@ func (registry *workerRegistry) popLast() *workerToken {
 	return node.token
 }
 
-func (registry *workerRegistry) remove(id uint64) {
-	if registry == nil {
-		return
-	}
-
-	registry.workers.Remove(func(node *workerStackNode) bool {
-		return node.token != nil && node.token.id == id
-	})
-}
-
 func (pool *Q[T]) startWorker() {
 	if !pool.metrics.tryIncWorkerIfBelow(pool.maxWorkers) {
 		return

@@ -10,7 +10,7 @@ import (
 	"github.com/theapemachine/datura"
 )
 
-func TestWorkerRegistryPushPopRemove(test *testing.T) {
+func TestWorkerRegistryPushPop(test *testing.T) {
 	Convey("Given a worker registry", test, func() {
 		registry := newWorkerRegistry()
 		first := &workerToken{id: 1, cancel: func() {}}
@@ -21,10 +21,9 @@ func TestWorkerRegistryPushPopRemove(test *testing.T) {
 		registry.push(second)
 		registry.push(third)
 
-		Convey("It should remove arbitrary workers and pop the newest remaining worker", func() {
-			registry.remove(second.id)
-
+		Convey("It should pop workers in LIFO order", func() {
 			So(registry.popLast(), ShouldEqual, third)
+			So(registry.popLast(), ShouldEqual, second)
 			So(registry.popLast(), ShouldEqual, first)
 			So(registry.popLast(), ShouldBeNil)
 		})

@@ -202,22 +202,24 @@ func NewScaler(
 	pool.scalerWG.Add(1)
 
 	go func() {
+		defer pool.scalerWG.Done()
+
+		ticker := time.NewTicker(max(time.Second, scaler.evalInterval))
+		defer ticker.Stop()
+
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			default:
-			}
-
-			time.Sleep(max(time.Second, scaler.evalInterval))
-
-			if scaler.pool.config != nil {
-				for _, regulator := range scaler.pool.config.Regulators {
-					regulator.Renormalize()
+			case <-ticker.C:
+				if scaler.pool.config != nil {
+					for _, regulator := range scaler.pool.config.Regulators {
+						regulator.Renormalize()
+					}
 				}
-			}
 
-			scaler.Observe(scaler.pool.metrics.CollectReading())
+				scaler.Observe(scaler.pool.metrics.CollectReading())
+			}
 		}
 	}()
 

@@ -36,3 +36,22 @@ func BenchmarkNewResultArtifact(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkCloneArtifact(b *testing.B) {
+	artifact, err := newResultArtifact("job", "payload", time.Minute)
+
+	if err != nil || artifact == nil {
+		b.Fatal("newResultArtifact failed")
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for b.Loop() {
+		cloned := cloneArtifact(artifact)
+
+		if cloned == nil || string(cloned.DecryptPayload()) != "payload" {
+			b.Fatal("cloneArtifact failed")
+		}
+	}
+}

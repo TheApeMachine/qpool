@@ -137,7 +137,9 @@ func newResultArtifact(
 		return nil, err
 	}
 
-	artifact.WithPayload(payload)
+	if len(payload) > 0 {
+		artifact.WithPayload(payload)
+	}
 	artifact.Poke(artifactAttrTTLNs, strconv.FormatInt(int64(ttl), 10))
 
 	return artifact, nil

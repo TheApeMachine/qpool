@@ -180,16 +180,9 @@ func cloneArtifact(source *datura.Artifact) *datura.Artifact {
 		return nil
 	}
 
-	origin, _ := source.Origin()
-	cloned := datura.Acquire(origin, source.Type())
+	cloned, err := source.Clone()
 
-	if cloned == nil {
-		return nil
-	}
-
-	raw := source.Pack()
-
-	if _, err := cloned.Write(raw); err != nil {
+	if err != nil {
 		return nil
 	}
 
